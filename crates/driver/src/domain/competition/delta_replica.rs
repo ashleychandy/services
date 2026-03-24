@@ -17,6 +17,8 @@ pub enum Error {
     InvalidSequenceRange { from: u64, to: u64 },
     #[error("delta sequence mismatch: expected from={expected}, got from={got}")]
     SequenceMismatch { expected: u64, got: u64 },
+    #[error("unknown event type received in envelope")]
+    UnknownEventType,
     #[error("delta snapshot sequence mismatch: current={current}, snapshot={snapshot}")]
     SnapshotSequenceMismatch { current: u64, snapshot: u64 },
     #[error("order payload is missing uid")]
@@ -34,6 +36,8 @@ pub enum Error {
 pub struct Snapshot {
     pub version: u32,
     #[serde(default)]
+    pub boot_id: Option<String>,
+    #[serde(default)]
     pub auction_id: u64,
     pub sequence: u64,
     pub auction: RawAuctionData,
@@ -50,6 +54,8 @@ pub struct RawAuctionData {
 #[serde(rename_all = "camelCase")]
 pub struct Envelope {
     pub version: u32,
+    #[serde(default)]
+    pub boot_id: Option<String>,
     #[serde(default)]
     pub auction_id: u64,
     #[serde(default)]
@@ -200,6 +206,9 @@ impl Replica {
 
     pub fn apply_delta(&mut self, envelope: Envelope) -> Result<(), Error> {
         Self::ensure_version(envelope.version)?;
+        // Capture sequence bounds before moving `envelope.events` below.
+        let from_sequence = envelope.from_sequence;
+        let to_sequence = envelope.to_sequence;
 
         if let Some(snapshot_sequence) = envelope.snapshot_sequence {
             if self.sequence < snapshot_sequence {
@@ -210,22 +219,22 @@ impl Replica {
             }
         }
 
-        if envelope.from_sequence > envelope.to_sequence {
+        if from_sequence > to_sequence {
             return Err(Error::InvalidSequenceRange {
-                from: envelope.from_sequence,
-                to: envelope.to_sequence,
+                from: from_sequence,
+                to: to_sequence,
             });
         }
 
         // At-least-once delivery can replay already-applied envelopes.
-        if envelope.to_sequence <= self.sequence {
+        if to_sequence <= self.sequence {
             return Ok(());
         }
 
-        if envelope.from_sequence != self.sequence {
+        if from_sequence != self.sequence {
             return Err(Error::SequenceMismatch {
                 expected: self.sequence,
-                got: envelope.from_sequence,
+                got: from_sequence,
             });
         }
 
@@ -264,7 +273,16 @@ impl Replica {
                     }
                     mutations.push(Mutation::PriceChanged { token, price });
                 }
-                Event::Unknown => {}
+                Event::Unknown => {
+                    metrics::get().delta_replica_unknown_event_types_total.inc();
+                    tracing::warn!(
+                        from_sequence = from_sequence,
+                        to_sequence = to_sequence,
+                        "delta replica received unknown event type; forcing resnapshot to avoid \
+                         silent divergence. Consider upgrading the driver."
+                    );
+                    return Err(Error::UnknownEventType);
+                }
             }
         }
 
@@ -291,7 +309,7 @@ impl Replica {
             }
         }
 
-        self.sequence = envelope.to_sequence;
+        self.sequence = to_sequence;
         self.auction_id = envelope.auction_id;
         self.state = ReplicaState::Ready;
         self.last_update = Some(chrono::Utc::now());
@@ -488,6 +506,7 @@ mod tests {
     fn snapshot(sequence: u64, orders: Vec<Value>) -> Snapshot {
         Snapshot {
             version: 1,
+            boot_id: None,
             auction_id: 0,
             sequence,
             auction: RawAuctionData {
@@ -513,6 +532,7 @@ mod tests {
     fn envelope(from_sequence: u64, to_sequence: u64, events: Vec<Event>) -> Envelope {
         Envelope {
             version: 1,
+            boot_id: None,
             auction_id: 0,
             auction_sequence: 0,
             from_sequence,
@@ -531,6 +551,7 @@ mod tests {
         replica
             .apply_snapshot(Snapshot {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 sequence: 7,
                 auction: RawAuctionData {
@@ -601,6 +622,7 @@ mod tests {
         replica
             .apply_snapshot(Snapshot {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 sequence: 10,
                 auction: RawAuctionData {
@@ -720,6 +742,7 @@ mod tests {
         let err = replica
             .apply_delta(Envelope {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 auction_sequence: 0,
                 from_sequence: 5,
@@ -754,6 +777,7 @@ mod tests {
         let err = replica
             .apply_snapshot(Snapshot {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 sequence: 1,
                 auction: RawAuctionData {

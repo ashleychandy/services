@@ -347,8 +347,10 @@ async fn run(
             let mut lock = replica.write().await;
             lock.set_state(ReplicaState::Syncing);
         }
-        match fetch_snapshot(&client, &base_url).await {
+        // Fetch snapshot and capture session boot_id for validation of live envelopes.
+        let session_boot_id = match fetch_snapshot(&client, &base_url).await {
             Ok(snapshot) => {
+                let boot_id = snapshot.boot_id.clone();
                 let applied = {
                     let mut lock = replica.write().await;
                     lock.apply_snapshot(snapshot)
@@ -365,6 +367,7 @@ async fn run(
                     prices = view.prices().len(),
                     "delta sync snapshot applied"
                 );
+                boot_id
             }
             Err(err) => {
                 {
@@ -375,11 +378,19 @@ async fn run(
                 tokio::time::sleep(DEFAULT_RETRY_DELAY).await;
                 continue;
             }
-        }
+        };
 
         let snapshot_started_at = Instant::now();
         loop {
-            match follow_stream(&client, &base_url, &replica, snapshot_started_at).await {
+            match follow_stream(
+                &client,
+                &base_url,
+                &replica,
+                snapshot_started_at,
+                session_boot_id.as_deref(),
+            )
+            .await
+            {
                 Ok(StreamControl::Resnapshot) => {
                     {
                         let mut lock = replica.write().await;
@@ -437,6 +448,7 @@ async fn follow_stream(
     base_url: &Url,
     replica: &std::sync::Arc<RwLock<Replica>>,
     snapshot_started_at: Instant,
+    session_boot_id: Option<&str>,
 ) -> anyhow::Result<StreamControl> {
     let url = shared::url::join(base_url, "delta/stream");
     let after_sequence = replica.read().await.sequence();
@@ -492,7 +504,7 @@ async fn follow_stream(
                             let block = buffer[..idx].to_string();
                             buffer.drain(..idx + 2);
 
-                            match handle_sse_block(&block, replica).await? {
+                            match handle_sse_block(&block, replica, session_boot_id).await? {
                                 BlockControl::Continue => {}
                                 BlockControl::Resnapshot => return Ok(StreamControl::Resnapshot),
                             }
@@ -537,6 +549,7 @@ enum BlockControl {
 async fn handle_sse_block(
     block: &str,
     replica: &std::sync::Arc<RwLock<Replica>>,
+    session_boot_id: Option<&str>,
 ) -> anyhow::Result<BlockControl> {
     let (event, data) = parse_sse_block(block);
     let Some(data) = data else {
@@ -546,6 +559,22 @@ async fn handle_sse_block(
     match event {
         "delta" => {
             let envelope: Envelope = serde_json::from_str(&data)?;
+            // Detect autopilot restart by comparing the session boot id from the
+            // snapshot with the boot id sent in the live envelope. If they
+            // differ, the autopilot restarted and we must request a resnapshot
+            // to avoid applying deltas across sessions.
+            if let (Some(session), Some(received)) = (session_boot_id, envelope.boot_id.as_deref())
+            {
+                if session != received {
+                    tracing::warn!(
+                        session_boot_id = %session,
+                        received_boot_id = %received,
+                        "autopilot boot ID changed; forcing resnapshot"
+                    );
+                    return Ok(BlockControl::Resnapshot);
+                }
+            }
+
             let applied = {
                 let mut lock = replica.write().await;
                 lock.apply_delta(envelope)
@@ -844,6 +873,7 @@ mod tests {
             let mut lock = replica.write().await;
             lock.apply_snapshot(Snapshot {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -863,7 +893,7 @@ mod tests {
             valid_order(&uid)
         );
 
-        let outcome = handle_sse_block(&block, &replica).await.unwrap();
+        let outcome = handle_sse_block(&block, &replica, None).await.unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
 
         let view = replica.read().await;
@@ -876,7 +906,7 @@ mod tests {
         let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
         let block = "event: resync_required\ndata: lagged\n\n";
 
-        let outcome = handle_sse_block(&block, &replica).await.unwrap();
+        let outcome = handle_sse_block(&block, &replica, None).await.unwrap();
         assert!(matches!(outcome, BlockControl::Resnapshot));
     }
 
@@ -885,7 +915,7 @@ mod tests {
         let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
         let block = "event: keepalive\ndata: ok\n\n";
 
-        let outcome = handle_sse_block(&block, &replica).await.unwrap();
+        let outcome = handle_sse_block(&block, &replica, None).await.unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
     }
 
@@ -894,7 +924,7 @@ mod tests {
         let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
         let block = "event: delta\ndata: not-json\n\n";
 
-        let err = handle_sse_block(block, &replica).await.unwrap_err();
+        let err = handle_sse_block(block, &replica, None).await.unwrap_err();
         assert!(
             err.to_string().contains("expected ident")
                 || err.to_string().contains("expected value")
@@ -908,6 +938,7 @@ mod tests {
             let mut lock = replica.write().await;
             lock.apply_snapshot(Snapshot {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -921,7 +952,7 @@ mod tests {
         let block = "event: delta\ndata: \
                      {\"version\":2,\"fromSequence\":0,\"toSequence\":1,\"events\":[]}\n\n";
 
-        let outcome = handle_sse_block(&block, &replica).await.unwrap();
+        let outcome = handle_sse_block(&block, &replica, None).await.unwrap();
         assert!(matches!(outcome, BlockControl::Resnapshot));
     }
 
@@ -932,6 +963,7 @@ mod tests {
             let mut lock = replica.write().await;
             lock.apply_snapshot(Snapshot {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 sequence: 2,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -950,7 +982,7 @@ mod tests {
              orderRemoved\",\"uid\":\"{uid}\"}}]}}\n\n"
         );
 
-        let outcome = handle_sse_block(&block, &replica).await.unwrap();
+        let outcome = handle_sse_block(&block, &replica, None).await.unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
 
         let view = replica.read().await;
@@ -964,6 +996,7 @@ mod tests {
             let mut lock = replica.write().await;
             lock.apply_snapshot(Snapshot {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -982,7 +1015,7 @@ mod tests {
             valid_order(&uid)
         );
 
-        let outcome = handle_sse_block(&block, &replica).await.unwrap();
+        let outcome = handle_sse_block(&block, &replica, None).await.unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
 
         let view = replica.read().await;
@@ -997,6 +1030,7 @@ mod tests {
             let mut lock = replica.write().await;
             lock.apply_snapshot(Snapshot {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -1015,7 +1049,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
 
 "#;
 
-        let outcome = handle_sse_block(block, &replica).await.unwrap();
+        let outcome = handle_sse_block(block, &replica, None).await.unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
 
         let view = replica.read().await;
@@ -1083,6 +1117,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             let mut lock = replica.write().await;
             lock.apply_snapshot(Snapshot {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 sequence: 3,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -1094,7 +1129,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
         }
 
         let client = reqwest::Client::new();
-        let err = follow_stream(&client, &base_url, &replica, Instant::now())
+        let err = follow_stream(&client, &base_url, &replica, Instant::now(), None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("delta stream closed"));
@@ -1133,6 +1168,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             let mut lock = replica.write().await;
             lock.apply_snapshot(Snapshot {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 sequence: 10,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -1144,7 +1180,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
         }
 
         let client = reqwest::Client::new();
-        let control = follow_stream(&client, &base_url, &replica, Instant::now())
+        let control = follow_stream(&client, &base_url, &replica, Instant::now(), None)
             .await
             .unwrap();
         assert!(matches!(control, StreamControl::Resnapshot));
@@ -1218,7 +1254,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(snapshot_payload).unwrap();
         }
 
-        let err = follow_stream(&client, &base_url, &replica, Instant::now())
+        let err = follow_stream(&client, &base_url, &replica, Instant::now(), None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("delta stream closed"));
@@ -1249,6 +1285,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             let mut lock = replica.write().await;
             lock.apply_snapshot(Snapshot {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 sequence: 1,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -1269,6 +1306,124 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
         assert!(health.last_update_age_seconds.is_some());
     }
 
+    #[tokio::test]
+    async fn boot_id_mismatch_in_delta_requests_resnapshot() {
+        let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
+        {
+            let mut lock = replica.write().await;
+            lock.apply_snapshot(Snapshot {
+                version: 1,
+                boot_id: Some("session-boot-id-A".to_string()),
+                auction_id: 0,
+                sequence: 0,
+                auction: crate::domain::competition::delta_replica::RawAuctionData {
+                    orders: vec![],
+                    prices: HashMap::new(),
+                },
+            })
+            .unwrap();
+        }
+
+        let block = r#"event: delta
+data: {"version":1,"bootId":"session-boot-id-B","fromSequence":0,"toSequence":1,"events":[]}
+
+"#;
+
+        let outcome = handle_sse_block(block, &replica, Some("session-boot-id-A"))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, BlockControl::Resnapshot));
+        assert_eq!(replica.read().await.sequence(), 0);
+    }
+
+    #[tokio::test]
+    async fn matching_boot_id_allows_delta_application() {
+        let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
+        {
+            let mut lock = replica.write().await;
+            lock.apply_snapshot(Snapshot {
+                version: 1,
+                boot_id: Some("session-boot-id-A".to_string()),
+                auction_id: 0,
+                sequence: 0,
+                auction: crate::domain::competition::delta_replica::RawAuctionData {
+                    orders: vec![],
+                    prices: HashMap::new(),
+                },
+            })
+            .unwrap();
+        }
+
+        let block = r#"event: delta
+data: {"version":1,"bootId":"session-boot-id-A","fromSequence":0,"toSequence":1,"events":[]}
+
+"#;
+
+        let outcome = handle_sse_block(block, &replica, Some("session-boot-id-A"))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, BlockControl::Continue));
+        assert_eq!(replica.read().await.sequence(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_boot_id_in_envelope_does_not_block_application() {
+        let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
+        {
+            let mut lock = replica.write().await;
+            lock.apply_snapshot(Snapshot {
+                version: 1,
+                boot_id: None,
+                auction_id: 0,
+                sequence: 0,
+                auction: crate::domain::competition::delta_replica::RawAuctionData {
+                    orders: vec![],
+                    prices: HashMap::new(),
+                },
+            })
+            .unwrap();
+        }
+
+        let block = r#"event: delta
+data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
+
+"#;
+
+        let outcome = handle_sse_block(block, &replica, None).await.unwrap();
+        assert!(matches!(outcome, BlockControl::Continue));
+        assert_eq!(replica.read().await.sequence(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_present_envelope_missing_boot_id_allows_application() {
+        let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
+        {
+            let mut lock = replica.write().await;
+            lock.apply_snapshot(Snapshot {
+                version: 1,
+                boot_id: Some("session-boot-id-A".to_string()),
+                auction_id: 0,
+                sequence: 0,
+                auction: crate::domain::competition::delta_replica::RawAuctionData {
+                    orders: vec![],
+                    prices: HashMap::new(),
+                },
+            })
+            .unwrap();
+        }
+
+        let block = r#"event: delta
+data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
+
+"#;
+
+        let outcome = handle_sse_block(block, &replica, Some("session-boot-id-A"))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, BlockControl::Continue));
+        assert_eq!(replica.read().await.sequence(), 1);
+    }
+
     #[test]
     fn snapshot_requires_ready_state() {
         reset_delta_replica_for_tests();
@@ -1276,6 +1431,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
         replica
             .apply_snapshot(Snapshot {
                 version: 1,
+                boot_id: None,
                 auction_id: 0,
                 sequence: 1,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {

@@ -65,6 +65,10 @@ pub struct Metrics {
     /// Unknown fields observed in delta replica order payloads.
     pub delta_replica_unknown_fields_total: prometheus::IntCounter,
 
+    /// Unknown event types received in delta envelopes; indicates potential
+    /// driver/autopilot version mismatch and possible state divergence.
+    pub delta_replica_unknown_event_types_total: prometheus::IntCounter,
+
     /// Missing required fields in delta replica order payloads.
     pub delta_replica_missing_required_fields_total: prometheus::IntCounter,
 

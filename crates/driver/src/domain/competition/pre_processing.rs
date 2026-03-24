@@ -854,7 +854,7 @@ async fn build_solve_request_from_replica(
         "constructed solve request from delta replica"
     );
 
-    Ok(Some(SolveRequest::from_replica_parts_typed(
+    Ok(Some(SolveRequest::from_replica_parts(
         metadata.id,
         metadata.deadline,
         metadata.surplus_capturing_jit_order_owners.clone(),
@@ -1164,6 +1164,7 @@ mod tests {
         let _guard = DeltaReplicaTestGuard::acquire();
         set_replica_snapshot_for_tests(Snapshot {
             version: 1,
+            boot_id: None,
             auction_id: 5,
             sequence: 1,
             auction: RawAuctionData {

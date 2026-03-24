@@ -160,9 +160,26 @@ impl RunLoop {
             leader_lock_tracker.try_acquire().await;
 
             if !leader_lock_tracker.is_leader() {
-                // Follower nodes: update cache and sleep, keep last_block warm
-                let _ = self_arc.update_caches(&mut last_block, false).await;
-                tokio::time::sleep(FOLLOWER_POLL_INTERVAL).await;
+                // Follower: wait for a block notification (or timeout) before
+                // hitting the DB. This avoids continuous DB polling when idle.
+                let _ =
+                    tokio::time::timeout(FOLLOWER_POLL_INTERVAL, self_arc.wake_notify.notified())
+                        .await;
+
+                // Snapshot previous block before calling `update_caches` in
+                // case the call mutates `last_block` internally.
+                let prev_block = last_block.clone();
+
+                let new_block = self_arc.update_caches(&mut last_block, false).await;
+
+                let already_seen = prev_block == Some(new_block.hash);
+                // Ensure we record the observed block for future iterations.
+                last_block = Some(new_block.hash);
+
+                if already_seen {
+                    // No new block observed; back off to reduce DB load.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
                 continue;
             }
 

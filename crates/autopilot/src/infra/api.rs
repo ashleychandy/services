@@ -44,6 +44,14 @@ static DELTA_SYNC_API_KEY: OnceLock<Option<String>> = OnceLock::new();
 static DELTA_SYNC_API_KEY_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<Option<String>>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
+#[cfg(test)]
+static DELTA_SYNC_ENABLED_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<bool>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+static DELTA_SYNC_STREAM_BUFFER_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
 #[derive(Clone)]
 struct State {
     estimator: Arc<dyn NativePriceEstimating>,
@@ -72,6 +80,7 @@ struct DeltaStreamQuery {
 #[serde(rename_all = "camelCase")]
 struct DeltaSnapshotResponse {
     version: u32,
+    boot_id: String,
     auction_id: u64,
     auction_sequence: u64,
     sequence: u64,
@@ -92,6 +101,7 @@ struct DeltaChecksumResponse {
 #[serde(rename_all = "camelCase")]
 struct DeltaEventEnvelope {
     version: u32,
+    boot_id: String,
     auction_id: u64,
     auction_sequence: u64,
     from_sequence: u64,
@@ -213,6 +223,7 @@ async fn get_delta_snapshot(headers: HeaderMap, AxumState(state): AxumState<Stat
     let snapshot_bytes = match tokio::task::spawn_blocking(move || {
         let response = DeltaSnapshotResponse {
             version: 1,
+            boot_id: crate::solvable_orders::boot_id().to_string(),
             auction_id: snapshot.auction_id,
             auction_sequence: snapshot.auction_sequence,
             sequence: snapshot.sequence,
@@ -577,6 +588,7 @@ fn to_api_envelope(
 ) -> DeltaEventEnvelope {
     DeltaEventEnvelope {
         version: 1,
+        boot_id: crate::solvable_orders::boot_id().to_string(),
         auction_id: envelope.auction_id,
         auction_sequence: envelope.auction_sequence,
         from_sequence: envelope.from_sequence,
@@ -603,11 +615,23 @@ struct DrainOutcome {
     closed: bool,
 }
 
+/// Drains all live envelopes from `receiver` that haven't been covered by
+/// replay yet.
+///
+/// # Parameters
+/// - `receiver`: the broadcast receiver to drain
+/// - `already_replayed_up_to`: skip envelopes whose `to_sequence` is at or
+///   below this value — they are already included in the replay payloads
+/// - `client_baseline_sequence`: the client's original `after_sequence`,
+///   embedded into drained envelopes as `snapshot_sequence` so the client can
+///   validate its stream position
+/// - `highest_sequence_seen`: updated to the highest `to_sequence` observed so
+///   the live stream filter knows where to start
 fn drain_live_envelopes(
     receiver: &mut tokio::sync::broadcast::Receiver<crate::solvable_orders::DeltaEnvelope>,
-    checkpoint_sequence: u64,
-    snapshot_sequence: u64,
-    replay_to_sequence: &mut u64,
+    already_replayed_up_to: u64,
+    client_baseline_sequence: u64,
+    highest_sequence_seen: &mut u64,
 ) -> Result<DrainOutcome, DrainError> {
     let mut drained = Vec::new();
     let mut closed = false;
@@ -615,13 +639,23 @@ fn drain_live_envelopes(
     loop {
         match receiver.try_recv() {
             Ok(envelope) => {
-                if envelope.to_sequence <= checkpoint_sequence {
+                if envelope.to_sequence <= already_replayed_up_to {
+                    // Already covered by replay; skip.
                     continue;
                 }
-                *replay_to_sequence = envelope.to_sequence;
-                let payload =
-                    serde_json::to_string(&to_api_envelope(envelope, Some(snapshot_sequence)))
-                        .map_err(DrainError::Serialize)?;
+                // Make monotonicity explicit. If the stream ever yields a
+                // non-monotonic `to_sequence`, catch it in debug builds but
+                // avoid incorrect backward assignment in release builds.
+                debug_assert!(
+                    envelope.to_sequence >= *highest_sequence_seen,
+                    "non-monotonic delta to_sequence observed"
+                );
+                *highest_sequence_seen = (*highest_sequence_seen).max(envelope.to_sequence);
+                let payload = serde_json::to_string(&to_api_envelope(
+                    envelope,
+                    Some(client_baseline_sequence),
+                ))
+                .map_err(DrainError::Serialize)?;
                 drained.push(payload);
             }
             Err(TryRecvError::Empty) => break,
@@ -675,6 +709,16 @@ fn delta_stream_gone_response(
 }
 
 fn delta_sync_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(value) = *DELTA_SYNC_ENABLED_OVERRIDE
+            .lock()
+            .expect("delta sync enabled override lock poisoned")
+        {
+            return value;
+        }
+    }
+
     shared::env::flag_enabled(
         std::env::var("AUTOPILOT_DELTA_SYNC_ENABLED")
             .ok()
@@ -692,6 +736,16 @@ fn delta_stream_max_lag() -> u64 {
 }
 
 fn delta_stream_buffer_size() -> usize {
+    #[cfg(test)]
+    {
+        if let Some(value) = *DELTA_SYNC_STREAM_BUFFER_OVERRIDE
+            .lock()
+            .expect("delta sync stream buffer override lock poisoned")
+        {
+            return value;
+        }
+    }
+
     std::env::var("AUTOPILOT_DELTA_SYNC_STREAM_BUFFER")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -986,32 +1040,55 @@ mod tests {
         domain::auction::Price::try_new(eth::Ether::from(eth::U256::from(value))).unwrap()
     }
 
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<String>,
+    #[cfg(test)]
+    struct DeltaSyncEnabledGuard {
+        previous: Option<bool>,
     }
 
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
+    #[cfg(test)]
+    impl DeltaSyncEnabledGuard {
+        fn set(value: bool) -> Self {
+            let mut lock = DELTA_SYNC_ENABLED_OVERRIDE
+                .lock()
+                .expect("delta sync enabled override lock poisoned");
+            let previous = *lock;
+            *lock = Some(value);
+            Self { previous }
         }
     }
 
-    impl Drop for EnvGuard {
+    #[cfg(test)]
+    impl Drop for DeltaSyncEnabledGuard {
         fn drop(&mut self) {
-            if let Some(value) = &self.previous {
-                unsafe {
-                    std::env::set_var(self.key, value);
-                }
-            } else {
-                unsafe {
-                    std::env::remove_var(self.key);
-                }
-            }
+            *DELTA_SYNC_ENABLED_OVERRIDE
+                .lock()
+                .expect("delta sync enabled override lock poisoned") = self.previous;
+        }
+    }
+
+    #[cfg(test)]
+    struct DeltaStreamBufferGuard {
+        previous: Option<usize>,
+    }
+
+    #[cfg(test)]
+    impl DeltaStreamBufferGuard {
+        fn set(value: usize) -> Self {
+            let mut lock = DELTA_SYNC_STREAM_BUFFER_OVERRIDE
+                .lock()
+                .expect("delta sync stream buffer override lock poisoned");
+            let previous = *lock;
+            *lock = Some(value);
+            Self { previous }
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for DeltaStreamBufferGuard {
+        fn drop(&mut self) {
+            *DELTA_SYNC_STREAM_BUFFER_OVERRIDE
+                .lock()
+                .expect("delta sync stream buffer override lock poisoned") = self.previous;
         }
     }
 
@@ -1229,6 +1306,7 @@ mod tests {
     fn api_envelope_serializes_with_expected_wire_shape() {
         let envelope = DeltaEventEnvelope {
             version: 1,
+            boot_id: crate::solvable_orders::boot_id().to_string(),
             auction_id: 9,
             auction_sequence: 4,
             from_sequence: 10,
@@ -1287,7 +1365,7 @@ mod tests {
 
     #[tokio::test]
     async fn delta_sync_disabled_disables_routes() {
-        let _guard = EnvGuard::set("AUTOPILOT_DELTA_SYNC_ENABLED", "false");
+        let _guard = DeltaSyncEnabledGuard::set(false);
         let cache = test_cache().await;
         let state = State {
             estimator: Arc::new(StubNativePriceEstimator::default()),
@@ -1312,7 +1390,7 @@ mod tests {
 
     #[tokio::test]
     async fn delta_snapshot_http_response_is_consistent_with_history() {
-        let _guard = EnvGuard::set("AUTOPILOT_DELTA_SYNC_ENABLED", "true");
+        let _guard = DeltaSyncEnabledGuard::set(true);
         let cache = test_cache().await;
 
         let token = Address::repeat_byte(0x11);
@@ -1379,7 +1457,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires database-backed update pipeline"]
     async fn update_drives_snapshot_and_stream_end_to_end() {
-        let _guard = EnvGuard::set("AUTOPILOT_DELTA_SYNC_ENABLED", "true");
+        let _guard = DeltaSyncEnabledGuard::set(true);
         let (cache, postgres) = db_cache().await;
 
         let uid: database::OrderUid = ByteArray([0x11; 56]);
@@ -1447,8 +1525,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slow_consumer_gets_resync_required_event() {
-        let _guard_enabled = EnvGuard::set("AUTOPILOT_DELTA_SYNC_ENABLED", "true");
-        let _guard_buffer = EnvGuard::set("AUTOPILOT_DELTA_SYNC_STREAM_BUFFER", "1");
+        let _guard_enabled = DeltaSyncEnabledGuard::set(true);
+        let _guard_buffer = DeltaStreamBufferGuard::set(1);
         let cache = test_cache().await;
         cache
             .set_state_for_tests(

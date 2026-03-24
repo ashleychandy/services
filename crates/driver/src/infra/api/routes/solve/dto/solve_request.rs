@@ -233,32 +233,6 @@ impl SolveRequest {
         deadline: chrono::DateTime<chrono::Utc>,
         surplus_capturing_jit_order_owners: Vec<eth::Address>,
         tokens: Vec<(eth::Address, Option<eth::U256>, bool)>,
-        orders: Vec<serde_json::Value>,
-    ) -> Result<Self, serde_json::Error> {
-        Ok(Self {
-            id,
-            tokens: tokens
-                .into_iter()
-                .map(|(address, price, trusted)| Token {
-                    address,
-                    price,
-                    trusted,
-                })
-                .collect(),
-            orders: orders
-                .into_iter()
-                .map(serde_json::from_value)
-                .collect::<Result<Vec<_>, _>>()?,
-            deadline,
-            surplus_capturing_jit_order_owners,
-        })
-    }
-
-    pub(crate) fn from_replica_parts_typed(
-        id: i64,
-        deadline: chrono::DateTime<chrono::Utc>,
-        surplus_capturing_jit_order_owners: Vec<eth::Address>,
-        tokens: Vec<(eth::Address, Option<eth::U256>, bool)>,
         orders: Vec<Order>,
     ) -> Self {
         Self {
@@ -276,6 +250,26 @@ impl SolveRequest {
             surplus_capturing_jit_order_owners,
         }
     }
+
+    pub fn from_replica_parts_json(
+        id: i64,
+        deadline: chrono::DateTime<chrono::Utc>,
+        surplus_capturing_jit_order_owners: Vec<eth::Address>,
+        tokens: Vec<(eth::Address, Option<eth::U256>, bool)>,
+        orders: Vec<serde_json::Value>,
+    ) -> Result<Self, serde_json::Error> {
+        let orders = orders
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::from_replica_parts(
+            id,
+            deadline,
+            surplus_capturing_jit_order_owners,
+            tokens,
+            orders,
+        ))
+    }
 }
 
 #[serde_as]
@@ -291,7 +285,7 @@ struct Token {
 #[serde_as]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct Order {
+pub struct Order {
     #[serde_as(as = "serde_ext::Hex")]
     uid: [u8; order::UID_LEN],
     sell_token: eth::Address,

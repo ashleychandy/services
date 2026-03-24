@@ -39,13 +39,23 @@ use {
         cmp::Ordering,
         collections::{BTreeMap, HashMap, HashSet, VecDeque, btree_map::Entry},
         future::Future,
-        sync::Arc,
+        sync::{Arc, OnceLock},
         time::{Duration, Instant},
     },
     strum::VariantNames,
     tokio::sync::{Mutex, broadcast},
     tracing::instrument,
 };
+
+static BOOT_ID: OnceLock<String> = OnceLock::new();
+
+static DELTA_HISTORY_MIN_RETAINED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+pub fn boot_id() -> &'static str {
+    BOOT_ID
+        .get_or_init(|| uuid::Uuid::new_v4().to_string())
+        .as_str()
+}
 #[derive(prometheus_metric_storage::MetricStorage)]
 pub struct Metrics {
     /// Tracks success and failure of the solvable orders cache update task.
@@ -95,11 +105,12 @@ pub struct Metrics {
     /// Number of canonical delta fallbacks due to mismatched incremental diffs.
     delta_canonical_fallback_total: IntCounter,
 
+    /// Aggregate counter for any incremental delta failure (useful for
+    /// high-level health dashboards and alerting).
+    delta_incremental_failure_total: IntCounter,
+
     /// Total incremental delta comparisons.
     delta_incremental_event_total: IntCounter,
-
-    /// Incremental delta comparisons that mismatched the canonical diff.
-    delta_incremental_event_mismatch_total: IntCounter,
 
     /// Incremental delta filter transitions that referenced a missing order.
     delta_filter_transition_missing_order_total: IntCounter,
@@ -182,6 +193,11 @@ const MAX_DELTA_HISTORY: usize = 1024;
 const DEFAULT_DELTA_HISTORY_MAX_AGE: Duration = Duration::from_secs(300);
 const MIN_DELTA_HISTORY_RETAINED: usize = 10;
 const DELTA_BROADCAST_CAPACITY: usize = MAX_DELTA_HISTORY;
+
+#[cfg(test)]
+static DELTA_SYNC_HISTORY_MIN_RETAINED_OVERRIDE: std::sync::LazyLock<
+    std::sync::Mutex<Option<usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DeltaEvent {
@@ -447,13 +463,18 @@ impl SolvableOrdersCache {
         let _ = self.delta_sender.send(envelope);
     }
 
+    /// Updates the auction ID and emits an AuctionChanged delta event if
+    /// changed.
+    ///
+    /// This must only be called from the run loop, which serializes calls
+    /// externally. The cache lock alone is sufficient here.
     pub async fn set_auction_id(&self, auction_id: u64) {
-        let _update_guard = self.update_lock.lock().await;
         self.assert_update_lock_held();
         let mut lock = self.cache.lock().await;
         if let Some(inner) = lock.as_mut() {
             if let Some(envelope) = apply_auction_id_change(inner, auction_id) {
-                // Keep replay and live streams aligned by sending while the cache lock is held.
+                // Send while holding cache lock to keep replay + live ordering
+                // consistent (same pattern as update()).
                 let _ = self.delta_sender.send(envelope);
             }
         }
@@ -734,10 +755,10 @@ impl SolvableOrdersCache {
             self.collect_inputs_from_db(db_solvable_orders, block, false)
                 .await?
         };
-        let auction = self.project_final_auction(block, &inputs)?;
+        let canonical_auction = self.project_final_auction(block, &inputs)?;
         if let Some(previous_auction) = previous_auction.as_ref() {
             change_bundle.price_changed_tokens =
-                Self::compute_price_changed_tokens(previous_auction, &auction);
+                Self::compute_price_changed_tokens(previous_auction, &canonical_auction);
         }
         tracing::debug!(
             price_changed = change_bundle.price_changed_tokens.len(),
@@ -767,18 +788,41 @@ impl SolvableOrdersCache {
         let mut events = if inputs.indexed_state.is_some() {
             Self::compute_delta_events_from_inputs(
                 previous_auction.as_ref(),
-                &auction,
+                &canonical_auction,
                 &change_bundle,
                 self.shadow_compare_incremental,
             )
-            .unwrap_or_else(|| compute_delta_events(previous_auction.as_ref(), &auction))
+            .unwrap_or_else(|| compute_delta_events(previous_auction.as_ref(), &canonical_auction))
         } else {
-            compute_delta_events(previous_auction.as_ref(), &auction)
+            compute_delta_events(previous_auction.as_ref(), &canonical_auction)
         };
-        let (auction_for_cache, projection_mismatch) =
-            self.apply_incremental_changes(previous_auction.as_ref(), auction.clone(), &events);
+        let (auction_for_cache, projection_mismatch) = self.apply_incremental_changes(
+            previous_auction.as_ref(),
+            canonical_auction.clone(),
+            &events,
+        );
         if projection_mismatch {
-            events = compute_delta_events(previous_auction.as_ref(), &auction);
+            // Recompute events against the auction_for_cache (the canonical
+            // auction returned on mismatch) to ensure the invariant: events
+            // must reconstruct `auction_for_cache`.
+            events = compute_delta_events(previous_auction.as_ref(), &auction_for_cache);
+
+            // Verify the invariant in debug builds, but avoid unguarded unwrap.
+            #[cfg(debug_assertions)]
+            {
+                debug_assert!(
+                    previous_auction.is_some(),
+                    "previous_auction must be Some when projection_mismatch is true"
+                );
+                if let Some(prev) = previous_auction.clone() {
+                    let check = apply_delta_events_to_auction(prev, &events);
+                    debug_assert_eq!(
+                        normalized_delta_surface(check),
+                        normalized_delta_surface(auction_for_cache.clone()),
+                        "events must reconstruct auction_for_cache after mismatch fallback"
+                    );
+                }
+            }
         }
         let envelope = DeltaEnvelope {
             auction_id: current_auction_id,
@@ -1452,32 +1496,45 @@ impl SolvableOrdersCache {
         changed
     }
 
+    /// Applies delta events to the previous auction and compares with the
+    /// canonical full-rebuild `auction`.
+    ///
+    /// Returns `(auction_for_cache, mismatch)`:
+    /// - If no mismatch: returns the reconstructed auction with non-delta
+    ///   fields copied from `auction` (block number, jit owners). Events are
+    ///   correct.
+    /// - If mismatch: returns `auction` unchanged (canonical). Caller MUST
+    ///   recompute events via `compute_delta_events` against the returned
+    ///   value.
     fn apply_incremental_changes(
         &self,
         previous_auction: Option<&domain::RawAuctionData>,
         auction: domain::RawAuctionData,
         events: &[DeltaEvent],
     ) -> (domain::RawAuctionData, bool) {
-        if let Some(previous_auction) = previous_auction {
-            let reconstructed = apply_delta_events_to_auction(previous_auction.clone(), events);
-            let reconstructed_surface = normalized_delta_surface(reconstructed.clone());
-            let auction_surface = normalized_delta_surface(auction.clone());
+        let Some(previous_auction) = previous_auction else {
+            return (auction, false);
+        };
 
-            #[cfg(debug_assertions)]
-            debug_assert_eq!(
-                reconstructed_surface, auction_surface,
-                "incremental projection mismatch; delta logic bug"
-            );
+        let reconstructed = apply_delta_events_to_auction(previous_auction.clone(), events);
+        let reconstructed_surface = normalized_delta_surface(reconstructed.clone());
+        let auction_surface = normalized_delta_surface(auction.clone());
 
-            if reconstructed_surface == auction_surface {
-                return (with_non_delta_fields(reconstructed, &auction), false);
-            }
-            Metrics::get()
-                .delta_incremental_projection_mismatch_total
-                .inc();
-            return (auction, true);
+        if reconstructed_surface == auction_surface {
+            return (with_non_delta_fields(reconstructed, &auction), false);
         }
-        (auction, false)
+
+        Metrics::get()
+            .delta_incremental_projection_mismatch_total
+            .inc();
+
+        tracing::warn!(
+            "incremental projection mismatch detected; storing canonical auction and recomputing \
+             events from full diff. This indicates a bug in the incremental delta logic."
+        );
+
+        // Return canonical auction unchanged. Caller must recompute events.
+        (auction, true)
     }
 
     fn compute_delta_events_from_inputs(
@@ -1570,10 +1627,12 @@ impl SolvableOrdersCache {
                 emitted.insert(transition.uid);
                 events.push(DeltaEvent::OrderAdded(order.clone()));
             } else {
-                Metrics::get().delta_incremental_event_mismatch_total.inc();
                 Metrics::get()
                     .delta_filter_transition_missing_order_total
                     .inc();
+                // Aggregate incremental failure signal (preserves high-level
+                // visibility across distinct failure causes).
+                Metrics::get().delta_incremental_failure_total.inc();
                 tracing::warn!(uid = ?transition.uid, "missing order for filter transition");
                 return None;
             }
@@ -1614,7 +1673,8 @@ impl SolvableOrdersCache {
             Some(events)
         } else {
             Metrics::get().delta_canonical_fallback_total.inc();
-            Metrics::get().delta_incremental_event_mismatch_total.inc();
+            // Aggregate failure metric for dashboards/alerts.
+            Metrics::get().delta_incremental_failure_total.inc();
             tracing::warn!(
                 canonical_events = canonical.len(),
                 staged_events = events.len(),
@@ -1827,11 +1887,23 @@ fn apply_auction_id_change(inner: &mut Inner, auction_id: u64) -> Option<DeltaEn
 }
 
 fn delta_history_min_retained() -> usize {
-    std::env::var("AUTOPILOT_DELTA_SYNC_HISTORY_MIN_RETAINED")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value: &usize| *value > 0)
-        .unwrap_or(MIN_DELTA_HISTORY_RETAINED)
+    #[cfg(test)]
+    {
+        if let Some(value) = *DELTA_SYNC_HISTORY_MIN_RETAINED_OVERRIDE
+            .lock()
+            .expect("delta history min retained override lock poisoned")
+        {
+            return value;
+        }
+    }
+
+    *DELTA_HISTORY_MIN_RETAINED.get_or_init(|| {
+        std::env::var("AUTOPILOT_DELTA_SYNC_HISTORY_MIN_RETAINED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value: &usize| *value > 0)
+            .unwrap_or(MIN_DELTA_HISTORY_RETAINED)
+    })
 }
 
 fn delta_history_max_age() -> Duration {
@@ -2540,32 +2612,29 @@ mod tests {
         )
     }
 
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<String>,
+    #[cfg(test)]
+    struct DeltaHistoryMinRetainedGuard {
+        previous: Option<usize>,
     }
 
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
+    #[cfg(test)]
+    impl DeltaHistoryMinRetainedGuard {
+        fn set(value: usize) -> Self {
+            let mut lock = DELTA_SYNC_HISTORY_MIN_RETAINED_OVERRIDE
+                .lock()
+                .expect("delta history min retained override lock poisoned");
+            let previous = *lock;
+            *lock = Some(value);
+            Self { previous }
         }
     }
 
-    impl Drop for EnvGuard {
+    #[cfg(test)]
+    impl Drop for DeltaHistoryMinRetainedGuard {
         fn drop(&mut self) {
-            if let Some(value) = &self.previous {
-                unsafe {
-                    std::env::set_var(self.key, value);
-                }
-            } else {
-                unsafe {
-                    std::env::remove_var(self.key);
-                }
-            }
+            *DELTA_SYNC_HISTORY_MIN_RETAINED_OVERRIDE
+                .lock()
+                .expect("delta history min retained override lock poisoned") = self.previous;
         }
     }
 
@@ -4033,7 +4102,7 @@ mod tests {
 
     #[test]
     fn prune_delta_history_evicts_by_age() {
-        let _guard = EnvGuard::set("AUTOPILOT_DELTA_SYNC_HISTORY_MIN_RETAINED", "1");
+        let _guard = DeltaHistoryMinRetainedGuard::set(1);
 
         let now = chrono::Utc::now();
         let instant_now = Instant::now();
