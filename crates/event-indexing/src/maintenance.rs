@@ -207,7 +207,7 @@ mod tests {
 
         let service_maintenance = ServiceMaintenance {
             maintainers: vec![Arc::new(mock_maintenance)],
-            retry_delay: Duration::default(),
+            retry_delay: Duration::from_millis(50),
             metrics: Metrics::instance(observe::metrics::get_storage_registry()).unwrap(),
         };
 

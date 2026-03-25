@@ -115,6 +115,10 @@ async fn delta_sync_snapshot_stream_resync_recovery(web3: Web3) {
             control_before_resync,
         )
         .await;
+    #[cfg(feature = "test-helpers")]
+    {
+        driver::test_helpers::set_replica_preprocessing_override(Some(true));
+    }
     services
         .start_api(configs::orderbook::Configuration {
             order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
@@ -723,7 +727,6 @@ fn parse_sse_block(block: &str) -> (&str, Option<String>) {
 static DELTA_ENV_MUTEX: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
 struct DeltaEnvGuard {
-    previous: Vec<(&'static str, Option<String>)>,
     _lock: OwnedMutexGuard<()>,
 }
 
@@ -734,43 +737,29 @@ impl DeltaEnvGuard {
             .clone()
             .lock_owned()
             .await;
-        let keys = [
-            "AUTOPILOT_DELTA_SYNC_ENABLED",
-            "DRIVER_DELTA_SYNC_ENABLED",
-            "DRIVER_DELTA_SYNC_USE_REPLICA",
-            "DRIVER_DELTA_SYNC_AUTOPILOT_URL",
-        ];
-
-        let previous = keys
-            .iter()
-            .map(|key| (*key, std::env::var(key).ok()))
-            .collect::<Vec<_>>();
-
-        unsafe {
-            std::env::set_var("AUTOPILOT_DELTA_SYNC_ENABLED", "true");
-            std::env::set_var("DRIVER_DELTA_SYNC_ENABLED", "true");
-            std::env::set_var("DRIVER_DELTA_SYNC_USE_REPLICA", "true");
-            std::env::set_var("DRIVER_DELTA_SYNC_AUTOPILOT_URL", delta_api_url);
+        // Configure autopilot and driver via their test override APIs so other
+        // threads/tasks see the change safely. We do NOT write to the process
+        // environment here; that avoids TOCTOU and visibility issues for
+        // concurrently running tasks.
+        autopilot::infra::api::set_delta_sync_enabled_override(Some(true));
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            driver::infra::delta_sync::set_driver_delta_sync_enabled_override(Some(true));
+            let url = reqwest::Url::parse(&delta_api_url).expect("invalid delta api url");
+            driver::infra::delta_sync::set_driver_delta_sync_autopilot_url_override(Some(url));
+            // The driver uses a separate 'use replica' setting; enable via the
+            // test helper re-export so the function is accessible to this crate.
+            driver::test_helpers::set_replica_preprocessing_override(Some(true));
         }
 
-        Self {
-            previous,
-            _lock: lock,
-        }
+        Self { _lock: lock }
     }
 }
 
 impl Drop for DeltaEnvGuard {
     fn drop(&mut self) {
-        for (key, value) in &self.previous {
-            match value {
-                Some(value) => unsafe {
-                    std::env::set_var(key, value);
-                },
-                None => unsafe {
-                    std::env::remove_var(key);
-                },
-            }
-        }
+        // No-op: we intentionally do not restore process environment
+        // variables because we never mutated them in `enable()`. The mutex
+        // guard will be dropped automatically to release serialization.
     }
 }

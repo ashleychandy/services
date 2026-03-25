@@ -1165,7 +1165,7 @@ mod tests {
         set_replica_snapshot_for_tests(Snapshot {
             version: 1,
             boot_id: None,
-            auction_id: 5,
+            auction_id: Some(5),
             sequence: 1,
             auction: RawAuctionData {
                 orders: vec![],

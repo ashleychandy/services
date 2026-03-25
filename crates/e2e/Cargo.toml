@@ -38,7 +38,7 @@ const-hex = { workspace = true }
 contracts = { workspace = true }
 cow-amm = { workspace = true }
 database = { workspace = true }
-driver = { workspace = true }
+driver = { workspace = true, features = ["test-helpers"] }
 eth-domain-types = { workspace = true }
 ethrpc = { workspace = true, features = ["test-util"] }
 futures = { workspace = true }
@@ -69,6 +69,10 @@ url = { workspace = true }
 [dev-dependencies]
 refunder = { workspace = true }
 rstest = { workspace = true }
+
+[features]
+# Enable optional test-only helpers from workspace crates (no deps here).
+test-helpers = []
 
 [lints]
 workspace = true

@@ -895,7 +895,7 @@ impl Node {
         // For example if you set up a command that spins up a docker container.
         let command = std::env::var("ANVIL_COMMAND").unwrap_or("anvil".to_string());
 
-        let mut process = tokio::process::Command::new(command)
+        let mut process = tokio::process::Command::new(&command)
             .arg("--port")
             .arg("0") // use 0 to let `anvil` use any open port
             .arg("--balance")

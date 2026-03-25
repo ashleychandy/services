@@ -19,6 +19,8 @@ pub enum Error {
     SequenceMismatch { expected: u64, got: u64 },
     #[error("unknown event type received in envelope")]
     UnknownEventType,
+    #[error("snapshot missing auction_id")]
+    MissingSnapshotAuctionId,
     #[error("delta snapshot sequence mismatch: current={current}, snapshot={snapshot}")]
     SnapshotSequenceMismatch { current: u64, snapshot: u64 },
     #[error("order payload is missing uid")]
@@ -37,8 +39,7 @@ pub struct Snapshot {
     pub version: u32,
     #[serde(default)]
     pub boot_id: Option<String>,
-    #[serde(default)]
-    pub auction_id: u64,
+    pub auction_id: Option<u64>,
     pub sequence: u64,
     pub auction: RawAuctionData,
 }
@@ -85,6 +86,14 @@ pub enum Event {
     PriceChanged {
         token: Address,
         price: Option<String>,
+    },
+
+    BlockChanged {
+        block: u64,
+    },
+
+    JitOwnersChanged {
+        surplus_capturing_jit_order_owners: Vec<Address>,
     },
     /// Unknown events are ignored for forward compatibility; breaking changes
     /// must bump the protocol version.
@@ -191,8 +200,10 @@ impl Replica {
         let new_prices = snapshot.auction.prices;
         let new_sequence = snapshot.sequence;
 
+        let auction_id = snapshot.auction_id.ok_or(Error::MissingSnapshotAuctionId)?;
+
         self.sequence = new_sequence;
-        self.auction_id = snapshot.auction_id;
+        self.auction_id = auction_id;
         self.orders = new_orders;
         self.prices = new_prices;
         self.state = ReplicaState::Ready;
@@ -256,6 +267,8 @@ impl Replica {
         for event in envelope.events {
             match event {
                 Event::AuctionChanged { .. } => {}
+                Event::BlockChanged { .. } => {}
+                Event::JitOwnersChanged { .. } => {}
                 Event::OrderAdded { order } | Event::OrderUpdated { order } => {
                     let uid = order_uid(&order)?;
                     let order = Self::parse_order(&order)?;
@@ -275,13 +288,12 @@ impl Replica {
                 }
                 Event::Unknown => {
                     metrics::get().delta_replica_unknown_event_types_total.inc();
-                    tracing::warn!(
+                    tracing::debug!(
                         from_sequence = from_sequence,
                         to_sequence = to_sequence,
-                        "delta replica received unknown event type; forcing resnapshot to avoid \
-                         silent divergence. Consider upgrading the driver."
+                        "delta replica received unknown event type; ignoring for forward \
+                         compatibility"
                     );
-                    return Err(Error::UnknownEventType);
                 }
             }
         }
@@ -357,7 +369,10 @@ impl Replica {
             hasher.update(token.as_slice());
             let canonical = eth::U256::from_str(price)
                 .map(|value| value.to_string())
-                .unwrap_or_else(|_| price.to_string());
+                .expect(&format!(
+                    "checksum invariant violated: price string for token {token:?} was not a \
+                     canonical decimal"
+                ));
             hasher.update(canonical.as_bytes());
         }
         format!("0x{}", const_hex::encode(hasher.finalize()))
@@ -457,7 +472,6 @@ fn order_uid(order: &Value) -> Result<String, Error> {
 fn is_valid_order_uid(uid: &str) -> bool {
     uid.starts_with("0x")
         && uid.len() == 114
-        && (uid.len() - 2).is_multiple_of(2)
         && uid
             .as_bytes()
             .iter()
@@ -507,7 +521,7 @@ mod tests {
         Snapshot {
             version: 1,
             boot_id: None,
-            auction_id: 0,
+            auction_id: Some(0),
             sequence,
             auction: RawAuctionData {
                 orders,
@@ -552,7 +566,7 @@ mod tests {
             .apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 7,
                 auction: RawAuctionData {
                     orders: vec![valid_order(&uid_1)],
@@ -623,7 +637,7 @@ mod tests {
             .apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 10,
                 auction: RawAuctionData {
                     orders: vec![valid_order(&uid_from_u16(1)), valid_order(&uid_from_u16(2))],
@@ -778,7 +792,7 @@ mod tests {
             .apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 1,
                 auction: RawAuctionData {
                     orders: vec![],

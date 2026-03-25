@@ -485,7 +485,6 @@ impl SolvableOrdersCache {
     /// This must only be called from the run loop, which serializes calls
     /// externally. The cache lock alone is sufficient here.
     pub async fn set_auction_id(&self, auction_id: u64) {
-        self.assert_update_lock_held();
         let mut lock = self.cache.lock().await;
         if let Some(inner) = lock.as_mut() {
             if let Some(envelope) = apply_auction_id_change(inner, auction_id) {
@@ -791,7 +790,18 @@ impl SolvableOrdersCache {
 
         let mut cache = self.cache.lock().await;
 
-        let next_sequence = previous_delta_sequence.map(|value| value + 1).unwrap_or(1);
+        let next_sequence = previous_delta_sequence
+            .map(|value| {
+                value.checked_add(1).unwrap_or_else(|| {
+                    Metrics::get().delta_incremental_failure_total.inc();
+                    tracing::error!(
+                        previous_delta_sequence = value,
+                        "delta sequence overflow, saturating to u64::MAX"
+                    );
+                    u64::MAX
+                })
+            })
+            .unwrap_or(1);
         let current_auction_id = previous_auction_id.unwrap_or_default();
         let next_auction_sequence = previous_auction_sequence
             .map(|value| value + 1)
@@ -818,26 +828,32 @@ impl SolvableOrdersCache {
             &events,
         );
         if projection_mismatch {
-            // Recompute events against the auction_for_cache (the canonical
-            // auction returned on mismatch) to ensure the invariant: events
-            // must reconstruct `auction_for_cache`.
             events = compute_delta_events(previous_auction.as_ref(), &auction_for_cache);
 
-            // Verify the invariant in debug builds, but avoid unguarded unwrap.
-            #[cfg(debug_assertions)]
-            {
-                debug_assert!(
-                    previous_auction.is_some(),
-                    "previous_auction must be Some when projection_mismatch is true"
-                );
-                if let Some(prev) = previous_auction.clone() {
-                    let check = apply_delta_events_to_auction(prev, &events);
-                    debug_assert_eq!(
-                        normalized_delta_surface(check),
-                        normalized_delta_surface(auction_for_cache.clone()),
-                        "events must reconstruct auction_for_cache after mismatch fallback"
+            // Record the mismatch and attempt to verify the fallback path.
+            Metrics::get()
+                .delta_incremental_projection_mismatch_total
+                .inc();
+            tracing::warn!("incremental projection mismatch detected, using canonical fallback");
+
+            if let Some(prev) = previous_auction.clone() {
+                let check = apply_delta_events_to_auction(prev, &events);
+                let lhs = normalized_delta_surface(check);
+                let rhs = normalized_delta_surface(auction_for_cache.clone());
+                if lhs != rhs {
+                    Metrics::get().delta_incremental_failure_total.inc();
+                    tracing::error!(
+                        "projection_mismatch fallback failed to reconstruct canonical auction",
                     );
                 }
+                // Keep the debug-only strict asserts for developers.
+                #[cfg(debug_assertions)]
+                debug_assert_eq!(
+                    lhs, rhs,
+                    "events must reconstruct auction_for_cache after mismatch fallback"
+                );
+            } else {
+                tracing::error!("previous_auction must be Some when projection_mismatch is true");
             }
         }
         let envelope = DeltaEnvelope {

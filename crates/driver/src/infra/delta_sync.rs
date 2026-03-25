@@ -1,6 +1,6 @@
 #[cfg(any(test, feature = "test-helpers"))]
 use std::sync::Mutex as StdMutex;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use {
@@ -39,12 +39,33 @@ static DELTA_CHECKSUM_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("failed to create reqwest client for delta checksum")
 });
+#[cfg(any(test, feature = "test-helpers"))]
+static DRIVER_DELTA_SYNC_ENABLED_OVERRIDE: LazyLock<std::sync::Mutex<Option<bool>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn set_driver_delta_sync_enabled_override(value: Option<bool>) {
+    *DRIVER_DELTA_SYNC_ENABLED_OVERRIDE
+        .lock()
+        .expect("driver delta sync enabled override lock poisoned") = value;
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+static DRIVER_DELTA_SYNC_AUTOPILOT_URL_OVERRIDE: LazyLock<std::sync::Mutex<Option<Url>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn set_driver_delta_sync_autopilot_url_override(value: Option<Url>) {
+    *DRIVER_DELTA_SYNC_AUTOPILOT_URL_OVERRIDE
+        .lock()
+        .expect("driver delta sync autopilot url override lock poisoned") = value;
+}
 static REPLICA_PREPROCESSING_ENABLED: OnceLock<bool> = OnceLock::new();
 static DELTA_STREAM_GONE_RETRY_THRESHOLD: OnceLock<u64> = OnceLock::new();
 static DELTA_REPLICA_MAX_STALENESS: OnceLock<Option<Duration>> = OnceLock::new();
 static DELTA_REPLICA_RESNAPSHOT_INTERVAL: OnceLock<Option<Duration>> = OnceLock::new();
 static BOOTSTRAP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 static REPLICA_PREPROCESSING_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Debug, Clone)]
@@ -88,6 +109,31 @@ struct DeltaChecksumResponse {
 ///
 /// The task keeps a local replica up to date from snapshot + delta SSE stream.
 pub fn maybe_spawn_from_env() -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    {
+        let override_lock = DRIVER_DELTA_SYNC_ENABLED_OVERRIDE
+            .lock()
+            .expect("driver delta sync enabled override lock poisoned");
+        if let Some(v) = *override_lock {
+            if !v {
+                tracing::warn!("driver delta sync disabled via test override");
+                return None;
+            }
+            // Some(true): fallthrough, skipping the env check below.
+        } else {
+            if !shared::env::flag_enabled(
+                std::env::var("DRIVER_DELTA_SYNC_ENABLED").ok().as_deref(),
+                true,
+            ) {
+                tracing::warn!("driver delta sync disabled via DRIVER_DELTA_SYNC_ENABLED");
+                return None;
+            }
+        }
+    }
+
+    // Non-test builds (or when test-helpers feature is disabled) still consult
+    // the environment flag normally.
+    #[cfg(not(any(test, feature = "test-helpers")))]
     if !shared::env::flag_enabled(
         std::env::var("DRIVER_DELTA_SYNC_ENABLED").ok().as_deref(),
         true,
@@ -318,7 +364,7 @@ pub fn replica_preprocessing_enabled() -> bool {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 fn replica_preprocessing_override() -> Option<bool> {
     match REPLICA_PREPROCESSING_OVERRIDE.load(Ordering::SeqCst) {
         1 => Some(true),
@@ -327,8 +373,8 @@ fn replica_preprocessing_override() -> Option<bool> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn set_replica_preprocessing_override(value: Option<bool>) {
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn set_replica_preprocessing_override(value: Option<bool>) {
     let encoded = match value {
         Some(true) => 1,
         Some(false) => 2,
@@ -602,7 +648,19 @@ async fn handle_sse_block(
 }
 
 fn delta_sync_base_url_from_env() -> Option<Url> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    {
+        if let Some(url) = DRIVER_DELTA_SYNC_AUTOPILOT_URL_OVERRIDE
+            .lock()
+            .expect("driver delta sync autopilot url override lock poisoned")
+            .clone()
+        {
+            return Some(url);
+        }
+    }
+
     let url = std::env::var("DRIVER_DELTA_SYNC_AUTOPILOT_URL").ok()?;
+
     match Url::parse(&url) {
         Ok(url) => Some(url),
         Err(err) => {
@@ -874,7 +932,7 @@ mod tests {
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![],
@@ -939,7 +997,7 @@ mod tests {
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![],
@@ -964,7 +1022,7 @@ mod tests {
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 2,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![],
@@ -997,7 +1055,7 @@ mod tests {
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![],
@@ -1031,7 +1089,7 @@ mod tests {
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![],
@@ -1118,7 +1176,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 3,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![valid_order(&uid)],
@@ -1169,7 +1227,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 10,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![valid_order(&uid)],
@@ -1286,7 +1344,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 1,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![valid_order(&valid_uid(1))],
@@ -1314,7 +1372,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: Some("session-boot-id-A".to_string()),
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![],
@@ -1344,7 +1402,7 @@ data: {"version":1,"bootId":"session-boot-id-B","fromSequence":0,"toSequence":1,
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: Some("session-boot-id-A".to_string()),
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![],
@@ -1374,7 +1432,7 @@ data: {"version":1,"bootId":"session-boot-id-A","fromSequence":0,"toSequence":1,
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![],
@@ -1402,7 +1460,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: Some("session-boot-id-A".to_string()),
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![],
@@ -1432,7 +1490,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             .apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
-                auction_id: 0,
+                auction_id: Some(0),
                 sequence: 1,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
                     orders: vec![valid_order(&valid_uid(1))],

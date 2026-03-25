@@ -49,9 +49,22 @@ static DELTA_SYNC_API_KEY: OnceLock<Option<String>> = OnceLock::new();
 static DELTA_SYNC_API_KEY_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<Option<String>>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
-#[cfg(test)]
-thread_local! {
-    static DELTA_SYNC_ENABLED_OVERRIDE: std::cell::RefCell<Option<bool>> = std::cell::RefCell::new(None);
+#[cfg(any(test, feature = "test-util"))]
+static DELTA_SYNC_ENABLED_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<bool>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_delta_sync_enabled_override(value: Option<bool>) {
+    *DELTA_SYNC_ENABLED_OVERRIDE
+        .lock()
+        .expect("delta sync enabled override lock poisoned") = value;
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub fn clear_delta_sync_enabled_override() {
+    *DELTA_SYNC_ENABLED_OVERRIDE
+        .lock()
+        .expect("delta sync enabled override lock poisoned") = None;
 }
 
 #[cfg(test)]
@@ -731,10 +744,12 @@ fn delta_stream_gone_response(
 }
 
 fn delta_sync_enabled() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     {
-        let override_val = DELTA_SYNC_ENABLED_OVERRIDE.with(|cell| *cell.borrow());
-        if let Some(value) = override_val {
+        if let Some(value) = *DELTA_SYNC_ENABLED_OVERRIDE
+            .lock()
+            .expect("delta sync enabled override lock poisoned")
+        {
             return value;
         }
     }
@@ -1074,11 +1089,14 @@ mod tests {
     #[cfg(test)]
     impl DeltaSyncEnabledGuard {
         fn set(value: bool) -> Self {
-            let previous = DELTA_SYNC_ENABLED_OVERRIDE.with(|cell| {
-                let prev = *cell.borrow();
-                *cell.borrow_mut() = Some(value);
+            let previous = {
+                let mut guard = DELTA_SYNC_ENABLED_OVERRIDE
+                    .lock()
+                    .expect("delta sync enabled override lock poisoned");
+                let prev = *guard;
+                *guard = Some(value);
                 prev
-            });
+            };
             Self { previous }
         }
     }
@@ -1086,9 +1104,10 @@ mod tests {
     #[cfg(test)]
     impl Drop for DeltaSyncEnabledGuard {
         fn drop(&mut self) {
-            DELTA_SYNC_ENABLED_OVERRIDE.with(|cell| {
-                *cell.borrow_mut() = self.previous;
-            });
+            let mut guard = DELTA_SYNC_ENABLED_OVERRIDE
+                .lock()
+                .expect("delta sync enabled override lock poisoned");
+            *guard = self.previous;
         }
     }
 
