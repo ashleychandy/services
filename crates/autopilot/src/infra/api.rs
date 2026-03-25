@@ -95,7 +95,7 @@ struct DeltaStreamQuery {
     after_sequence: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeltaSnapshotResponse {
     version: u32,
@@ -107,7 +107,7 @@ struct DeltaSnapshotResponse {
     auction: dto::RawAuctionData,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeltaChecksumResponse {
     version: u32,
@@ -842,20 +842,6 @@ fn delta_sync_api_key() -> Option<String> {
         .clone()
 }
 
-#[cfg(test)]
-fn set_delta_sync_api_key_override(value: Option<String>) {
-    *DELTA_SYNC_API_KEY_OVERRIDE
-        .lock()
-        .expect("delta sync api key override lock poisoned") = Some(value);
-}
-
-#[cfg(test)]
-fn clear_delta_sync_api_key_override() {
-    *DELTA_SYNC_API_KEY_OVERRIDE
-        .lock()
-        .expect("delta sync api key override lock poisoned") = None;
-}
-
 #[derive(prometheus_metric_storage::MetricStorage)]
 #[metric(subsystem = "delta_sync")]
 struct DeltaMetrics {
@@ -1137,18 +1123,29 @@ mod tests {
         }
     }
 
-    struct ApiKeyOverrideGuard;
+    #[cfg(test)]
+    struct ApiKeyOverrideGuard {
+        previous: Option<Option<String>>,
+    }
 
+    #[cfg(test)]
     impl ApiKeyOverrideGuard {
         fn set(value: Option<String>) -> Self {
-            set_delta_sync_api_key_override(value);
-            Self
+            let mut lock = DELTA_SYNC_API_KEY_OVERRIDE
+                .lock()
+                .expect("delta sync api key override lock poisoned");
+            let previous = lock.clone();
+            *lock = Some(value);
+            Self { previous }
         }
     }
 
+    #[cfg(test)]
     impl Drop for ApiKeyOverrideGuard {
         fn drop(&mut self) {
-            clear_delta_sync_api_key_override();
+            *DELTA_SYNC_API_KEY_OVERRIDE
+                .lock()
+                .expect("delta sync api key override lock poisoned") = self.previous.clone();
         }
     }
 
@@ -1262,58 +1259,7 @@ mod tests {
         (cache, postgres)
     }
 
-    fn apply_events(
-        previous: domain::RawAuctionData,
-        events: &[DeltaEvent],
-    ) -> domain::RawAuctionData {
-        let mut orders: std::collections::HashMap<domain::OrderUid, domain::Order> = previous
-            .orders
-            .into_iter()
-            .map(|order| (order.uid, order))
-            .collect();
-        let mut prices = previous.prices;
 
-        // Apply all delta events, including non-delta root fields.
-        let mut block = previous.block;
-        let mut surplus_capturing_jit_order_owners = previous.surplus_capturing_jit_order_owners;
-
-        for event in events {
-            match event {
-                DeltaEvent::AuctionChanged { .. } => {}
-                DeltaEvent::BlockChanged { block: b } => {
-                    block = *b;
-                }
-                DeltaEvent::OrderAdded(order) | DeltaEvent::OrderUpdated(order) => {
-                    orders.insert(order.uid, order.clone());
-                }
-                DeltaEvent::OrderRemoved(uid) => {
-                    orders.remove(uid);
-                }
-                DeltaEvent::PriceChanged { token, price } => {
-                    if let Some(price) = price {
-                        prices.insert((*token).into(), *price);
-                    } else {
-                        prices.remove(&(*token).into());
-                    }
-                }
-                DeltaEvent::JitOwnersChanged {
-                    surplus_capturing_jit_order_owners: owners,
-                } => {
-                    surplus_capturing_jit_order_owners = owners.clone();
-                }
-            }
-        }
-
-        let mut orders = orders.into_values().collect::<Vec<_>>();
-        orders.sort_by_key(|order| order.uid.0);
-
-        domain::RawAuctionData {
-            block,
-            orders,
-            prices,
-            surplus_capturing_jit_order_owners,
-        }
-    }
 
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -1855,5 +1801,293 @@ mod tests {
         );
         assert_eq!(payload["oldestAvailable"], 5);
         assert_eq!(payload["latestSequence"], 12);
+    }
+
+    #[tokio::test]
+    async fn get_delta_snapshot_when_cache_has_data() {
+        let _guard = DeltaSyncEnabledGuard::set(true);
+        let cache = test_cache().await;
+
+        let auction = domain::RawAuctionData {
+            block: 42,
+            orders: vec![test_order(1, 100)],
+            prices: std::collections::HashMap::from([(
+                Address::repeat_byte(0xAA).into(),
+                test_price(2000),
+            )]),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(auction.clone(), 1, 5, 5, VecDeque::new())
+            .await;
+
+        let state = State {
+            estimator: Arc::new(StubNativePriceEstimator::default()),
+            allowed_timeout: MIN_TIMEOUT..=MIN_TIMEOUT,
+            solvable_orders_cache: cache,
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/delta/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("Content-Type").unwrap(),
+            "application/json"
+        );
+
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let snapshot: DeltaSnapshotResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snapshot.version, 1);
+        assert_eq!(snapshot.sequence, 5);
+        assert_eq!(snapshot.auction_id, 1);
+        assert_eq!(snapshot.auction.orders.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_delta_snapshot_requires_auth_when_api_key_configured() {
+        let _guard_enabled = DeltaSyncEnabledGuard::set(true);
+        let _guard_key = ApiKeyOverrideGuard::set(Some("secret123".to_string()));
+        let cache = test_cache().await;
+
+        let state = State {
+            estimator: Arc::new(StubNativePriceEstimator::default()),
+            allowed_timeout: MIN_TIMEOUT..=MIN_TIMEOUT,
+            solvable_orders_cache: cache,
+        };
+        let app = build_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/delta/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response_with_key = app
+            .oneshot(
+                Request::builder()
+                    .uri("/delta/snapshot")
+                    .header("X-Delta-Sync-Api-Key", "secret123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response_with_key.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn get_delta_checksum_returns_204_when_no_snapshot() {
+        let _guard = DeltaSyncEnabledGuard::set(true);
+        let cache = test_cache().await;
+
+        let state = State {
+            estimator: Arc::new(StubNativePriceEstimator::default()),
+            allowed_timeout: MIN_TIMEOUT..=MIN_TIMEOUT,
+            solvable_orders_cache: cache,
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/delta/checksum")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn get_delta_checksum_returns_correct_hash_when_snapshot_exists() {
+        let _guard = DeltaSyncEnabledGuard::set(true);
+        let cache = test_cache().await;
+
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: vec![test_order(1, 100)],
+            prices: std::collections::HashMap::from([(
+                Address::repeat_byte(0xBB).into(),
+                test_price(3000),
+            )]),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(auction, 1, 10, 10, VecDeque::new())
+            .await;
+
+        let state = State {
+            estimator: Arc::new(StubNativePriceEstimator::default()),
+            allowed_timeout: MIN_TIMEOUT..=MIN_TIMEOUT,
+            solvable_orders_cache: cache,
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/delta/checksum")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let checksum: DeltaChecksumResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(checksum.version, 1);
+        assert_eq!(checksum.sequence, 10);
+        assert!(!checksum.order_uid_hash.is_empty());
+        assert!(!checksum.price_hash.is_empty());
+    }
+
+    #[test]
+    fn delta_stream_buffer_size_respects_override() {
+        let _guard = DeltaStreamBufferGuard::set(256);
+        assert_eq!(delta_stream_buffer_size(), 256);
+    }
+
+    #[tokio::test]
+    async fn drain_live_envelopes_with_closed_true_triggers_resync_control_event() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(8);
+        let mut replay_to_sequence = 0;
+
+        drop(sender);
+
+        let drained = drain_live_envelopes(&mut receiver, 0, 0, &mut replay_to_sequence).unwrap();
+
+        assert!(drained.closed);
+        assert_eq!(drained.payloads.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_envelopes_with_snapshot_sequence_field_populated() {
+        let _guard_enabled = DeltaSyncEnabledGuard::set(true);
+        let _guard_key = ApiKeyOverrideGuard::set(None);
+        let cache = test_cache().await;
+
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: vec![test_order(1, 100)],
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        let envelope = DeltaEnvelope {
+            auction_id: 1,
+            auction_sequence: 1,
+            from_sequence: 0,
+            to_sequence: 1,
+            published_at: chrono::Utc::now(),
+            published_at_instant: Instant::now(),
+            events: vec![DeltaEvent::OrderAdded(test_order(1, 100))],
+        };
+        cache
+            .set_state_for_tests(auction, 1, 1, 1, VecDeque::from([envelope]))
+            .await;
+
+        let state = State {
+            estimator: Arc::new(StubNativePriceEstimator::default()),
+            allowed_timeout: MIN_TIMEOUT..=MIN_TIMEOUT,
+            solvable_orders_cache: cache,
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/delta/stream?after_sequence=0")
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body_stream = response.into_body().into_data_stream();
+        let chunk = tokio::time::timeout(
+            Duration::from_secs(1),
+            futures::StreamExt::next(&mut body_stream),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&chunk);
+        assert!(text.contains("snapshotSequence"));
+    }
+
+    #[test]
+    fn api_key_hash_produces_consistent_short_hex_prefix() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Delta-Sync-Api-Key", HeaderValue::from_static("test_key"));
+
+        let hash1 = api_key_hash(&headers).unwrap();
+        let hash2 = api_key_hash(&headers).unwrap();
+
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 16);
+        assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn boot_id_field_appears_in_envelope_responses() {
+        let envelope = DeltaEventEnvelope {
+            version: 1,
+            boot_id: crate::solvable_orders::boot_id().to_string(),
+            auction_id: 1,
+            auction_sequence: 1,
+            from_sequence: 0,
+            to_sequence: 1,
+            snapshot_sequence: None,
+            published_at: "2026-03-20T00:00:00Z".to_string(),
+            events: vec![],
+        };
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains("bootId"));
+        assert!(json.contains(&crate::solvable_orders::boot_id()));
+    }
+
+    #[test]
+    fn active_stream_guard_increments_and_decrements_gauge() {
+        let initial = DeltaMetrics::get().active_streams.get();
+
+        {
+            let _guard = ActiveStreamGuard::new(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+                Some("test_hash".to_string()),
+            );
+            assert_eq!(DeltaMetrics::get().active_streams.get(), initial + 1);
+        }
+
+        assert_eq!(DeltaMetrics::get().active_streams.get(), initial);
     }
 }

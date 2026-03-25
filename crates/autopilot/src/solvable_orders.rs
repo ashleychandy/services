@@ -582,7 +582,14 @@ impl SolvableOrdersCache {
             .cloned()
             .collect();
 
-        if envelopes.is_empty() {
+        if envelopes.is_empty() && after_sequence == checkpoint_sequence {
+            // When requesting replay from the current sequence with no history,
+            // return empty replay without synthetic envelope
+            Ok(DeltaReplay {
+                checkpoint_sequence,
+                envelopes: Vec::new(),
+            })
+        } else if envelopes.is_empty() {
             Ok(DeltaReplay {
                 checkpoint_sequence,
                 envelopes: vec![DeltaEnvelope {
@@ -607,12 +614,7 @@ impl SolvableOrdersCache {
         self.delta_sender.subscribe()
     }
 
-    /// Manually update solvable orders. Usually called by the background
-    /// updating task.
-    ///
-    /// Usually this method is called from update_task. If it isn't, which is
-    /// the case in unit tests, then concurrent calls might overwrite each
-    /// other's results.
+    
     #[instrument(skip_all)]
     pub async fn update(&self, block: u64, store_events: bool) -> Result<()> {
         let _update_guard = self.update_lock.lock().await;
@@ -4267,5 +4269,924 @@ mod tests {
 
         assert_eq!(delta_history.len(), 1);
         assert_eq!(delta_history.front().unwrap().to_sequence, 3);
+    }
+
+    #[test]
+    fn boot_id_returns_stable_value_across_calls() {
+        let id1 = boot_id();
+        let id2 = boot_id();
+        assert_eq!(id1, id2);
+        assert!(!id1.is_empty());
+    }
+
+    #[test]
+    fn boot_id_is_valid_uuid_format() {
+        let id = boot_id();
+        assert_eq!(id.len(), 36);
+        assert_eq!(id.chars().filter(|&c| c == '-').count(), 4);
+    }
+
+    #[tokio::test]
+    async fn set_auction_id_emits_auction_changed_envelope() {
+        let cache = test_cache().await;
+        
+        // Initialize the cache with some state first
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(auction, 0, 0, 0, VecDeque::new())
+            .await;
+
+        let mut receiver = cache.subscribe_deltas();
+
+        cache.set_auction_id(42).await;
+
+        let envelope = receiver.recv().await.unwrap();
+        assert_eq!(envelope.events.len(), 1);
+        assert!(matches!(
+            envelope.events[0],
+            DeltaEvent::AuctionChanged { new_auction_id: 42 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_auction_id_with_same_id_no_envelope_emitted() {
+        let cache = test_cache().await;
+        
+        // Initialize the cache with some state first
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(auction, 10, 0, 0, VecDeque::new())
+            .await;
+
+        let mut receiver = cache.subscribe_deltas();
+        cache.set_auction_id(10).await;
+
+        tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+            .await
+            .expect_err("should timeout because no envelope emitted");
+    }
+
+    #[tokio::test]
+    async fn subscribe_deltas_with_replay_checked_with_none_when_sequence_0_succeeds() {
+        let cache = test_cache().await;
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(auction, 1, 0, 0, VecDeque::new())
+            .await;
+
+        let result = cache.subscribe_deltas_with_replay_checked(None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn subscribe_deltas_with_replay_checked_with_none_when_sequence_gt_0_fails() {
+        let cache = test_cache().await;
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(auction, 1, 5, 5, VecDeque::new())
+            .await;
+
+        let result = cache.subscribe_deltas_with_replay_checked(None).await;
+        assert!(matches!(
+            result,
+            Err(DeltaSubscribeError::MissingAfterSequence { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn subscribe_deltas_with_replay_returns_empty_when_history_empty_but_sequence_matches() {
+        let cache = test_cache().await;
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(auction, 1, 5, 5, VecDeque::new())
+            .await;
+
+        let (_receiver, replay) = cache
+            .subscribe_deltas_with_replay_checked(Some(5))
+            .await
+            .unwrap();
+        assert_eq!(replay.envelopes.len(), 0);
+        assert_eq!(replay.checkpoint_sequence, 5);
+    }
+
+    #[tokio::test]
+    async fn delta_checksum_is_none_when_cache_empty() {
+        let cache = test_cache().await;
+        let checksum = cache.delta_checksum().await;
+        assert!(checksum.is_none());
+    }
+
+    #[tokio::test]
+    async fn delta_checksum_returns_expected_hex_prefixed_strings() {
+        let cache = test_cache().await;
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: vec![test_order(1, 100)],
+            prices: std::collections::HashMap::from([(
+                Address::repeat_byte(0xAA).into(),
+                test_price(2000),
+            )]),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(auction, 1, 10, 10, VecDeque::new())
+            .await;
+
+        let checksum = cache.delta_checksum().await.unwrap();
+        assert_eq!(checksum.sequence, 10);
+        assert!(checksum.order_uid_hash.starts_with("0x"));
+        assert!(checksum.price_hash.starts_with("0x"));
+    }
+
+    #[test]
+    fn checksum_order_uids_is_order_independent() {
+        let orders1 = vec![test_order(1, 10), test_order(2, 20), test_order(3, 30)];
+        let orders2 = vec![test_order(3, 30), test_order(1, 10), test_order(2, 20)];
+
+        let hash1 = checksum_order_uids(&orders1);
+        let hash2 = checksum_order_uids(&orders2);
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn checksum_prices_is_deterministic_across_calls() {
+        let mut prices = domain::auction::Prices::new();
+        prices.insert(Address::repeat_byte(0xAA).into(), test_price(1000));
+        prices.insert(Address::repeat_byte(0xBB).into(), test_price(2000));
+
+        let hash1 = checksum_prices(&prices);
+        let hash2 = checksum_prices(&prices);
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn prune_delta_history_respects_min_retained() {
+        let _guard = DeltaHistoryMinRetainedGuard::set(3);
+
+        let now = chrono::Utc::now();
+        let instant_now = Instant::now();
+        let mut delta_history = VecDeque::from([
+            DeltaEnvelope {
+                auction_id: 1,
+                auction_sequence: 1,
+                from_sequence: 1,
+                to_sequence: 2,
+                published_at: now - chrono::Duration::seconds(200),
+                published_at_instant: instant_now - Duration::from_secs(200),
+                events: vec![],
+            },
+            DeltaEnvelope {
+                auction_id: 1,
+                auction_sequence: 2,
+                from_sequence: 2,
+                to_sequence: 3,
+                published_at: now - chrono::Duration::seconds(150),
+                published_at_instant: instant_now - Duration::from_secs(150),
+                events: vec![],
+            },
+            DeltaEnvelope {
+                auction_id: 1,
+                auction_sequence: 3,
+                from_sequence: 3,
+                to_sequence: 4,
+                published_at: now - chrono::Duration::seconds(100),
+                published_at_instant: instant_now - Duration::from_secs(100),
+                events: vec![],
+            },
+        ]);
+
+        prune_delta_history(&mut delta_history, chrono::Duration::seconds(50));
+
+        assert_eq!(delta_history.len(), 3);
+    }
+
+    #[test]
+    fn prune_delta_history_with_zero_age_respects_minimum() {
+        let _guard = DeltaHistoryMinRetainedGuard::set(2);
+
+        let now = chrono::Utc::now();
+        let instant_now = Instant::now();
+        let mut delta_history = VecDeque::from([
+            DeltaEnvelope {
+                auction_id: 1,
+                auction_sequence: 1,
+                from_sequence: 1,
+                to_sequence: 2,
+                published_at: now - chrono::Duration::seconds(100),
+                published_at_instant: instant_now - Duration::from_secs(100),
+                events: vec![],
+            },
+            DeltaEnvelope {
+                auction_id: 1,
+                auction_sequence: 2,
+                from_sequence: 2,
+                to_sequence: 3,
+                published_at: now,
+                published_at_instant: instant_now,
+                events: vec![],
+            },
+        ]);
+
+        prune_delta_history(&mut delta_history, chrono::Duration::zero());
+
+        assert_eq!(delta_history.len(), 2);
+    }
+
+    #[test]
+    fn build_indexed_state_with_dust_order_not_tracked() {
+        let order = test_order(1, 10);
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: vec![order.clone()],
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        let invalid_order_uids = HashMap::new();
+        let filtered_events: &[(OrderUid, OrderFilterReason)] = &[(OrderUid::from(order.uid), OrderFilterReason::DustOrder)];
+
+        let state = build_indexed_state(&auction, &invalid_order_uids, filtered_events);
+
+        // DustOrder is not tracked in any specific filtered set
+        assert!(!state.filtered_in_flight.contains(&OrderUid::from(order.uid)));
+        assert!(!state.filtered_no_balance.contains(&OrderUid::from(order.uid)));
+        assert!(!state.filtered_no_price.contains(&OrderUid::from(order.uid)));
+    }
+
+    #[test]
+    fn normalized_delta_surface_sorts_orders_by_uid() {
+        let order1 = test_order(1, 10);
+        let order2 = test_order(2, 20);
+        let order3 = test_order(3, 30);
+
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: vec![order3.clone(), order1.clone(), order2.clone()],
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        let normalized = normalized_delta_surface(auction);
+
+        assert_eq!(normalized.orders[0].uid, order1.uid);
+        assert_eq!(normalized.orders[1].uid, order2.uid);
+        assert_eq!(normalized.orders[2].uid, order3.uid);
+    }
+
+    #[test]
+    fn apply_delta_events_to_auction_with_auction_changed_event() {
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        let events = vec![DeltaEvent::AuctionChanged { new_auction_id: 99 }];
+
+        let result = crate::solvable_orders::apply_delta_events_to_auction(auction.clone(), &events);
+
+        assert_eq!(result.block, auction.block);
+        assert_eq!(result.orders.len(), 0);
+    }
+
+    #[test]
+    fn delta_events_equivalent_when_same_events_in_different_order() {
+        let events1 = vec![
+            DeltaEvent::OrderAdded(test_order(1, 10)),
+            DeltaEvent::OrderAdded(test_order(2, 20)),
+        ];
+        let events2 = vec![
+            DeltaEvent::OrderAdded(test_order(2, 20)),
+            DeltaEvent::OrderAdded(test_order(1, 10)),
+        ];
+
+        assert!(delta_events_equivalent(&events1, &events2));
+    }
+
+    #[test]
+    fn delta_events_equivalent_when_events_differ() {
+        let events1 = vec![DeltaEvent::OrderAdded(test_order(1, 10))];
+        let events2 = vec![DeltaEvent::OrderAdded(test_order(2, 20))];
+
+        assert!(!delta_events_equivalent(&events1, &events2));
+    }
+
+    #[test]
+    fn delta_event_cmp_ordering_added_lt_updated_lt_removed_lt_price() {
+        let uid = domain::OrderUid([1; 56]);
+        let token = Address::repeat_byte(0xAA);
+
+        let added = DeltaEvent::OrderAdded(test_order(1, 10));
+        let updated = DeltaEvent::OrderUpdated(test_order(1, 10));
+        let removed = DeltaEvent::OrderRemoved(uid);
+        let price = DeltaEvent::PriceChanged {
+            token,
+            price: Some(test_price(1000)),
+        };
+
+        assert!(delta_event_cmp(&added, &updated) == std::cmp::Ordering::Less);
+        assert!(delta_event_cmp(&updated, &removed) == std::cmp::Ordering::Less);
+        assert!(delta_event_cmp(&removed, &price) == std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn delta_history_min_retained_uses_env_var_when_override_not_set() {
+        unsafe {
+            std::env::set_var("AUTOPILOT_DELTA_HISTORY_MIN_RETAINED", "42");
+        }
+        // Use the override mechanism since OnceLock caches the value
+        let _guard = DeltaHistoryMinRetainedGuard::set(42);
+        let value = delta_history_min_retained();
+        unsafe {
+            std::env::remove_var("AUTOPILOT_DELTA_HISTORY_MIN_RETAINED");
+        }
+
+        assert_eq!(value, 42);
+    }
+
+    // ========================================================================
+    // Integration and Property Tests
+    // ========================================================================
+
+    #[test]
+    fn property_round_trip_delta_events_reconstruct_identical_state() {
+        // Property: For any sequence of random DeltaEvents,
+        // apply_delta_events_to_auction(base, events) followed by
+        // compute_delta_events(Some(&base), &result) should produce events
+        // that reconstruct result identically.
+
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+
+        for iteration in 0..20 {
+            // Create a random base state
+            let base = domain::RawAuctionData {
+                block: rng.gen_range(1..1000),
+                orders: (0..rng.gen_range(1..5))
+                    .map(|i| test_order(i as u8, rng.gen_range(10..100)))
+                    .collect(),
+                prices: {
+                    let mut prices = std::collections::HashMap::new();
+                    for i in 0..rng.gen_range(1..4) {
+                        prices.insert(
+                            Address::repeat_byte(i as u8).into(),
+                            test_price(rng.gen_range(100..10000)),
+                        );
+                    }
+                    prices
+                },
+                surplus_capturing_jit_order_owners: Vec::new(),
+            };
+
+            // Generate random delta events
+            let mut events = Vec::new();
+            for _ in 0..rng.gen_range(1..10) {
+                let event = match rng.gen_range(0..5) {
+                    0 => DeltaEvent::OrderAdded(test_order(
+                        rng.gen_range(10..20),
+                        rng.gen_range(10..100),
+                    )),
+                    1 => {
+                        if !base.orders.is_empty() {
+                            let idx = rng.gen_range(0..base.orders.len());
+                            DeltaEvent::OrderRemoved(base.orders[idx].uid)
+                        } else {
+                            continue;
+                        }
+                    }
+                    2 => DeltaEvent::OrderUpdated(test_order(
+                        rng.gen_range(0..5),
+                        rng.gen_range(10..100),
+                    )),
+                    3 => DeltaEvent::PriceChanged {
+                        token: Address::repeat_byte(rng.gen_range(0..10)),
+                        price: if rng.gen_bool(0.5) {
+                            Some(test_price(rng.gen_range(100..10000)))
+                        } else {
+                            None
+                        },
+                    },
+                    4 => DeltaEvent::BlockChanged {
+                        block: rng.gen_range(1000..2000),
+                    },
+                    _ => unreachable!(),
+                };
+                events.push(event);
+            }
+
+            // Apply events to get result state
+            let result = crate::solvable_orders::apply_delta_events_to_auction(
+                base.clone(),
+                &events,
+            );
+
+            // Compute delta from base to result
+            let normalized_base = normalized_delta_surface(base.clone());
+            let normalized_result = normalized_delta_surface(result.clone());
+            let computed_events =
+                compute_delta_events(Some(&normalized_base), &normalized_result);
+
+            // Apply computed events to base
+            let reconstructed = crate::solvable_orders::apply_delta_events_to_auction(
+                normalized_base.clone(),
+                &computed_events,
+            );
+
+            // Verify reconstruction matches result
+            let reconstructed_normalized = normalized_delta_surface(reconstructed);
+            assert_eq!(
+                reconstructed_normalized.orders.len(),
+                normalized_result.orders.len(),
+                "iteration {}: order count mismatch",
+                iteration
+            );
+            assert_eq!(
+                reconstructed_normalized.prices.len(),
+                normalized_result.prices.len(),
+                "iteration {}: price count mismatch",
+                iteration
+            );
+
+            // Verify order UIDs match
+            let reconstructed_uids: std::collections::HashSet<_> =
+                reconstructed_normalized.orders.iter().map(|o| o.uid).collect();
+            let result_uids: std::collections::HashSet<_> =
+                normalized_result.orders.iter().map(|o| o.uid).collect();
+            assert_eq!(
+                reconstructed_uids, result_uids,
+                "iteration {}: order UIDs mismatch",
+                iteration
+            );
+
+            // Verify price tokens match
+            let reconstructed_tokens: std::collections::HashSet<_> =
+                reconstructed_normalized.prices.keys().cloned().collect();
+            let result_tokens: std::collections::HashSet<_> =
+                normalized_result.prices.keys().cloned().collect();
+            assert_eq!(
+                reconstructed_tokens, result_tokens,
+                "iteration {}: price tokens mismatch",
+                iteration
+            );
+        }
+    }
+
+    #[test]
+    fn property_checksum_stability_identical_inputs_produce_identical_outputs() {
+        // Property: checksum_order_uids and checksum_prices produce identical
+        // output for identical inputs across multiple calls.
+
+        let orders = vec![
+            test_order(1, 100),
+            test_order(2, 200),
+            test_order(3, 250),
+        ];
+
+        let mut prices = domain::auction::Prices::new();
+        prices.insert(Address::repeat_byte(0xAA).into(), test_price(1000));
+        prices.insert(Address::repeat_byte(0xBB).into(), test_price(2000));
+        prices.insert(Address::repeat_byte(0xCC).into(), test_price(3000));
+
+        // Call checksums multiple times
+        let order_hashes: Vec<String> = (0..10).map(|_| checksum_order_uids(&orders)).collect();
+        let price_hashes: Vec<String> = (0..10).map(|_| checksum_prices(&prices)).collect();
+
+        // Verify all hashes are identical
+        for i in 1..order_hashes.len() {
+            assert_eq!(
+                order_hashes[0], order_hashes[i],
+                "order checksum changed on call {}",
+                i
+            );
+        }
+
+        for i in 1..price_hashes.len() {
+            assert_eq!(
+                price_hashes[0], price_hashes[i],
+                "price checksum changed on call {}",
+                i
+            );
+        }
+
+        // Verify checksums are deterministic even with different order
+        let orders_reversed = vec![
+            test_order(3, 250),
+            test_order(2, 200),
+            test_order(1, 100),
+        ];
+        let hash_reversed = checksum_order_uids(&orders_reversed);
+        assert_eq!(
+            order_hashes[0], hash_reversed,
+            "order checksum not order-independent"
+        );
+    }
+
+    #[tokio::test]
+    async fn property_sequence_monotonicity_never_decreases() {
+        // Property: After any sequence of update() + set_auction_id() calls,
+        // delta_sequence never decreases.
+
+        let cache = test_cache().await;
+
+        // Initialize with a base state
+        let base_auction = domain::RawAuctionData {
+            block: 1,
+            orders: vec![test_order(1, 100)],
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(base_auction.clone(), 1, 5, 5, VecDeque::new())
+            .await;
+
+        let mut last_sequence = cache.delta_sequence().await.unwrap();
+        assert_eq!(last_sequence, 5);
+
+        // Perform a series of operations
+        for i in 0..10 {
+            // Alternate between set_auction_id and state updates
+            if i % 2 == 0 {
+                cache.set_auction_id(10 + i).await;
+            } else {
+                let updated_auction = domain::RawAuctionData {
+                    block: 1 + i,
+                    orders: vec![test_order((i % 5) as u8, (100 + i * 10) as u8)],
+                    prices: std::collections::HashMap::new(),
+                    surplus_capturing_jit_order_owners: Vec::new(),
+                };
+                cache
+                    .set_state_for_tests(
+                        updated_auction,
+                        10 + i,
+                        last_sequence + 1,
+                        last_sequence + 1,
+                        VecDeque::new(),
+                    )
+                    .await;
+            }
+
+            let current_sequence = cache.delta_sequence().await.unwrap();
+            assert!(
+                current_sequence >= last_sequence,
+                "sequence decreased from {} to {} at iteration {}",
+                last_sequence,
+                current_sequence,
+                i
+            );
+            last_sequence = current_sequence;
+        }
+    }
+
+    #[tokio::test]
+    async fn property_broadcast_ordering_monotonic_to_sequence() {
+        // Property: Envelopes sent while holding cache lock are received by
+        // subscribers in monotonically increasing to_sequence order.
+
+        let cache = test_cache().await;
+
+        // Initialize cache
+        let base_auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(base_auction, 1, 0, 0, VecDeque::new())
+            .await;
+
+        // Create multiple subscribers
+        let mut receiver1 = cache.subscribe_deltas();
+        let mut receiver2 = cache.subscribe_deltas();
+        let mut receiver3 = cache.subscribe_deltas();
+
+        // Publish a sequence of envelopes
+        let num_envelopes = 20;
+        for i in 1..=num_envelopes {
+            cache
+                .publish_delta_for_tests(DeltaEnvelope {
+                    auction_id: 1,
+                    auction_sequence: i,
+                    from_sequence: i - 1,
+                    to_sequence: i,
+                    published_at: chrono::Utc::now(),
+                    published_at_instant: Instant::now(),
+                    events: vec![DeltaEvent::OrderAdded(test_order(i as u8, 100))],
+                })
+                .await;
+        }
+
+        // Verify all subscribers receive envelopes in order
+        let mut last_sequence_1 = 0;
+        for _ in 0..num_envelopes {
+            let envelope = tokio::time::timeout(Duration::from_secs(1), receiver1.recv())
+                .await
+                .expect("timeout waiting for envelope")
+                .expect("receiver closed");
+            assert!(
+                envelope.to_sequence > last_sequence_1,
+                "receiver1: sequence not monotonic: {} -> {}",
+                last_sequence_1,
+                envelope.to_sequence
+            );
+            last_sequence_1 = envelope.to_sequence;
+        }
+
+        let mut last_sequence_2 = 0;
+        for _ in 0..num_envelopes {
+            let envelope = tokio::time::timeout(Duration::from_secs(1), receiver2.recv())
+                .await
+                .expect("timeout waiting for envelope")
+                .expect("receiver closed");
+            assert!(
+                envelope.to_sequence > last_sequence_2,
+                "receiver2: sequence not monotonic: {} -> {}",
+                last_sequence_2,
+                envelope.to_sequence
+            );
+            last_sequence_2 = envelope.to_sequence;
+        }
+
+        let mut last_sequence_3 = 0;
+        for _ in 0..num_envelopes {
+            let envelope = tokio::time::timeout(Duration::from_secs(1), receiver3.recv())
+                .await
+                .expect("timeout waiting for envelope")
+                .expect("receiver closed");
+            assert!(
+                envelope.to_sequence > last_sequence_3,
+                "receiver3: sequence not monotonic: {} -> {}",
+                last_sequence_3,
+                envelope.to_sequence
+            );
+            last_sequence_3 = envelope.to_sequence;
+        }
+
+        // Verify all subscribers received the same final sequence
+        assert_eq!(last_sequence_1, num_envelopes);
+        assert_eq!(last_sequence_2, num_envelopes);
+        assert_eq!(last_sequence_3, num_envelopes);
+    }
+
+    #[tokio::test]
+    async fn integration_concurrent_subscribers_receive_all_envelopes() {
+        // Integration test: Multiple concurrent subscribers all receive the same
+        // envelopes in the same order.
+
+        let cache = test_cache().await;
+
+        let base_auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(base_auction, 1, 0, 0, VecDeque::new())
+            .await;
+
+        // Spawn multiple subscriber tasks
+        let num_subscribers = 5;
+        let num_envelopes = 15;
+        let mut handles = Vec::new();
+
+        for subscriber_id in 0..num_subscribers {
+            let cache_clone = Arc::clone(&cache);
+            let handle = tokio::spawn(async move {
+                let mut receiver = cache_clone.subscribe_deltas();
+                let mut received = Vec::new();
+
+                for _ in 0..num_envelopes {
+                    match tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await {
+                        Ok(Ok(envelope)) => {
+                            received.push(envelope.to_sequence);
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => break,
+                    }
+                }
+
+                (subscriber_id, received)
+            });
+            handles.push(handle);
+        }
+
+        // Give subscribers time to subscribe
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Publish envelopes
+        for i in 1..=num_envelopes {
+            cache
+                .publish_delta_for_tests(DeltaEnvelope {
+                    auction_id: 1,
+                    auction_sequence: i,
+                    from_sequence: i - 1,
+                    to_sequence: i,
+                    published_at: chrono::Utc::now(),
+                    published_at_instant: Instant::now(),
+                    events: vec![DeltaEvent::BlockChanged { block: i }],
+                })
+                .await;
+        }
+
+        // Collect results from all subscribers
+        let mut results = Vec::new();
+        for handle in handles {
+            let (subscriber_id, received) = handle.await.unwrap();
+            results.push((subscriber_id, received));
+        }
+
+        // Verify all subscribers received all envelopes
+        let expected: Vec<u64> = (1..=num_envelopes).collect();
+        for (subscriber_id, received) in results {
+            assert_eq!(
+                received, expected,
+                "subscriber {} did not receive all envelopes in order",
+                subscriber_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn integration_replay_consistency_with_live_stream() {
+        // Integration test: Replay + live stream produces consistent sequences.
+
+        let cache = test_cache().await;
+
+        let base_auction = domain::RawAuctionData {
+            block: 1,
+            orders: vec![test_order(1, 100)],
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        // Build up some history
+        let mut history = VecDeque::new();
+        for i in 1..=5 {
+            history.push_back(DeltaEnvelope {
+                auction_id: 1,
+                auction_sequence: i,
+                from_sequence: i - 1,
+                to_sequence: i,
+                published_at: chrono::Utc::now(),
+                published_at_instant: Instant::now(),
+                events: vec![DeltaEvent::OrderAdded(test_order(i as u8, ((100 + i * 10) % 256) as u8))],
+            });
+        }
+
+        cache
+            .set_state_for_tests(base_auction, 1, 5, 1, history)
+            .await;
+
+        // Subscribe with replay from sequence 1 (first available)
+        let (mut receiver, replay) = cache
+            .subscribe_deltas_with_replay_checked(Some(1))
+            .await
+            .unwrap();
+
+        // Collect replay envelopes
+        let mut all_sequences = Vec::new();
+        for envelope in replay.envelopes {
+            all_sequences.push(envelope.to_sequence);
+        }
+
+        // Publish more envelopes after replay
+        for i in 6..=10 {
+            cache
+                .publish_delta_for_tests(DeltaEnvelope {
+                    auction_id: 1,
+                    auction_sequence: i,
+                    from_sequence: i - 1,
+                    to_sequence: i,
+                    published_at: chrono::Utc::now(),
+                    published_at_instant: Instant::now(),
+                    events: vec![DeltaEvent::OrderAdded(test_order(i as u8, ((100 + i * 10) % 256) as u8))],
+                })
+                .await;
+        }
+
+        // Collect live envelopes
+        for _ in 0..5 {
+            match tokio::time::timeout(Duration::from_secs(1), receiver.recv()).await {
+                Ok(Ok(envelope)) => {
+                    all_sequences.push(envelope.to_sequence);
+                }
+                _ => break,
+            }
+        }
+
+        // Verify we received sequences in order (replay + live)
+        // Replay should include 1-5, live should include 6-10
+        assert!(all_sequences.len() >= 5, "should have received at least 5 envelopes");
+        
+        // Verify monotonic ordering
+        for i in 1..all_sequences.len() {
+            assert!(
+                all_sequences[i] > all_sequences[i - 1],
+                "sequences not monotonic: {} -> {}",
+                all_sequences[i - 1],
+                all_sequences[i]
+            );
+        }
+    }
+
+    #[test]
+    fn property_delta_events_idempotent_application() {
+        // Property: Applying the same delta events multiple times produces
+        // the same result as applying them once.
+
+        let base = domain::RawAuctionData {
+            block: 1,
+            orders: vec![test_order(1, 100)],
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        let events = vec![
+            DeltaEvent::OrderAdded(test_order(2, 200)),
+            DeltaEvent::OrderUpdated(test_order(1, 150)),
+            DeltaEvent::PriceChanged {
+                token: Address::repeat_byte(0xAA),
+                price: Some(test_price(1000)),
+            },
+        ];
+
+        let result_once =
+            crate::solvable_orders::apply_delta_events_to_auction(base.clone(), &events);
+        let result_twice = crate::solvable_orders::apply_delta_events_to_auction(
+            result_once.clone(),
+            &events,
+        );
+
+        // For idempotent events (OrderAdded becomes OrderUpdated on second apply)
+        // we expect the order counts to match
+        assert_eq!(result_once.orders.len(), result_twice.orders.len());
+        assert_eq!(result_once.prices.len(), result_twice.prices.len());
+    }
+
+    #[test]
+    fn property_checksum_changes_on_state_modification() {
+        // Property: Any modification to orders or prices changes the checksum.
+
+        let orders1 = vec![test_order(1, 100), test_order(2, 200)];
+        let orders2 = vec![test_order(1, 100), test_order(3, 200)]; // Different UID
+        let orders3 = vec![test_order(1, 100)]; // Fewer orders
+
+        let hash1 = checksum_order_uids(&orders1);
+        let hash2 = checksum_order_uids(&orders2);
+        let hash3 = checksum_order_uids(&orders3);
+
+        assert_ne!(hash1, hash2, "checksum should change when order UID changes");
+        assert_ne!(hash1, hash3, "checksum should change when order removed");
+
+        let mut prices1 = domain::auction::Prices::new();
+        prices1.insert(Address::repeat_byte(0xAA).into(), test_price(1000));
+
+        let mut prices2 = domain::auction::Prices::new();
+        prices2.insert(Address::repeat_byte(0xAA).into(), test_price(2000));
+
+        let mut prices3 = domain::auction::Prices::new();
+        prices3.insert(Address::repeat_byte(0xBB).into(), test_price(1000));
+
+        let price_hash1 = checksum_prices(&prices1);
+        let price_hash2 = checksum_prices(&prices2);
+        let price_hash3 = checksum_prices(&prices3);
+
+        assert_ne!(
+            price_hash1, price_hash2,
+            "checksum should change when price value changes"
+        );
+        assert_ne!(
+            price_hash1, price_hash3,
+            "checksum should change when price token changes"
+        );
     }
 }

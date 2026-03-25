@@ -66,7 +66,7 @@ static DELTA_REPLICA_MAX_STALENESS: OnceLock<Option<Duration>> = OnceLock::new()
 static DELTA_REPLICA_RESNAPSHOT_INTERVAL: OnceLock<Option<Duration>> = OnceLock::new();
 static BOOTSTRAP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 #[cfg(any(test, feature = "test-helpers"))]
-static REPLICA_PREPROCESSING_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+pub static REPLICA_PREPROCESSING_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReplicaSnapshot {

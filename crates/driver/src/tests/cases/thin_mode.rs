@@ -1,23 +1,25 @@
 use crate::{
-    infra::delta_sync::{DeltaReplicaTestGuard, set_replica_preprocessing_override},
+    infra::delta_sync::{DeltaReplicaTestGuard, REPLICA_PREPROCESSING_OVERRIDE},
     tests::{
         self,
         setup::{ab_order, ab_pool, ab_solution},
     },
 };
 
-struct ReplicaOverrideGuard;
+struct ReplicaOverrideGuard {
+    previous: u8,
+}
 
 impl ReplicaOverrideGuard {
     fn enable() -> Self {
-        set_replica_preprocessing_override(Some(true));
-        Self
+        let previous = REPLICA_PREPROCESSING_OVERRIDE.swap(1, std::sync::atomic::Ordering::SeqCst);
+        Self { previous }
     }
 }
 
 impl Drop for ReplicaOverrideGuard {
     fn drop(&mut self) {
-        set_replica_preprocessing_override(None);
+        REPLICA_PREPROCESSING_OVERRIDE.store(self.previous, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
