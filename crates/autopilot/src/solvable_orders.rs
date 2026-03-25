@@ -205,6 +205,10 @@ pub enum DeltaEvent {
     AuctionChanged {
         new_auction_id: u64,
     },
+    /// Block number changed on the root auction data.
+    BlockChanged {
+        block: u64,
+    },
     /// Order entered the solver-visible set (including
     /// re-validation/unfiltering).
     OrderAdded(domain::Order),
@@ -214,6 +218,10 @@ pub enum DeltaEvent {
     PriceChanged {
         token: Address,
         price: Option<Price>,
+    },
+    /// Surplus-capturing JIT order owners changed on the root auction data.
+    JitOwnersChanged {
+        surplus_capturing_jit_order_owners: Vec<Address>,
     },
 }
 
@@ -408,6 +416,14 @@ impl SolvableOrdersCache {
             .await
             .as_ref()
             .map(|inner| inner.delta_sequence)
+    }
+
+    fn diff_inputs(
+        &self,
+        previous_solvable_orders: Option<&boundary::SolvableOrders>,
+        current_solvable_orders: &boundary::SolvableOrders,
+    ) -> ChangeBundle {
+        diff_solvable_order_inputs(previous_solvable_orders, current_solvable_orders)
     }
 
     pub async fn delta_checksum(&self) -> Option<DeltaChecksum> {
@@ -1468,24 +1484,21 @@ impl SolvableOrdersCache {
         })
     }
 
-    fn diff_inputs(
-        &self,
-        previous_solvable_orders: Option<&boundary::SolvableOrders>,
-        current_solvable_orders: &boundary::SolvableOrders,
-    ) -> ChangeBundle {
-        diff_solvable_order_inputs(previous_solvable_orders, current_solvable_orders)
-    }
-
     fn compute_price_changed_tokens(
         previous: &domain::RawAuctionData,
         current: &domain::RawAuctionData,
     ) -> Vec<Address> {
-        let mut tokens: HashSet<Address> = HashSet::new();
-        tokens.extend(previous.prices.keys().map(|token| **token));
-        tokens.extend(current.prices.keys().map(|token| **token));
+        let mut price_tokens = previous
+            .prices
+            .keys()
+            .map(|token| Address::from(*token))
+            .collect::<Vec<_>>();
+        price_tokens.extend(current.prices.keys().map(|token| Address::from(*token)));
+        price_tokens.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        price_tokens.dedup_by(|a, b| a.as_slice() == b.as_slice());
 
         let mut changed = Vec::new();
-        for token in tokens {
+        for token in price_tokens {
             let previous_price = previous.prices.get(&token.into());
             let current_price = current.prices.get(&token.into());
             if previous_price != current_price {
@@ -1652,6 +1665,25 @@ impl SolvableOrdersCache {
                     });
                 }
             }
+        }
+
+        // Incremental detection for non-delta root fields: block and JIT owners.
+        if previous.block != current.block {
+            events.push(DeltaEvent::BlockChanged {
+                block: current.block,
+            });
+        }
+
+        let mut prev_jit = previous.surplus_capturing_jit_order_owners.clone();
+        let mut curr_jit = current.surplus_capturing_jit_order_owners.clone();
+        prev_jit.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        curr_jit.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        if prev_jit != curr_jit {
+            events.push(DeltaEvent::JitOwnersChanged {
+                surplus_capturing_jit_order_owners: current
+                    .surplus_capturing_jit_order_owners
+                    .clone(),
+            });
         }
 
         Metrics::get().delta_incremental_event_total.inc();
@@ -1964,13 +1996,18 @@ fn order_event_key(event: &DeltaEvent) -> Option<([u8; 56], u8)> {
         DeltaEvent::OrderAdded(order) => Some((order.uid.0, 0)),
         DeltaEvent::OrderUpdated(order) => Some((order.uid.0, 1)),
         DeltaEvent::OrderRemoved(uid) => Some((uid.0, 2)),
-        DeltaEvent::AuctionChanged { .. } | DeltaEvent::PriceChanged { .. } => None,
+        DeltaEvent::AuctionChanged { .. }
+        | DeltaEvent::PriceChanged { .. }
+        | DeltaEvent::BlockChanged { .. }
+        | DeltaEvent::JitOwnersChanged { .. } => None,
     }
 }
 
 fn delta_event_rank(event: &DeltaEvent) -> u8 {
     match event {
         DeltaEvent::AuctionChanged { .. } => 0,
+        DeltaEvent::BlockChanged { .. } => 0,
+        DeltaEvent::JitOwnersChanged { .. } => 0,
         DeltaEvent::OrderAdded(_) => 1,
         DeltaEvent::OrderUpdated(_) => 2,
         DeltaEvent::OrderRemoved(_) => 3,
@@ -2074,6 +2111,25 @@ fn compute_delta_events(
         }
     }
 
+    // Detect block changes on the root auction data.
+    if previous.block != current.block {
+        events.push(DeltaEvent::BlockChanged {
+            block: current.block,
+        });
+    }
+
+    // Detect changes to surplus-capturing JIT order owners. Compare as sets
+    // (order-insensitive) by sorting the address vectors.
+    let mut prev_jit = previous.surplus_capturing_jit_order_owners.clone();
+    let mut curr_jit = current.surplus_capturing_jit_order_owners.clone();
+    prev_jit.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    curr_jit.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    if prev_jit != curr_jit {
+        events.push(DeltaEvent::JitOwnersChanged {
+            surplus_capturing_jit_order_owners: current.surplus_capturing_jit_order_owners.clone(),
+        });
+    }
+
     events
 }
 
@@ -2088,9 +2144,17 @@ pub(crate) fn apply_delta_events_to_auction(
         .collect();
     let mut prices = previous.prices;
 
+    // Preserve and allow updates to non-delta root fields.
+    let mut block = previous.block;
+    let mut surplus_capturing_jit_order_owners =
+        previous.surplus_capturing_jit_order_owners.clone();
+
     for event in events {
         match event {
             DeltaEvent::AuctionChanged { .. } => {}
+            DeltaEvent::BlockChanged { block: b } => {
+                block = *b;
+            }
             DeltaEvent::OrderAdded(order) | DeltaEvent::OrderUpdated(order) => {
                 orders.insert(order.uid, order.clone());
             }
@@ -2104,6 +2168,11 @@ pub(crate) fn apply_delta_events_to_auction(
                     prices.remove(&(*token).into());
                 }
             }
+            DeltaEvent::JitOwnersChanged {
+                surplus_capturing_jit_order_owners: owners,
+            } => {
+                surplus_capturing_jit_order_owners = owners.clone();
+            }
         }
     }
 
@@ -2111,10 +2180,10 @@ pub(crate) fn apply_delta_events_to_auction(
     orders.sort_by_key(|order| order.uid.0);
 
     domain::RawAuctionData {
-        block: previous.block,
+        block,
         orders,
         prices,
-        surplus_capturing_jit_order_owners: previous.surplus_capturing_jit_order_owners,
+        surplus_capturing_jit_order_owners,
     }
 }
 
@@ -3641,9 +3710,60 @@ mod tests {
                 token: token_b,
                 price: Some(test_price(250)),
             },
+            DeltaEvent::BlockChanged { block: 11 },
         ];
 
         assert_eq!(events_first, expected);
+    }
+
+    #[test]
+    fn compute_delta_events_emits_block_and_jit_owner_changes() {
+        let token = Address::repeat_byte(0x11);
+        let previous = normalize(domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: HashMap::from([(token.into(), test_price(1000))]),
+            surplus_capturing_jit_order_owners: vec![Address::repeat_byte(0x01)],
+        });
+        let current = normalize(domain::RawAuctionData {
+            block: 2,
+            orders: Vec::new(),
+            prices: HashMap::from([(token.into(), test_price(1000))]),
+            surplus_capturing_jit_order_owners: vec![Address::repeat_byte(0xFF)],
+        });
+
+        let events = compute_delta_events(Some(&previous), &current);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, DeltaEvent::BlockChanged { block } if *block == 2))
+        );
+        assert!(events.iter().any(|event| matches!(event, DeltaEvent::JitOwnersChanged { surplus_capturing_jit_order_owners } if surplus_capturing_jit_order_owners == &vec![Address::repeat_byte(0xFF)])));
+    }
+
+    #[test]
+    fn apply_delta_events_applies_block_and_jit_owner_changes() {
+        let previous = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: vec![Address::repeat_byte(0x01)],
+        };
+
+        let events = vec![
+            DeltaEvent::BlockChanged { block: 42 },
+            DeltaEvent::JitOwnersChanged {
+                surplus_capturing_jit_order_owners: vec![Address::repeat_byte(0xAA)],
+            },
+        ];
+
+        let rebuilt = apply_delta_events_to_auction(previous.clone(), &events);
+        assert_eq!(rebuilt.block, 42);
+        assert_eq!(
+            rebuilt.surplus_capturing_jit_order_owners,
+            vec![Address::repeat_byte(0xAA)]
+        );
     }
 
     #[test]
@@ -3841,6 +3961,7 @@ mod tests {
                     token: Address::repeat_byte(0xAA),
                     price: Some(test_price(1500)),
                 },
+                DeltaEvent::BlockChanged { block: 2 },
             ]
         );
     }

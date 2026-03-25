@@ -31,7 +31,12 @@ use {
     tokio::sync::{broadcast::error::TryRecvError, oneshot},
     tokio_stream::{
         iter,
-        wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError},
+        wrappers::{
+            BroadcastStream,
+            ReceiverStream,
+            UnboundedReceiverStream,
+            errors::BroadcastStreamRecvError,
+        },
     },
 };
 
@@ -45,8 +50,9 @@ static DELTA_SYNC_API_KEY_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 #[cfg(test)]
-static DELTA_SYNC_ENABLED_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<bool>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+thread_local! {
+    static DELTA_SYNC_ENABLED_OVERRIDE: std::cell::RefCell<Option<bool>> = std::cell::RefCell::new(None);
+}
 
 #[cfg(test)]
 static DELTA_SYNC_STREAM_BUFFER_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<usize>>> =
@@ -128,6 +134,9 @@ enum DeltaEventDto {
     AuctionChanged {
         new_auction_id: u64,
     },
+    BlockChanged {
+        block: u64,
+    },
     OrderAdded {
         order: dto::order::Order,
     },
@@ -140,6 +149,9 @@ enum DeltaEventDto {
     PriceChanged {
         token: Address,
         price: Option<String>,
+    },
+    JitOwnersChanged {
+        surplus_capturing_jit_order_owners: Vec<Address>,
     },
 }
 
@@ -498,6 +510,11 @@ async fn stream_delta_events(
     let (stream_sender, stream_receiver) =
         tokio::sync::mpsc::channel::<Result<sse::Event, Infallible>>(delta_stream_buffer_size());
     let forward_sender = stream_sender.clone();
+    // Dedicated unbounded control channel for critical events (resync_required)
+    // so they are not dropped when the main bounded buffer is full.
+    let (control_sender, control_receiver) =
+        tokio::sync::mpsc::unbounded_channel::<Result<sse::Event, Infallible>>();
+    let control_sender_clone = control_sender.clone();
     let cache = Arc::clone(&state.solvable_orders_cache);
     tokio::spawn(async move {
         let _active_stream = active_stream;
@@ -523,11 +540,14 @@ async fn stream_delta_events(
                     "skipped": 0
                 })
                 .to_string();
-                let _ = forward_sender
-                    .send(Ok(sse::Event::default()
-                        .event("resync_required")
-                        .data(resync_payload)))
-                    .await;
+
+                // Send critical resync event over the unbounded control channel so
+                // it won't be dropped due to the bounded consumer buffer.
+                // control_sender_clone is injected into the spawn closure.
+                let _ = control_sender_clone.send(Ok(sse::Event::default()
+                    .event("resync_required")
+                    .data(resync_payload)));
+
                 tracing::warn!("delta stream dropped slow consumer");
                 break;
             }
@@ -552,14 +572,16 @@ async fn stream_delta_events(
             "skipped": 0
         })
         .to_string();
-        let _ = stream_sender.try_send(Ok(sse::Event::default()
+        let _ = control_sender.send(Ok(sse::Event::default()
             .event("resync_required")
             .data(resync_payload)));
     }
 
-    let stream = ReceiverStream::new(stream_receiver);
+    let control_stream = UnboundedReceiverStream::new(control_receiver);
+    let regular_stream = ReceiverStream::new(stream_receiver);
+    let merged = futures::stream::select(control_stream, regular_stream);
 
-    sse::Sse::new(stream)
+    sse::Sse::new(merged)
         .keep_alive(sse::KeepAlive::new().interval(delta_stream_keepalive_interval()))
         .into_response()
 }
@@ -711,10 +733,8 @@ fn delta_stream_gone_response(
 fn delta_sync_enabled() -> bool {
     #[cfg(test)]
     {
-        if let Some(value) = *DELTA_SYNC_ENABLED_OVERRIDE
-            .lock()
-            .expect("delta sync enabled override lock poisoned")
-        {
+        let override_val = DELTA_SYNC_ENABLED_OVERRIDE.with(|cell| *cell.borrow());
+        if let Some(value) = override_val {
             return value;
         }
     }
@@ -884,6 +904,7 @@ fn delta_event_to_dto(event: DeltaEvent) -> DeltaEventDto {
         DeltaEvent::AuctionChanged { new_auction_id } => {
             DeltaEventDto::AuctionChanged { new_auction_id }
         }
+        DeltaEvent::BlockChanged { block } => DeltaEventDto::BlockChanged { block },
         DeltaEvent::OrderAdded(order) => DeltaEventDto::OrderAdded {
             order: dto::order::from_domain(order),
         },
@@ -896,6 +917,11 @@ fn delta_event_to_dto(event: DeltaEvent) -> DeltaEventDto {
         DeltaEvent::PriceChanged { token, price } => DeltaEventDto::PriceChanged {
             token,
             price: price.map(|price| price.get().0.to_string()),
+        },
+        DeltaEvent::JitOwnersChanged {
+            surplus_capturing_jit_order_owners,
+        } => DeltaEventDto::JitOwnersChanged {
+            surplus_capturing_jit_order_owners: surplus_capturing_jit_order_owners.clone(),
         },
     }
 }
@@ -1048,11 +1074,11 @@ mod tests {
     #[cfg(test)]
     impl DeltaSyncEnabledGuard {
         fn set(value: bool) -> Self {
-            let mut lock = DELTA_SYNC_ENABLED_OVERRIDE
-                .lock()
-                .expect("delta sync enabled override lock poisoned");
-            let previous = *lock;
-            *lock = Some(value);
+            let previous = DELTA_SYNC_ENABLED_OVERRIDE.with(|cell| {
+                let prev = *cell.borrow();
+                *cell.borrow_mut() = Some(value);
+                prev
+            });
             Self { previous }
         }
     }
@@ -1060,9 +1086,9 @@ mod tests {
     #[cfg(test)]
     impl Drop for DeltaSyncEnabledGuard {
         fn drop(&mut self) {
-            *DELTA_SYNC_ENABLED_OVERRIDE
-                .lock()
-                .expect("delta sync enabled override lock poisoned") = self.previous;
+            DELTA_SYNC_ENABLED_OVERRIDE.with(|cell| {
+                *cell.borrow_mut() = self.previous;
+            });
         }
     }
 
@@ -1228,9 +1254,16 @@ mod tests {
             .collect();
         let mut prices = previous.prices;
 
+        // Apply all delta events, including non-delta root fields.
+        let mut block = previous.block;
+        let mut surplus_capturing_jit_order_owners = previous.surplus_capturing_jit_order_owners;
+
         for event in events {
             match event {
                 DeltaEvent::AuctionChanged { .. } => {}
+                DeltaEvent::BlockChanged { block: b } => {
+                    block = *b;
+                }
                 DeltaEvent::OrderAdded(order) | DeltaEvent::OrderUpdated(order) => {
                     orders.insert(order.uid, order.clone());
                 }
@@ -1244,6 +1277,11 @@ mod tests {
                         prices.remove(&(*token).into());
                     }
                 }
+                DeltaEvent::JitOwnersChanged {
+                    surplus_capturing_jit_order_owners: owners,
+                } => {
+                    surplus_capturing_jit_order_owners = owners.clone();
+                }
             }
         }
 
@@ -1251,10 +1289,10 @@ mod tests {
         orders.sort_by_key(|order| order.uid.0);
 
         domain::RawAuctionData {
-            block: previous.block,
+            block,
             orders,
             prices,
-            surplus_capturing_jit_order_owners: previous.surplus_capturing_jit_order_owners,
+            surplus_capturing_jit_order_owners,
         }
     }
 
@@ -1334,6 +1372,43 @@ mod tests {
         assert_eq!(wire.snapshot_sequence, None);
         assert_eq!(wire.published_at, "2026-03-20T00:00:00Z");
         assert_eq!(wire.events.len(), 2);
+    }
+
+    #[test]
+    fn api_envelope_serializes_block_and_jit_owner_events() {
+        let envelope = DeltaEventEnvelope {
+            version: 1,
+            boot_id: crate::solvable_orders::boot_id().to_string(),
+            auction_id: 9,
+            auction_sequence: 4,
+            from_sequence: 10,
+            to_sequence: 11,
+            snapshot_sequence: None,
+            published_at: "2026-03-20T00:00:00Z".to_string(),
+            events: vec![
+                DeltaEventDto::BlockChanged { block: 123 },
+                DeltaEventDto::JitOwnersChanged {
+                    surplus_capturing_jit_order_owners: vec![Address::repeat_byte(0xAB)],
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let wire: WireEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(wire.events.len(), 2);
+        // Ensure the wire representation includes expected fields for each event.
+        let first = &wire.events[0];
+        assert_eq!(first["type"], "blockChanged");
+        assert_eq!(first["block"], serde_json::json!(123));
+
+        let second = &wire.events[1];
+        assert_eq!(second["type"], "jitOwnersChanged");
+        // Payload must include at least one additional key (the owners payload).
+        let obj = second.as_object().expect("expected event to be an object");
+        assert!(
+            obj.len() >= 2,
+            "expected event object to contain payload field"
+        );
     }
 
     #[test]
@@ -1518,6 +1593,7 @@ mod tests {
                 }
                 DeltaEvent::OrderRemoved(_) | DeltaEvent::AuctionChanged { .. } => false,
                 DeltaEvent::PriceChanged { .. } => false,
+                DeltaEvent::BlockChanged { .. } | DeltaEvent::JitOwnersChanged { .. } => false,
             })
         });
         assert!(replay_has_order);
