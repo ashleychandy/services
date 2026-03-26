@@ -63,6 +63,7 @@ async fn dual_autopilot_only_leader_produces_auctions(web3: Web3) {
                 vec![],
                 1,
                 true,
+                false,
             )
             .await,
             colocation::start_baseline_solver(
@@ -72,6 +73,7 @@ async fn dual_autopilot_only_leader_produces_auctions(web3: Web3) {
                 vec![],
                 1,
                 true,
+                false,
             )
             .await,
         ],

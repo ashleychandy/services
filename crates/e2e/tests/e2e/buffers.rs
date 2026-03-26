@@ -58,6 +58,7 @@ async fn onchain_settlement_without_liquidity(web3: Web3) {
                 vec![],
                 1,
                 true,
+                false,
             )
             .await,
         ],

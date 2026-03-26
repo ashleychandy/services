@@ -30,6 +30,7 @@ pub async fn start_baseline_solver(
     base_tokens: Vec<Address>,
     max_hops: usize,
     merge_solutions: bool,
+    supports_thin_solve_request: bool,
 ) -> SolverEngine {
     start_baseline_solver_with_haircut(
         name,
@@ -39,6 +40,7 @@ pub async fn start_baseline_solver(
         max_hops,
         merge_solutions,
         0,
+        supports_thin_solve_request,
     )
     .await
 }
@@ -51,6 +53,7 @@ pub async fn start_baseline_solver_with_haircut(
     max_hops: usize,
     merge_solutions: bool,
     haircut_bps: u32,
+    _supports_thin_solve_request: bool,
 ) -> SolverEngine {
     let encoded_base_tokens = encode_base_tokens(base_tokens.clone());
     let config_file = config_tmp_file(format!(

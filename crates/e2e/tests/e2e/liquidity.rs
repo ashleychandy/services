@@ -187,6 +187,7 @@ async fn zero_ex_liquidity(web3: Web3) {
                 vec![],
                 1,
                 true,
+                false,
             )
             .await,
         ],

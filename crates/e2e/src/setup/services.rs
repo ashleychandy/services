@@ -264,6 +264,7 @@ impl<'a> Services<'a> {
                     1,
                     true,
                     haircut_bps,
+                    false,
                 )
                 .await,
             ],
@@ -371,6 +372,7 @@ impl<'a> Services<'a> {
                     vec![],
                     1,
                     true,
+                    false,
                 )
                 .await,
             );

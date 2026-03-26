@@ -73,6 +73,7 @@ async fn solver_competition(web3: Web3) {
                 vec![],
                 1,
                 true,
+                false,
             )
             .await,
             colocation::start_baseline_solver(
@@ -82,6 +83,7 @@ async fn solver_competition(web3: Web3) {
                 vec![],
                 1,
                 true,
+                false,
             )
             .await,
         ],
@@ -228,6 +230,7 @@ async fn wrong_solution_submission_address(web3: Web3) {
                 vec![*base_a.address()],
                 1,
                 true,
+                false,
             )
             .await,
             colocation::start_baseline_solver(
@@ -237,6 +240,7 @@ async fn wrong_solution_submission_address(web3: Web3) {
                 vec![*base_b.address()],
                 1,
                 true,
+                false,
             )
             .await,
         ],
@@ -385,6 +389,7 @@ async fn store_filtered_solutions(web3: Web3) {
                 base_tokens.clone(),
                 1,
                 true,
+                false,
             )
             .await,
             SolverEngine {

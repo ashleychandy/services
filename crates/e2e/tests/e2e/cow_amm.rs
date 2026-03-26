@@ -169,6 +169,7 @@ async fn cow_amm_jit(web3: Web3) {
                 vec![],
                 1,
                 true,
+                false,
             )
             .await,
             SolverEngine {
@@ -539,6 +540,7 @@ async fn cow_amm_driver_support(web3: Web3) {
                 vec![],
                 1,
                 true,
+                false,
             )
             .await,
             SolverEngine {
@@ -826,6 +828,7 @@ async fn cow_amm_opposite_direction(web3: Web3) {
                 vec![],
                 1,
                 true,
+                false,
             )
             .await,
             SolverEngine {

@@ -99,6 +99,7 @@ async fn delta_sync_snapshot_stream_resync_recovery(web3: Web3) {
                 vec![],
                 1,
                 true,
+                true,
             )
             .await,
         ],
@@ -239,6 +240,7 @@ async fn delta_sync_update_pipeline_integration(web3: Web3) {
                 *onchain.contracts().weth.address(),
                 vec![],
                 1,
+                true,
                 true,
             )
             .await,
@@ -481,17 +483,14 @@ async fn wait_for_delta_snapshot_full(delta_api_url: &str) -> DeltaSnapshotFullD
 
 async fn assert_snapshot_replay_matches(delta_api_url: &str, mut snapshot: DeltaSnapshotFullDto) {
     for _ in 0..3 {
-        if snapshot.oldest_available == 0 {
-            if let Some(replayed) =
-                replay_delta_history(delta_api_url, snapshot.oldest_available, snapshot.sequence)
-                    .await
-            {
-                let snapshot_orders = auction_orders(&snapshot.auction);
-                let snapshot_prices = auction_prices(&snapshot.auction);
-                assert_eq!(replayed.orders, snapshot_orders);
-                assert_eq!(replayed.prices, snapshot_prices);
-                return;
-            }
+        if let Some(replayed) =
+            replay_delta_history(delta_api_url, snapshot.oldest_available, snapshot.sequence).await
+        {
+            let snapshot_orders = auction_orders(&snapshot.auction);
+            let snapshot_prices = auction_prices(&snapshot.auction);
+            assert_eq!(replayed.orders, snapshot_orders);
+            assert_eq!(replayed.prices, snapshot_prices);
+            return;
         }
         snapshot = wait_for_delta_snapshot_full(delta_api_url).await;
     }
@@ -758,8 +757,16 @@ impl DeltaEnvGuard {
 
 impl Drop for DeltaEnvGuard {
     fn drop(&mut self) {
-        // No-op: we intentionally do not restore process environment
-        // variables because we never mutated them in `enable()`. The mutex
-        // guard will be dropped automatically to release serialization.
+        // Clear the overrides set in enable() to prevent interference with
+        // subsequent tests in the same process.
+        autopilot::infra::api::set_delta_sync_enabled_override(None);
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            driver::infra::delta_sync::set_driver_delta_sync_enabled_override(None);
+            driver::infra::delta_sync::set_driver_delta_sync_autopilot_url_override(None);
+            driver::test_helpers::set_replica_preprocessing_override(None);
+        }
+        // The mutex guard will be dropped automatically to release
+        // serialization.
     }
 }

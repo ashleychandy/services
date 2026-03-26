@@ -489,6 +489,7 @@ async fn two_limit_orders_multiple_winners_test(web3: Web3) {
                 vec![*base_a.address()],
                 2,
                 false,
+                false,
             )
             .await,
             colocation::start_baseline_solver(
@@ -497,6 +498,7 @@ async fn two_limit_orders_multiple_winners_test(web3: Web3) {
                 *onchain.contracts().weth.address(),
                 vec![*base_b.address()],
                 2,
+                false,
                 false,
             )
             .await,
@@ -741,6 +743,7 @@ async fn too_many_limit_orders_test(web3: Web3) {
                 vec![],
                 1,
                 true,
+                false,
             )
             .await,
         ],
@@ -844,6 +847,7 @@ async fn limit_does_not_apply_to_in_market_orders_test(web3: Web3) {
                 vec![],
                 1,
                 true,
+                false,
             )
             .await,
         ],
