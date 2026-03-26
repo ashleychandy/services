@@ -56,6 +56,7 @@ pub fn boot_id() -> &'static str {
         .get_or_init(|| uuid::Uuid::new_v4().to_string())
         .as_str()
 }
+
 #[derive(prometheus_metric_storage::MetricStorage)]
 pub struct Metrics {
     /// Tracks success and failure of the solvable orders cache update task.
@@ -614,7 +615,6 @@ impl SolvableOrdersCache {
         self.delta_sender.subscribe()
     }
 
-    
     #[instrument(skip_all)]
     pub async fn update(&self, block: u64, store_events: bool) -> Result<()> {
         let _update_guard = self.update_lock.lock().await;
@@ -4289,7 +4289,7 @@ mod tests {
     #[tokio::test]
     async fn set_auction_id_emits_auction_changed_envelope() {
         let cache = test_cache().await;
-        
+
         // Initialize the cache with some state first
         let auction = domain::RawAuctionData {
             block: 1,
@@ -4316,7 +4316,7 @@ mod tests {
     #[tokio::test]
     async fn set_auction_id_with_same_id_no_envelope_emitted() {
         let cache = test_cache().await;
-        
+
         // Initialize the cache with some state first
         let auction = domain::RawAuctionData {
             block: 1,
@@ -4530,13 +4530,22 @@ mod tests {
         };
 
         let invalid_order_uids = HashMap::new();
-        let filtered_events: &[(OrderUid, OrderFilterReason)] = &[(OrderUid::from(order.uid), OrderFilterReason::DustOrder)];
+        let filtered_events: &[(OrderUid, OrderFilterReason)] =
+            &[(OrderUid::from(order.uid), OrderFilterReason::DustOrder)];
 
         let state = build_indexed_state(&auction, &invalid_order_uids, filtered_events);
 
         // DustOrder is not tracked in any specific filtered set
-        assert!(!state.filtered_in_flight.contains(&OrderUid::from(order.uid)));
-        assert!(!state.filtered_no_balance.contains(&OrderUid::from(order.uid)));
+        assert!(
+            !state
+                .filtered_in_flight
+                .contains(&OrderUid::from(order.uid))
+        );
+        assert!(
+            !state
+                .filtered_no_balance
+                .contains(&OrderUid::from(order.uid))
+        );
         assert!(!state.filtered_no_price.contains(&OrderUid::from(order.uid)));
     }
 
@@ -4571,7 +4580,8 @@ mod tests {
 
         let events = vec![DeltaEvent::AuctionChanged { new_auction_id: 99 }];
 
-        let result = crate::solvable_orders::apply_delta_events_to_auction(auction.clone(), &events);
+        let result =
+            crate::solvable_orders::apply_delta_events_to_auction(auction.clone(), &events);
 
         assert_eq!(result.block, auction.block);
         assert_eq!(result.orders.len(), 0);
@@ -4703,16 +4713,13 @@ mod tests {
             }
 
             // Apply events to get result state
-            let result = crate::solvable_orders::apply_delta_events_to_auction(
-                base.clone(),
-                &events,
-            );
+            let result =
+                crate::solvable_orders::apply_delta_events_to_auction(base.clone(), &events);
 
             // Compute delta from base to result
             let normalized_base = normalized_delta_surface(base.clone());
             let normalized_result = normalized_delta_surface(result.clone());
-            let computed_events =
-                compute_delta_events(Some(&normalized_base), &normalized_result);
+            let computed_events = compute_delta_events(Some(&normalized_base), &normalized_result);
 
             // Apply computed events to base
             let reconstructed = crate::solvable_orders::apply_delta_events_to_auction(
@@ -4736,8 +4743,11 @@ mod tests {
             );
 
             // Verify order UIDs match
-            let reconstructed_uids: std::collections::HashSet<_> =
-                reconstructed_normalized.orders.iter().map(|o| o.uid).collect();
+            let reconstructed_uids: std::collections::HashSet<_> = reconstructed_normalized
+                .orders
+                .iter()
+                .map(|o| o.uid)
+                .collect();
             let result_uids: std::collections::HashSet<_> =
                 normalized_result.orders.iter().map(|o| o.uid).collect();
             assert_eq!(
@@ -4764,11 +4774,7 @@ mod tests {
         // Property: checksum_order_uids and checksum_prices produce identical
         // output for identical inputs across multiple calls.
 
-        let orders = vec![
-            test_order(1, 100),
-            test_order(2, 200),
-            test_order(3, 250),
-        ];
+        let orders = vec![test_order(1, 100), test_order(2, 200), test_order(3, 250)];
 
         let mut prices = domain::auction::Prices::new();
         prices.insert(Address::repeat_byte(0xAA).into(), test_price(1000));
@@ -4797,11 +4803,7 @@ mod tests {
         }
 
         // Verify checksums are deterministic even with different order
-        let orders_reversed = vec![
-            test_order(3, 250),
-            test_order(2, 200),
-            test_order(1, 100),
-        ];
+        let orders_reversed = vec![test_order(3, 250), test_order(2, 200), test_order(1, 100)];
         let hash_reversed = checksum_order_uids(&orders_reversed);
         assert_eq!(
             order_hashes[0], hash_reversed,
@@ -5058,7 +5060,10 @@ mod tests {
                 to_sequence: i,
                 published_at: chrono::Utc::now(),
                 published_at_instant: Instant::now(),
-                events: vec![DeltaEvent::OrderAdded(test_order(i as u8, ((100 + i * 10) % 256) as u8))],
+                events: vec![DeltaEvent::OrderAdded(test_order(
+                    i as u8,
+                    ((100 + i * 10) % 256) as u8,
+                ))],
             });
         }
 
@@ -5088,7 +5093,10 @@ mod tests {
                     to_sequence: i,
                     published_at: chrono::Utc::now(),
                     published_at_instant: Instant::now(),
-                    events: vec![DeltaEvent::OrderAdded(test_order(i as u8, ((100 + i * 10) % 256) as u8))],
+                    events: vec![DeltaEvent::OrderAdded(test_order(
+                        i as u8,
+                        ((100 + i * 10) % 256) as u8,
+                    ))],
                 })
                 .await;
         }
@@ -5105,8 +5113,11 @@ mod tests {
 
         // Verify we received sequences in order (replay + live)
         // Replay should include 1-5, live should include 6-10
-        assert!(all_sequences.len() >= 5, "should have received at least 5 envelopes");
-        
+        assert!(
+            all_sequences.len() >= 5,
+            "should have received at least 5 envelopes"
+        );
+
         // Verify monotonic ordering
         for i in 1..all_sequences.len() {
             assert!(
@@ -5141,10 +5152,8 @@ mod tests {
 
         let result_once =
             crate::solvable_orders::apply_delta_events_to_auction(base.clone(), &events);
-        let result_twice = crate::solvable_orders::apply_delta_events_to_auction(
-            result_once.clone(),
-            &events,
-        );
+        let result_twice =
+            crate::solvable_orders::apply_delta_events_to_auction(result_once.clone(), &events);
 
         // For idempotent events (OrderAdded becomes OrderUpdated on second apply)
         // we expect the order counts to match
@@ -5164,7 +5173,10 @@ mod tests {
         let hash2 = checksum_order_uids(&orders2);
         let hash3 = checksum_order_uids(&orders3);
 
-        assert_ne!(hash1, hash2, "checksum should change when order UID changes");
+        assert_ne!(
+            hash1, hash2,
+            "checksum should change when order UID changes"
+        );
         assert_ne!(hash1, hash3, "checksum should change when order removed");
 
         let mut prices1 = domain::auction::Prices::new();

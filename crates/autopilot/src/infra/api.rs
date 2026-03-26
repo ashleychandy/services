@@ -1,7 +1,7 @@
 use {
     crate::{
         infra::persistence::dto,
-        solvable_orders::{DeltaAfterError, DeltaEvent, DeltaSubscribeError, SolvableOrdersCache},
+        solvable_orders::{DeltaAfterError, DeltaEvent, SolvableOrdersCache},
     },
     alloy::primitives::Address,
     axum::{
@@ -29,14 +29,11 @@ use {
     },
     subtle::ConstantTimeEq,
     tokio::sync::{broadcast::error::TryRecvError, oneshot},
-    tokio_stream::{
-        iter,
-        wrappers::{
-            BroadcastStream,
-            ReceiverStream,
-            UnboundedReceiverStream,
-            errors::BroadcastStreamRecvError,
-        },
+    tokio_stream::wrappers::{
+        BroadcastStream,
+        ReceiverStream,
+        UnboundedReceiverStream,
+        errors::BroadcastStreamRecvError,
     },
 };
 
@@ -45,9 +42,34 @@ use {
 const MIN_TIMEOUT: Duration = Duration::from_millis(250);
 static DELTA_SYNC_API_KEY: OnceLock<Option<String>> = OnceLock::new();
 
+// Cached env-based delta stream configuration values. Parsing the process
+// environment can acquire a global lock; cache the computed values on first
+// access to avoid repeated env lookups per connection.
+static DELTA_STREAM_MAX_LAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static DELTA_STREAM_BUFFER_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static DELTA_STREAM_KEEPALIVE_INTERVAL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
 #[cfg(test)]
-static DELTA_SYNC_API_KEY_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<Option<String>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+#[derive(Clone, Debug)]
+enum ApiKeyOverride {
+    /// No override: fall through to the environment variable / OnceLock.
+    NotSet,
+    /// Override active: no key is required (open endpoint).
+    NoKeyRequired,
+    /// Override active: require exactly this key.
+    Key(String),
+}
+
+#[cfg(test)]
+impl Default for ApiKeyOverride {
+    fn default() -> Self {
+        Self::NotSet
+    }
+}
+
+#[cfg(test)]
+static DELTA_SYNC_API_KEY_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<ApiKeyOverride>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(ApiKeyOverride::NotSet));
 
 #[cfg(any(test, feature = "test-util"))]
 static DELTA_SYNC_ENABLED_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<bool>>> =
@@ -193,12 +215,7 @@ pub async fn serve_with_listener(
     max_timeout: Duration,
     shutdown: oneshot::Receiver<()>,
 ) -> Result<(), std::io::Error> {
-    let state = State {
-        estimator,
-        allowed_timeout: MIN_TIMEOUT..=max_timeout,
-        solvable_orders_cache,
-    };
-    let app = build_router(state);
+    let app = build_app(estimator, solvable_orders_cache, max_timeout);
 
     let addr = listener
         .local_addr()
@@ -213,6 +230,19 @@ pub async fn serve_with_listener(
         shutdown.await.ok();
     })
     .await
+}
+
+pub(crate) fn build_app(
+    estimator: Arc<dyn NativePriceEstimating>,
+    solvable_orders_cache: Arc<SolvableOrdersCache>,
+    max_timeout: Duration,
+) -> Router {
+    let state = State {
+        estimator,
+        allowed_timeout: MIN_TIMEOUT..=max_timeout,
+        solvable_orders_cache,
+    };
+    build_router(state)
 }
 
 fn build_router(state: State) -> Router {
@@ -237,9 +267,10 @@ async fn get_delta_snapshot(headers: HeaderMap, AxumState(state): AxumState<Stat
     if let Err(response) = authorize_delta_sync(&headers) {
         return response;
     }
-    DeltaMetrics::get().snapshot_requests.inc();
+    let metrics = DeltaMetrics::get();
+    metrics.snapshot_requests.inc();
     let Some(snapshot) = state.solvable_orders_cache.delta_snapshot().await else {
-        DeltaMetrics::get().snapshot_empty.inc();
+        metrics.snapshot_empty.inc();
         return empty_delta_snapshot_response();
     };
 
@@ -248,7 +279,7 @@ async fn get_delta_snapshot(headers: HeaderMap, AxumState(state): AxumState<Stat
     let snapshot_bytes = match tokio::task::spawn_blocking(move || {
         let response = DeltaSnapshotResponse {
             version: 1,
-            boot_id: crate::solvable_orders::boot_id().to_string(),
+            boot_id: crate::solvable_orders::boot_id().to_owned(),
             auction_id: snapshot.auction_id,
             auction_sequence: snapshot.auction_sequence,
             sequence: snapshot.sequence,
@@ -277,7 +308,7 @@ async fn get_delta_snapshot(headers: HeaderMap, AxumState(state): AxumState<Stat
         .body(Body::from(snapshot_bytes))
     {
         Ok(response) => {
-            DeltaMetrics::get().snapshot_bytes.set(snapshot_len as i64);
+            metrics.snapshot_bytes.set(snapshot_len as i64);
             response
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response(),
@@ -293,183 +324,143 @@ async fn stream_delta_events(
     if let Err(response) = authorize_delta_sync(&headers) {
         return response;
     }
-    DeltaMetrics::get().stream_connections.inc();
+    let metrics = DeltaMetrics::get();
+    metrics.stream_connections.inc();
     let api_key_hash = api_key_hash(&headers);
-    let active_stream = ActiveStreamGuard::new(remote_addr, api_key_hash.clone());
-    // Subscribe while holding the cache lock used for replay so replay state and
-    // receiver position remain consistent.
-    let (mut receiver, replay) = match state
-        .solvable_orders_cache
-        .subscribe_deltas_with_replay_checked(query.after_sequence)
-        .await
+    let active_stream = ActiveStreamGuard::new(remote_addr, api_key_hash);
+    let baseline_sequence = query.after_sequence.unwrap_or_default();
+
+    // First attempt: subscribe, build replay payloads, and drain live envelopes.
+    let result = match subscribe_and_build_replay(
+        &state.solvable_orders_cache,
+        query.after_sequence,
+        baseline_sequence,
+    )
+    .await
     {
-        Ok(replay) => replay,
-        Err(DeltaSubscribeError::MissingAfterSequence { .. }) => {
+        Ok(r) => r,
+
+        Err(SubscribeReplayError::Subscribe(
+            crate::solvable_orders::DeltaSubscribeError::MissingAfterSequence { .. },
+        )) => {
             return (
                 StatusCode::BAD_REQUEST,
                 "after_sequence is required; call /delta/snapshot and use its sequence",
             )
                 .into_response();
         }
-        Err(DeltaSubscribeError::DeltaAfter(err)) => match err {
-            err @ DeltaAfterError::FutureSequence { .. } => {
-                return delta_stream_after_error_response(err);
-            }
-            err @ DeltaAfterError::ResyncRequired { .. } => {
-                DeltaMetrics::get().replay_miss.inc();
-                return delta_stream_after_error_response(err);
-            }
-        },
-    };
-    let after_sequence = query.after_sequence.unwrap_or_default();
-    let checkpoint_sequence = replay.checkpoint_sequence;
-    let replay_envelopes = replay.envelopes;
-    let max_stream_lag = delta_stream_max_lag();
-    let baseline_sequence = after_sequence;
-    let initial_lag = checkpoint_sequence.saturating_sub(after_sequence);
-    if initial_lag > max_stream_lag {
-        DeltaMetrics::get().stream_lagged.inc();
-        tracing::warn!(
-            after_sequence,
-            checkpoint_sequence,
-            initial_lag,
-            "delta stream requires resnapshot due to lag"
-        );
-        return delta_stream_gone_response(
-            format!("resnapshot required because subscription lagged by {initial_lag} messages"),
-            checkpoint_sequence,
-            None,
-        );
-    }
 
-    let mut replay_payloads = Vec::new();
-    let mut replay_to_sequence = checkpoint_sequence;
-    for envelope in replay_envelopes {
-        replay_to_sequence = replay_to_sequence.max(envelope.to_sequence);
-        let envelope = to_api_envelope(envelope, Some(baseline_sequence));
-        let payload = match serde_json::to_string(&envelope) {
-            Ok(payload) => payload,
-            Err(err) => {
-                tracing::error!(?err, "failed to serialize delta envelope");
-                DeltaMetrics::get().serialize_errors.inc();
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+        Err(SubscribeReplayError::Subscribe(
+            crate::solvable_orders::DeltaSubscribeError::DeltaAfter(err),
+        )) => {
+            if matches!(
+                err,
+                crate::solvable_orders::DeltaAfterError::ResyncRequired { .. }
+            ) {
+                metrics.replay_miss.inc();
             }
-        };
-        replay_payloads.push(payload);
-    }
+            return delta_stream_after_error_response(err);
+        }
 
-    let drained_outcome = match drain_live_envelopes(
-        &mut receiver,
-        checkpoint_sequence,
-        baseline_sequence,
-        &mut replay_to_sequence,
-    ) {
-        Ok(payloads) => payloads,
-        Err(DrainError::Serialize(err)) => {
-            tracing::error!(?err, "failed to serialize drained delta envelope");
-            DeltaMetrics::get().serialize_errors.inc();
+        Err(SubscribeReplayError::Serialize(err)) => {
+            tracing::error!(?err, "failed to serialize delta envelope during replay");
+            metrics.serialize_errors.inc();
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
         }
-        Err(DrainError::Lagged(skipped)) => {
-            // Instead of immediately treating this as a hard lag (410), retry once:
-            // a new subscription+replay may recover from the race where envelopes were
-            // published between the initial subscribe/replay build and this drain.
-            DeltaMetrics::get().stream_lagged.inc();
+
+        // Lag on first attempt: retry once before giving up.
+        Err(SubscribeReplayError::Drain(DrainError::Lagged(skipped))) => {
+            metrics.stream_lagged.inc();
             tracing::warn!(
-                after_sequence,
-                checkpoint_sequence,
+                after_sequence = baseline_sequence,
                 skipped,
-                "delta stream lagged while draining live envelopes; retrying subscription once"
+                "delta stream lagged during initial drain; retrying subscription once"
             );
 
-            // Try to re-subscribe and rebuild replay+drain once.
-            match state
-                .solvable_orders_cache
-                .subscribe_deltas_with_replay_checked(query.after_sequence)
-                .await
+            // Single retry
+            match subscribe_and_build_replay(
+                &state.solvable_orders_cache,
+                query.after_sequence,
+                baseline_sequence,
+            )
+            .await
             {
-                Ok((new_receiver, new_replay)) => {
-                    receiver = new_receiver;
-                    replay_to_sequence = new_replay.checkpoint_sequence;
-                    // rebuild replay payloads
-                    replay_payloads.clear();
-                    for envelope in new_replay.envelopes {
-                        replay_to_sequence = replay_to_sequence.max(envelope.to_sequence);
-                        let envelope = to_api_envelope(envelope, Some(baseline_sequence));
-                        let payload = match serde_json::to_string(&envelope) {
-                            Ok(payload) => payload,
-                            Err(err) => {
-                                tracing::error!(?err, "failed to serialize delta envelope");
-                                DeltaMetrics::get().serialize_errors.inc();
-                                return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
-                                    .into_response();
-                            }
-                        };
-                        replay_payloads.push(payload);
-                    }
+                Ok(r) => r,
 
-                    match drain_live_envelopes(
-                        &mut receiver,
-                        replay_to_sequence,
-                        baseline_sequence,
-                        &mut replay_to_sequence,
-                    ) {
-                        Ok(payloads) => payloads,
-                        Err(DrainError::Serialize(err)) => {
-                            tracing::error!(?err, "failed to serialize drained delta envelope");
-                            DeltaMetrics::get().serialize_errors.inc();
-                            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
-                                .into_response();
-                        }
-                        Err(DrainError::Lagged(skipped)) => {
-                            tracing::warn!(
-                                after_sequence,
-                                checkpoint_sequence,
-                                skipped,
-                                "delta stream lagged while draining live envelopes even after \
-                                 retry"
-                            );
-                            // Use the retry's checkpoint (replay_to_sequence) in the resync
-                            // response
-                            return delta_stream_gone_response(
-                                format!(
-                                    "resnapshot required because subscription lagged by {skipped} \
-                                     messages"
-                                ),
-                                replay_to_sequence,
-                                None,
-                            );
-                        }
-                    }
-                }
-                Err(_) => {
-                    // If we cannot re-subscribe for any reason, fall back to resync response.
+                Err(SubscribeReplayError::Drain(DrainError::Lagged(skipped2))) => {
                     tracing::warn!(
-                        "failed to re-subscribe after lag while draining live envelopes"
+                        after_sequence = baseline_sequence,
+                        skipped2,
+                        "delta stream lagged even after retry"
                     );
+                    return delta_stream_gone_response(
+                        format!(
+                            "resnapshot required because subscription lagged by {skipped2} \
+                             messages"
+                        ),
+                        skipped2,
+                        None,
+                    );
+                }
+
+                Err(SubscribeReplayError::Serialize(err)) => {
+                    tracing::error!(?err, "failed to serialize delta envelope during retry");
+                    metrics.serialize_errors.inc();
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+                }
+
+                Err(err) => {
+                    tracing::warn!(?err, "failed to re-subscribe after lag");
                     return delta_stream_gone_response(
                         format!(
                             "resnapshot required because subscription lagged by {skipped} messages"
                         ),
-                        checkpoint_sequence,
+                        baseline_sequence,
                         None,
                     );
                 }
             }
         }
+
+        Err(SubscribeReplayError::Drain(DrainError::Serialize(err))) => {
+            tracing::error!(?err, "failed to serialize drained delta envelope");
+            metrics.serialize_errors.inc();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+        }
     };
-    replay_payloads.extend(drained_outcome.payloads);
+
+    // Check initial lag guard (unchanged logic, just uses the result struct).
+    let initial_lag = result.replay_to_sequence.saturating_sub(baseline_sequence);
+    let max_stream_lag = delta_stream_max_lag();
+    if initial_lag > max_stream_lag {
+        metrics.stream_lagged.inc();
+        tracing::warn!(
+            after_sequence = baseline_sequence,
+            replay_to_sequence = result.replay_to_sequence,
+            initial_lag,
+            "delta stream requires resnapshot due to lag"
+        );
+        return delta_stream_gone_response(
+            format!("resnapshot required because subscription lagged by {initial_lag} messages"),
+            result.replay_to_sequence,
+            None,
+        );
+    }
 
     tracing::debug!(
-        resume_from = after_sequence,
-        checkpoint_sequence,
-        replay_to_sequence,
+        resume_from = baseline_sequence,
+        replay_to_sequence = result.replay_to_sequence,
         "delta stream replay served"
     );
 
-    let replay_stream = iter(replay_payloads.into_iter().map(|payload| {
+    // Build SSE streams (unchanged from original)
+    let replay_to_sequence = result.replay_to_sequence;
+    let replay_stream = tokio_stream::iter(result.payloads.into_iter().map(|payload| {
         Ok::<sse::Event, Infallible>(sse::Event::default().event("delta").data(payload))
     }));
+
+    // Move the receiver out of the helper's result for use by the live stream.
+    let mut receiver = result.receiver;
     let cache = Arc::clone(&state.solvable_orders_cache);
     let live_stream = BroadcastStream::new(receiver).filter_map(move |item| {
         let cache = Arc::clone(&cache);
@@ -486,7 +477,7 @@ async fn stream_delta_events(
                         )),
                         Err(err) => {
                             tracing::error!(?err, "failed to serialize live delta envelope");
-                            DeltaMetrics::get().serialize_errors.inc();
+                            metrics.serialize_errors.inc();
                             Some(Ok::<sse::Event, Infallible>(
                                 sse::Event::default()
                                     .event("error")
@@ -496,19 +487,19 @@ async fn stream_delta_events(
                     }
                 }
                 Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                    DeltaMetrics::get().stream_lagged.inc();
+                    metrics.stream_lagged.inc();
                     let latest_sequence =
-                        cache.delta_sequence().await.unwrap_or(checkpoint_sequence);
+                        cache.delta_sequence().await.unwrap_or(replay_to_sequence);
                     tracing::warn!(
-                        after_sequence,
-                        checkpoint_sequence,
+                        after_sequence = baseline_sequence,
+                        replay_to_sequence = replay_to_sequence,
                         skipped,
                         "delta stream lagged"
                     );
                     let payload = serde_json::json!({
                         "message": "delta stream lagged",
                         "latestSequence": latest_sequence,
-                        "skipped": skipped
+                        "skipped": skipped,
                     })
                     .to_string();
                     Some(Ok::<sse::Event, Infallible>(
@@ -544,7 +535,7 @@ async fn stream_delta_events(
                                 match forward_sender.try_send(item) {
                                     Ok(()) => {}
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                DeltaMetrics::get().stream_lagged.inc();
+                metrics.stream_lagged.inc();
                 let latest_sequence =
                     cache.delta_sequence().await.unwrap_or(replay_to_sequence);
                 let resync_payload = serde_json::json!({
@@ -573,12 +564,12 @@ async fn stream_delta_events(
         }
     });
 
-    if drained_outcome.closed {
+    if result.drained_closed {
         let latest_sequence = state
             .solvable_orders_cache
             .delta_sequence()
             .await
-            .unwrap_or(checkpoint_sequence);
+            .unwrap_or(replay_to_sequence);
         let resync_payload = serde_json::json!({
             "message": "delta stream closed during replay drain",
             "latestSequence": latest_sequence,
@@ -623,7 +614,7 @@ fn to_api_envelope(
 ) -> DeltaEventEnvelope {
     DeltaEventEnvelope {
         version: 1,
-        boot_id: crate::solvable_orders::boot_id().to_string(),
+        boot_id: crate::solvable_orders::boot_id().to_owned(),
         auction_id: envelope.auction_id,
         auction_sequence: envelope.auction_sequence,
         from_sequence: envelope.from_sequence,
@@ -708,6 +699,63 @@ fn drain_live_envelopes(
     })
 }
 
+/// Result type returned by `subscribe_and_build_replay`.
+struct ReplayResult {
+    receiver: tokio::sync::broadcast::Receiver<crate::solvable_orders::DeltaEnvelope>,
+    /// Pre-serialised JSON payloads covering the [after_sequence, live] gap.
+    payloads: Vec<String>,
+    /// Highest sequence covered by payloads; live stream must start after this.
+    replay_to_sequence: u64,
+    /// True when the broadcast channel closed during the drain; caller should
+    /// signal resync to the client.
+    drained_closed: bool,
+}
+
+#[derive(Debug)]
+enum SubscribeReplayError {
+    Subscribe(crate::solvable_orders::DeltaSubscribeError),
+    Serialize(serde_json::Error),
+    Drain(DrainError),
+}
+
+async fn subscribe_and_build_replay(
+    cache: &crate::solvable_orders::SolvableOrdersCache,
+    after_sequence: Option<u64>,
+    baseline_sequence: u64,
+) -> Result<ReplayResult, SubscribeReplayError> {
+    let (mut receiver, replay) = cache
+        .subscribe_deltas_with_replay_checked(after_sequence)
+        .await
+        .map_err(SubscribeReplayError::Subscribe)?;
+
+    let mut replay_to_sequence = replay.checkpoint_sequence;
+    let mut payloads = Vec::with_capacity(replay.envelopes.len());
+
+    for envelope in replay.envelopes {
+        replay_to_sequence = replay_to_sequence.max(envelope.to_sequence);
+        let serialised = serde_json::to_string(&to_api_envelope(envelope, Some(baseline_sequence)))
+            .map_err(SubscribeReplayError::Serialize)?;
+        payloads.push(serialised);
+    }
+
+    let drain_outcome = drain_live_envelopes(
+        &mut receiver,
+        replay_to_sequence,
+        baseline_sequence,
+        &mut replay_to_sequence,
+    )
+    .map_err(SubscribeReplayError::Drain)?;
+
+    payloads.extend(drain_outcome.payloads);
+
+    Ok(ReplayResult {
+        receiver,
+        payloads,
+        replay_to_sequence,
+        drained_closed: drain_outcome.closed,
+    })
+}
+
 fn empty_delta_snapshot_response() -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
@@ -723,7 +771,7 @@ fn delta_stream_after_error_response(err: DeltaAfterError) -> Response {
             oldest_available,
             latest,
         } => delta_stream_gone_response(
-            "delta history does not include requested sequence; resnapshot required".to_string(),
+            "delta history does not include requested sequence; resnapshot required",
             latest,
             Some(oldest_available),
         ),
@@ -731,12 +779,12 @@ fn delta_stream_after_error_response(err: DeltaAfterError) -> Response {
 }
 
 fn delta_stream_gone_response(
-    message: String,
+    message: impl Into<String>,
     latest_sequence: u64,
     oldest_available: Option<u64>,
 ) -> Response {
     let payload = DeltaStreamGoneResponse {
-        message,
+        message: message.into(),
         latest_sequence,
         oldest_available,
     };
@@ -763,14 +811,18 @@ fn delta_sync_enabled() -> bool {
 }
 
 fn delta_stream_max_lag() -> u64 {
-    std::env::var("AUTOPILOT_DELTA_SYNC_STREAM_MAX_LAG")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(256)
+    *DELTA_STREAM_MAX_LAG.get_or_init(|| {
+        std::env::var("AUTOPILOT_DELTA_SYNC_STREAM_MAX_LAG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(256)
+    })
 }
 
 fn delta_stream_buffer_size() -> usize {
+    // The test override is checked first so tests can vary buffer sizes
+    // without fighting the OnceLock that caches the first production read.
     #[cfg(test)]
     {
         if let Some(value) = *DELTA_SYNC_STREAM_BUFFER_OVERRIDE
@@ -781,20 +833,24 @@ fn delta_stream_buffer_size() -> usize {
         }
     }
 
-    std::env::var("AUTOPILOT_DELTA_SYNC_STREAM_BUFFER")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(128)
+    *DELTA_STREAM_BUFFER_SIZE.get_or_init(|| {
+        std::env::var("AUTOPILOT_DELTA_SYNC_STREAM_BUFFER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(128)
+    })
 }
 
 fn delta_stream_keepalive_interval() -> Duration {
-    let seconds = std::env::var("AUTOPILOT_DELTA_SYNC_STREAM_KEEPALIVE_SECS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(10);
-    Duration::from_secs(seconds)
+    *DELTA_STREAM_KEEPALIVE_INTERVAL.get_or_init(|| {
+        let seconds = std::env::var("AUTOPILOT_DELTA_SYNC_STREAM_KEEPALIVE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(10);
+        Duration::from_secs(seconds)
+    })
 }
 
 fn authorize_delta_sync(headers: &HeaderMap) -> Result<(), Response> {
@@ -830,13 +886,18 @@ fn api_key_hash(headers: &HeaderMap) -> Option<String> {
 
 fn delta_sync_api_key() -> Option<String> {
     #[cfg(test)]
-    if let Some(value) = DELTA_SYNC_API_KEY_OVERRIDE
-        .lock()
-        .expect("delta sync api key override lock poisoned")
-        .clone()
     {
-        return value;
+        match DELTA_SYNC_API_KEY_OVERRIDE
+            .lock()
+            .expect("delta sync api key override lock poisoned")
+            .clone()
+        {
+            ApiKeyOverride::NotSet => {} // fall through to OnceLock below
+            ApiKeyOverride::NoKeyRequired => return None,
+            ApiKeyOverride::Key(key) => return Some(key),
+        }
     }
+
     DELTA_SYNC_API_KEY
         .get_or_init(|| std::env::var("AUTOPILOT_DELTA_SYNC_API_KEY").ok())
         .clone()
@@ -922,7 +983,8 @@ fn delta_event_to_dto(event: DeltaEvent) -> DeltaEventDto {
         DeltaEvent::JitOwnersChanged {
             surplus_capturing_jit_order_owners,
         } => DeltaEventDto::JitOwnersChanged {
-            surplus_capturing_jit_order_owners: surplus_capturing_jit_order_owners.clone(),
+            // Move the Vec directly; the enum was consumed by value.
+            surplus_capturing_jit_order_owners,
         },
     }
 }
@@ -1125,18 +1187,32 @@ mod tests {
 
     #[cfg(test)]
     struct ApiKeyOverrideGuard {
-        previous: Option<Option<String>>,
+        previous: ApiKeyOverride,
     }
 
     #[cfg(test)]
     impl ApiKeyOverrideGuard {
-        fn set(value: Option<String>) -> Self {
+        /// Sets the override to require `key`.  Pass `None` to override with
+        /// "no key required" (open endpoint).
+        fn set(key: Option<String>) -> Self {
+            let new_value = match key {
+                Some(k) => ApiKeyOverride::Key(k),
+                None => ApiKeyOverride::NoKeyRequired,
+            };
             let mut lock = DELTA_SYNC_API_KEY_OVERRIDE
                 .lock()
                 .expect("delta sync api key override lock poisoned");
             let previous = lock.clone();
-            *lock = Some(value);
+            *lock = new_value;
             Self { previous }
+        }
+
+        /// Explicitly clear the override (identical to dropping the guard, but
+        /// useful when the guard needs to be cleared early in a test).
+        fn clear(&self) {
+            *DELTA_SYNC_API_KEY_OVERRIDE
+                .lock()
+                .expect("delta sync api key override lock poisoned") = ApiKeyOverride::NotSet;
         }
     }
 
@@ -1259,8 +1335,6 @@ mod tests {
         (cache, postgres)
     }
 
-
-
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct WireEnvelope {
@@ -1309,7 +1383,7 @@ mod tests {
     fn api_envelope_serializes_with_expected_wire_shape() {
         let envelope = DeltaEventEnvelope {
             version: 1,
-            boot_id: crate::solvable_orders::boot_id().to_string(),
+            boot_id: crate::solvable_orders::boot_id().to_owned(),
             auction_id: 9,
             auction_sequence: 4,
             from_sequence: 10,
@@ -1343,7 +1417,7 @@ mod tests {
     fn api_envelope_serializes_block_and_jit_owner_events() {
         let envelope = DeltaEventEnvelope {
             version: 1,
-            boot_id: crate::solvable_orders::boot_id().to_string(),
+            boot_id: crate::solvable_orders::boot_id().to_owned(),
             auction_id: 9,
             auction_sequence: 4,
             from_sequence: 10,
@@ -2061,7 +2135,7 @@ mod tests {
     fn boot_id_field_appears_in_envelope_responses() {
         let envelope = DeltaEventEnvelope {
             version: 1,
-            boot_id: crate::solvable_orders::boot_id().to_string(),
+            boot_id: crate::solvable_orders::boot_id().to_owned(),
             auction_id: 1,
             auction_sequence: 1,
             from_sequence: 0,

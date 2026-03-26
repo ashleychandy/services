@@ -182,7 +182,8 @@ mod tests {
                 Arc::new(err_mock_maintenance),
                 Arc::new(ok2_mock_maintenance),
             ],
-            retry_delay: Duration::default(),
+
+            retry_delay: Duration::from_millis(50),
             metrics: Metrics::instance(observe::metrics::get_storage_registry()).unwrap(),
         };
 
@@ -252,7 +253,8 @@ mod tests {
 
         let service_maintenance = ServiceMaintenance {
             maintainers: vec![Arc::new(mock_maintenance)],
-            retry_delay: Duration::default(),
+
+            retry_delay: Duration::from_millis(50),
             metrics: Metrics::instance(observe::metrics::get_storage_registry()).unwrap(),
         };
 
