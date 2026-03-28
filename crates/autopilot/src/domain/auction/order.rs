@@ -30,7 +30,7 @@ pub struct Order {
 }
 
 // uid as 56 bytes: 32 for orderDigest, 20 for ownerAddress and 4 for validTo
-#[derive(Copy, Clone, PartialEq, Hash, Eq)]
+#[derive(Copy, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]
 pub struct OrderUid(pub [u8; 56]);
 
 impl OrderUid {

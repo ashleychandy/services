@@ -480,6 +480,11 @@ impl SolvableOrdersCache {
         let _ = self.delta_sender.send(envelope);
     }
 
+    #[cfg(test)]
+    pub(crate) fn delta_receiver_count(&self) -> usize {
+        self.delta_sender.receiver_count()
+    }
+
     /// Updates the auction ID and emits an AuctionChanged delta event if
     /// changed.
     ///
@@ -1575,17 +1580,17 @@ impl SolvableOrdersCache {
         shadow_compare_incremental: bool,
     ) -> Option<Vec<DeltaEvent>> {
         let previous = previous?;
-        let current_orders_by_uid = current
-            .orders
-            .iter()
-            .map(|order| (order.uid, order.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut current_orders = current_orders_by_uid.clone();
-        let previous_orders = previous
+
+        let mut current_orders_by_uid: HashMap<_, _> = current
             .orders
             .iter()
             .map(|order| (order.uid, order))
-            .collect::<HashMap<_, _>>();
+            .collect();
+        let previous_orders: HashMap<_, _> = previous
+            .orders
+            .iter()
+            .map(|order| (order.uid, order))
+            .collect();
         let mut emitted = HashSet::new();
         let mut events = Vec::new();
 
@@ -1593,9 +1598,9 @@ impl SolvableOrdersCache {
         added.sort_by(|a, b| a.0.cmp(&b.0));
         added.dedup();
         for uid in added {
-            if let Some(order) = current_orders.remove(&uid) {
+            if let Some(order) = current_orders_by_uid.remove(&uid) {
                 if emitted.insert(uid) {
-                    events.push(DeltaEvent::OrderAdded(order));
+                    events.push(DeltaEvent::OrderAdded((*order).clone()));
                 }
             }
         }
@@ -1604,14 +1609,14 @@ impl SolvableOrdersCache {
         updated.sort_by(|a, b| a.0.cmp(&b.0));
         updated.dedup();
         for uid in updated {
-            if let Some(order) = current_orders.remove(&uid) {
+            if let Some(order) = current_orders_by_uid.remove(&uid) {
                 if previous_orders
                     .get(&uid)
-                    .map(|previous| !solver_visible_order_eq(previous, &order))
+                    .map(|previous| !solver_visible_order_eq(previous, order))
                     .unwrap_or(true)
                 {
                     if emitted.insert(uid) {
-                        events.push(DeltaEvent::OrderUpdated(order));
+                        events.push(DeltaEvent::OrderUpdated((*order).clone()));
                     }
                 }
             }
@@ -1621,14 +1626,14 @@ impl SolvableOrdersCache {
         quote_updated.sort_by(|a, b| a.0.cmp(&b.0));
         quote_updated.dedup();
         for uid in quote_updated {
-            if let Some(order) = current_orders.remove(&uid) {
+            if let Some(order) = current_orders_by_uid.remove(&uid) {
                 if previous_orders
                     .get(&uid)
-                    .map(|previous| !solver_visible_order_eq(previous, &order))
+                    .map(|previous| !solver_visible_order_eq(previous, order))
                     .unwrap_or(true)
                 {
                     if emitted.insert(uid) {
-                        events.push(DeltaEvent::OrderUpdated(order));
+                        events.push(DeltaEvent::OrderUpdated((*order).clone()));
                     }
                 }
             }
@@ -1654,9 +1659,10 @@ impl SolvableOrdersCache {
                     emitted.insert(transition.uid);
                     events.push(DeltaEvent::OrderRemoved(transition.uid));
                 }
-            } else if let Some(order) = current_orders_by_uid.get(&transition.uid) {
+            } else if let Some(order) = current_orders_by_uid.remove(&transition.uid) {
+                // Remove the entry so it cannot be emitted again.
                 emitted.insert(transition.uid);
-                events.push(DeltaEvent::OrderAdded(order.clone()));
+                events.push(DeltaEvent::OrderAdded((*order).clone()));
             } else {
                 Metrics::get()
                     .delta_filter_transition_missing_order_total
@@ -1891,20 +1897,30 @@ impl SolvableOrdersCache {
 }
 
 fn prune_delta_history(delta_history: &mut VecDeque<DeltaEnvelope>, max_age: chrono::Duration) {
-    let max_age = max_age.to_std().unwrap_or_else(|_| Duration::from_secs(0));
+    let max_age_std = max_age.to_std().unwrap_or_else(|_| Duration::from_secs(0));
     let min_retained = delta_history_min_retained();
-    loop {
-        let over_count = delta_history.len() > MAX_DELTA_HISTORY;
-        let over_age = delta_history
-            .front()
-            .is_some_and(|front| front.published_at_instant.elapsed() > max_age)
-            && delta_history.len() > min_retained;
 
-        if !(over_count || over_age) {
-            break;
-        }
+    // How many elements may be removed by age while still retaining the minimum
+    // required elements.
+    let pruneable = delta_history.len().saturating_sub(min_retained);
 
-        delta_history.pop_front();
+    // Count leading elements that are older than `max_age`, but don't count
+    // past the `min_retained` boundary.
+    let to_remove_by_age = delta_history
+        .iter()
+        .take(pruneable)
+        .take_while(|e| e.published_at_instant.elapsed() > max_age_std)
+        .count();
+
+    // Also compute how many must be removed to respect `MAX_DELTA_HISTORY`.
+    let to_remove_by_count = delta_history.len().saturating_sub(MAX_DELTA_HISTORY);
+
+    // We need to remove enough elements to satisfy both constraints, so take
+    // the maximum of the two removal counts.
+    let remove = to_remove_by_age.max(to_remove_by_count);
+
+    if remove > 0 {
+        delta_history.drain(..remove);
     }
 }
 
@@ -2034,12 +2050,17 @@ fn delta_event_rank(event: &DeltaEvent) -> u8 {
 }
 
 fn checksum_order_uids(orders: &[domain::Order]) -> String {
-    let mut uids = orders.iter().map(|order| order.uid).collect::<Vec<_>>();
-    uids.sort_by(|a, b| a.0.cmp(&b.0));
+    // Deterministic checksum by hashing the ordered list of UIDs. This
+    // matches the driver's approach: sort UIDs and feed their raw bytes to
+    // the SHA256 hasher. Use an unstable sort on the raw arrays for best
+    // performance (no stability required) and avoid per-comparison slice
+    // coercions by sorting the `[u8;56]` values directly.
+    let mut uids: Vec<[u8; 56]> = orders.iter().map(|o| o.uid.0).collect();
+    uids.sort_unstable();
 
     let mut hasher = Sha256::new();
     for uid in uids {
-        hasher.update(uid.0);
+        hasher.update(&uid);
     }
     format!("0x{}", const_hex::encode(hasher.finalize()))
 }
@@ -2155,6 +2176,9 @@ pub(crate) fn apply_delta_events_to_auction(
     previous: domain::RawAuctionData,
     events: &[DeltaEvent],
 ) -> domain::RawAuctionData {
+    // Use a HashMap for mutation efficiency and do a single sort at the end.
+    // For typical auction sizes a single final sort is faster than repeated
+    // tree insertions during event application.
     let mut orders: HashMap<domain::OrderUid, domain::Order> = previous
         .orders
         .into_iter()
@@ -2195,7 +2219,7 @@ pub(crate) fn apply_delta_events_to_auction(
     }
 
     let mut orders = orders.into_values().collect::<Vec<_>>();
-    orders.sort_by_key(|order| order.uid.0);
+    orders.sort_unstable_by_key(|order| order.uid);
 
     domain::RawAuctionData {
         block,
@@ -2582,6 +2606,7 @@ mod tests {
         account_balances::BalanceFetching,
         alloy::primitives::{Address, B256},
         bad_tokens::list_based::DenyListedTokens,
+        database::byte_array::ByteArray,
         eth_domain_types as eth,
         ethrpc::{
             alloy::unbuffered_provider,
@@ -2697,6 +2722,199 @@ mod tests {
             Address::repeat_byte(0xFF),
             false,
         )
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_update_runs_against_postgres() {
+        // Connect to the local Postgres instance (expects schema/migrations
+        // from the repository to be applied).
+        let postgres = Arc::new(
+            Postgres::with_defaults()
+                .await
+                .expect("postgres must be running at postgresql://"),
+        );
+
+        // Clear state using a transaction, matching our DB helpers' pattern.
+        let mut tx = postgres.pool.begin().await.expect("begin tx");
+        database::clear_DANGER_(&mut tx)
+            .await
+            .expect("failed to clear database");
+        tx.commit().await.expect("commit tx");
+
+        let persistence = Persistence::new(None, Arc::clone(&postgres)).await;
+
+        let balance_fetcher = Arc::new(StubBalanceFetcher::default());
+        let deny_listed_tokens = DenyListedTokens::default();
+
+        let native_price_estimator = StubNativePriceEstimator::default();
+        let cache_store = Cache::new(Duration::from_secs(10), Default::default());
+        let caching_estimator = CachingNativePriceEstimator::new(
+            Box::new(native_price_estimator),
+            cache_store,
+            1,
+            Default::default(),
+            HEALTHY_PRICE_ESTIMATION_TIME,
+        );
+        let native_price_updater =
+            NativePriceUpdater::new(caching_estimator, Duration::MAX, Default::default());
+
+        let (provider, _wallet) = unbuffered_provider("http://localhost:0", None);
+        let block_stream = mock_single_block(BlockInfo::default());
+        let block_retriever = Arc::new(BlockRetriever {
+            provider,
+            block_stream,
+        });
+        let cow_amm_registry = cow_amm::Registry::new(block_retriever);
+
+        let protocol_fees = domain::ProtocolFees::new(
+            &configs::autopilot::fee_policy::FeePoliciesConfig::default(),
+            Vec::new(),
+            false,
+        );
+
+        // disable_order_balance_filter=true: StubBalanceFetcher returns U256::ZERO
+        // for every query, so balance filtering must be disabled or the inserted
+        // order would be filtered out before reaching the delta machinery.
+        let cache = SolvableOrdersCache::new(
+            Duration::from_secs(0),
+            persistence,
+            order_validation::banned::Users::none(),
+            balance_fetcher,
+            deny_listed_tokens,
+            native_price_updater,
+            Address::repeat_byte(0xEE),
+            protocol_fees,
+            cow_amm_registry,
+            Duration::from_secs(1),
+            Address::repeat_byte(0xFF),
+            true,
+        );
+
+        // Insert a real order so the production pipeline exercises price
+        // estimation, filtering, and diff logic.  Use ByteArray constructors
+        // directly, matching the established pattern in this test module.
+        let uid = ByteArray([0x11; 56]);
+        let app_data = ByteArray([0x22; 32]);
+        let now = chrono::Utc::now();
+
+        let mut conn = postgres.pool.acquire().await.expect("acquire conn");
+        database::app_data::insert(&mut conn, &app_data, b"{}")
+            .await
+            .expect("insert app_data");
+
+        let order = database::orders::Order {
+            uid,
+            owner: ByteArray([0x33; 20]),
+            creation_timestamp: now,
+            sell_token: ByteArray([0x44; 20]),
+            buy_token: ByteArray([0x55; 20]),
+            receiver: None,
+            sell_amount: sqlx::types::BigDecimal::from(1000u64),
+            buy_amount: sqlx::types::BigDecimal::from(900u64),
+            valid_to: now.timestamp() + 600,
+            app_data,
+            fee_amount: sqlx::types::BigDecimal::from(0u64),
+            kind: database::orders::OrderKind::Sell,
+            partially_fillable: false,
+            signature: vec![0u8; 65],
+            signing_scheme: database::orders::SigningScheme::Eip712,
+            settlement_contract: ByteArray([0x66; 20]),
+            sell_token_balance: database::orders::SellTokenSource::Erc20,
+            buy_token_balance: database::orders::BuyTokenDestination::Erc20,
+            cancellation_timestamp: None,
+            class: database::orders::OrderClass::Limit,
+        };
+        database::orders::insert_order(&mut conn, &order)
+            .await
+            .expect("insert order");
+        drop(conn);
+
+        // Subscribe before the first update so no envelope is missed.
+        let mut receiver = cache.subscribe_deltas();
+
+        // ---- First update: cache is empty, order enters the set ----
+        cache.update(1, false).await.expect("first update failed");
+
+        let envelope1 = receiver
+            .try_recv()
+            .expect("first envelope should have been sent");
+        assert_eq!(envelope1.from_sequence, 0);
+        assert_eq!(envelope1.to_sequence, 1);
+        // The inserted order must appear as OrderAdded in the first envelope.
+        assert!(
+            envelope1
+                .events
+                .iter()
+                .any(|e| matches!(e, DeltaEvent::OrderAdded(_))),
+            "first update should emit OrderAdded for the inserted order; got: {:?}",
+            envelope1.events
+        );
+        // No removals or updates on first call — there is no previous state to diff.
+        assert!(
+            !envelope1
+                .events
+                .iter()
+                .any(|e| matches!(e, DeltaEvent::OrderRemoved(_) | DeltaEvent::OrderUpdated(_))),
+            "first update must not emit OrderRemoved or OrderUpdated"
+        );
+
+        let seq1 = cache
+            .delta_sequence()
+            .await
+            .expect("sequence missing after first update");
+        assert_eq!(seq1, 1);
+
+        // ---- Second update: same order, different block number ----
+        cache.update(2, false).await.expect("second update failed");
+
+        let envelope2 = receiver
+            .try_recv()
+            .expect("second envelope should have been sent");
+        assert_eq!(envelope2.from_sequence, 1);
+        assert_eq!(envelope2.to_sequence, 2);
+        // The order is unchanged so the incremental diff must not emit any order
+        // events.  If it does, the diff logic has a bug.
+        assert!(
+            !envelope2.events.iter().any(|e| matches!(
+                e,
+                DeltaEvent::OrderAdded(_)
+                    | DeltaEvent::OrderRemoved(_)
+                    | DeltaEvent::OrderUpdated(_)
+            )),
+            "second update with unchanged order must emit no order events; got: {:?}",
+            envelope2.events
+        );
+        // Block number changed from 1 to 2, so BlockChanged must be present.
+        assert!(
+            envelope2
+                .events
+                .iter()
+                .any(|e| matches!(e, DeltaEvent::BlockChanged { block: 2 })),
+            "second update must emit BlockChanged {{ block: 2 }}; got: {:?}",
+            envelope2.events
+        );
+
+        let seq2 = cache
+            .delta_sequence()
+            .await
+            .expect("sequence missing after second update");
+        assert_eq!(seq2, 2);
+        assert!(seq2 > seq1, "sequence must be strictly increasing");
+
+        // The snapshot must reflect the final sequence.
+        let snapshot = cache.delta_snapshot().await.expect("snapshot should exist");
+        assert_eq!(snapshot.sequence, seq2);
+        // The snapshot auction must contain the order.
+        let model_uid = model::order::OrderUid(uid.0);
+        assert!(
+            snapshot
+                .auction
+                .orders
+                .iter()
+                .any(|o| o.uid == domain::OrderUid(model_uid.0)),
+            "snapshot auction must contain the inserted order"
+        );
     }
 
     #[cfg(test)]
@@ -4628,17 +4846,12 @@ mod tests {
     }
 
     #[test]
-    fn delta_history_min_retained_uses_env_var_when_override_not_set() {
-        unsafe {
-            std::env::set_var("AUTOPILOT_DELTA_HISTORY_MIN_RETAINED", "42");
-        }
-        // Use the override mechanism since OnceLock caches the value
+    fn delta_history_min_retained_respects_override_guard() {
+        // The global OnceLock may already be initialized by other tests.
+        // The intended behaviour tested here is that the test-only override
+        // (`DeltaHistoryMinRetainedGuard`) takes precedence — ensure that.
         let _guard = DeltaHistoryMinRetainedGuard::set(42);
         let value = delta_history_min_retained();
-        unsafe {
-            std::env::remove_var("AUTOPILOT_DELTA_HISTORY_MIN_RETAINED");
-        }
-
         assert_eq!(value, 42);
     }
 
@@ -4812,9 +5025,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn property_sequence_monotonicity_never_decreases() {
-        // Property: After any sequence of update() + set_auction_id() calls,
-        // delta_sequence never decreases.
+    async fn property_sequence_monotonicity_with_test_overrides_never_decreases() {
+        // Property: After any sequence of `set_state_for_tests()` + `set_auction_id()`
+        // calls (i.e. direct test overrides), delta_sequence never decreases.
 
         let cache = test_cache().await;
 

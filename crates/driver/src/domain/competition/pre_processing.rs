@@ -255,16 +255,23 @@ impl Utilities {
     /// auction pre-processing since eagerly deserializing these requests
     /// is surprisingly costly because their are so big.
     async fn parse_request(&self, solve_request: Request<Body>) -> Result<Arc<Auction>> {
-        let body_mode = parse_solve_request_body_mode(solve_request.headers())?;
+        let mut request_opt: Option<Request<Body>> = Some(solve_request);
+
+        let body_mode = parse_solve_request_body_mode(headers_of(&request_opt))?;
+
         let replica_state = delta_sync::replica_state()
             .await
             .unwrap_or(ReplicaState::Uninitialized);
         let replica_fresh = delta_sync::replica_is_fresh().await.unwrap_or(false);
         let replica_ready = matches!(replica_state, ReplicaState::Ready) && replica_fresh;
+
+        let mut buffered_body: Option<body::Bytes> = None;
+
         let auction_dto = if delta_sync::replica_preprocessing_enabled() && replica_ready {
-            if let Some(metadata) =
-                parse_solve_request_metadata_from_headers(solve_request.headers())?
-            {
+            if let Some(metadata) = {
+                let headers = headers_of(&request_opt);
+                parse_solve_request_metadata_from_headers(headers)?
+            } {
                 match build_solve_request_from_replica_resilient(&metadata, body_mode).await {
                     Ok(Some(from_replica)) => {
                         tracing::debug!(
@@ -274,20 +281,20 @@ impl Utilities {
                         from_replica
                     }
                     Ok(None) => {
-                        let solve_request = collect_request_body(solve_request).await?;
-                        parse_full_solve_request(solve_request).await?
+                        let body = read_body_once(&mut request_opt, &mut buffered_body).await?;
+                        parse_full_solve_request(body).await?
                     }
                     Err(err) => {
                         if body_mode == SolveRequestBodyMode::Thin {
                             return Err(err);
                         }
-                        let solve_request = collect_request_body(solve_request).await?;
-                        parse_full_solve_request(solve_request).await?
+                        let body = read_body_once(&mut request_opt, &mut buffered_body).await?;
+                        parse_full_solve_request(body).await?
                     }
                 }
             } else {
-                let solve_request = collect_request_body(solve_request).await?;
-                let metadata = parse_solve_request_metadata(&solve_request)?;
+                let body = read_body_once(&mut request_opt, &mut buffered_body).await?;
+                let metadata = parse_solve_request_metadata(&body)?;
                 match build_solve_request_from_replica_resilient(&metadata, body_mode).await {
                     Ok(Some(from_replica)) => {
                         tracing::debug!(
@@ -296,51 +303,44 @@ impl Utilities {
                         );
                         from_replica
                     }
-                    Ok(None) => parse_full_solve_request(solve_request).await?,
+                    Ok(None) => parse_full_solve_request(body).await?,
                     Err(err) => {
                         if body_mode == SolveRequestBodyMode::Thin {
                             return Err(err);
                         }
-                        parse_full_solve_request(solve_request).await?
+                        parse_full_solve_request(body).await?
                     }
                 }
             }
         } else if delta_sync::replica_preprocessing_enabled() && !replica_ready {
             if body_mode == SolveRequestBodyMode::Thin {
-                let headers = solve_request.headers().clone();
-                let body = collect_request_body(solve_request).await?;
-                if let Ok(from_body) = parse_full_solve_request(body.clone()).await {
-                    // Check if the parsed body has orders. A thin request with an empty
-                    // orders array will parse successfully but should use the replica instead.
-                    if from_body.has_orders() {
-                        from_body
-                    } else {
-                        let metadata = if let Some(metadata) =
-                            parse_solve_request_metadata_from_headers(&headers)?
-                        {
-                            metadata
+                let body = read_body_once(&mut request_opt, &mut buffered_body).await?;
+
+                let parse_result = parse_full_solve_request(body.clone()).await;
+                match parse_result {
+                    Ok(from_body) => {
+                        if from_body.has_orders() {
+                            from_body
                         } else {
-                            parse_solve_request_metadata(&body)?
-                        };
+                            let metadata: SolveRequestMetadata = (&from_body).into();
+
+                            match build_solve_request_from_replica_resilient(&metadata, body_mode)
+                                .await
+                            {
+                                Ok(Some(from_replica)) => from_replica,
+                                Ok(None) => from_body,
+                                Err(err) => return Err(err),
+                            }
+                        }
+                    }
+                    Err(parse_err) => {
+                        let metadata = parse_solve_request_metadata(&body)?;
                         match build_solve_request_from_replica_resilient(&metadata, body_mode).await
                         {
                             Ok(Some(from_replica)) => from_replica,
-                            Ok(None) => parse_full_solve_request(body.clone()).await?,
+                            Ok(None) => return Err(parse_err),
                             Err(err) => return Err(err),
                         }
-                    }
-                } else {
-                    let metadata = if let Some(metadata) =
-                        parse_solve_request_metadata_from_headers(&headers)?
-                    {
-                        metadata
-                    } else {
-                        parse_solve_request_metadata(&body)?
-                    };
-                    match build_solve_request_from_replica_resilient(&metadata, body_mode).await {
-                        Ok(Some(from_replica)) => from_replica,
-                        Ok(None) => parse_full_solve_request(body.clone()).await?,
-                        Err(err) => return Err(err),
                     }
                 }
             } else {
@@ -350,8 +350,8 @@ impl Utilities {
                     replica_fresh,
                     "delta replica not ready; falling back to full solve body"
                 );
-                let solve_request = collect_request_body(solve_request).await?;
-                parse_full_solve_request(solve_request).await?
+                let body = read_body_once(&mut request_opt, &mut buffered_body).await?;
+                parse_full_solve_request(body).await?
             }
         } else {
             if body_mode == SolveRequestBodyMode::Thin {
@@ -360,8 +360,8 @@ impl Utilities {
                      disabled"
                 );
             }
-            let solve_request = collect_request_body(solve_request).await?;
-            parse_full_solve_request(solve_request).await?
+            let body = read_body_once(&mut request_opt, &mut buffered_body).await?;
+            parse_full_solve_request(body).await?
         };
 
         // now that we finally know the auction id we can set it in the span
@@ -686,6 +686,20 @@ struct SolveRequestTokenMetadata {
     trusted: bool,
 }
 
+impl From<&crate::infra::api::routes::solve::dto::SolveRequest> for SolveRequestMetadata {
+    fn from(req: &crate::infra::api::routes::solve::dto::SolveRequest) -> Self {
+        SolveRequestMetadata {
+            id: req.id(),
+            tokens: req
+                .tokens_meta()
+                .map(|(address, trusted)| SolveRequestTokenMetadata { address, trusted })
+                .collect(),
+            deadline: req.deadline(),
+            surplus_capturing_jit_order_owners: req.surplus_jit_owners().to_vec(),
+        }
+    }
+}
+
 fn parse_solve_request_metadata(solve_request: &[u8]) -> Result<SolveRequestMetadata> {
     let _timer = metrics::get().processing_stage_timer("parse_dto");
     let _timer2 = observe::metrics::metrics().on_auction_overhead_start("driver", "parse_dto");
@@ -862,45 +876,67 @@ async fn build_solve_request_from_replica(
         snapshot.orders,
     )))
 }
+async fn ensure_replica_then_build(
+    metadata: &SolveRequestMetadata,
+    run_retry_loop: bool,
+    bootstrap_context: &'static str,
+    not_bootstrapped_msg: &'static str,
+    post_bootstrap_failure_msg: &'static str,
+) -> Result<SolveRequest> {
+    if run_retry_loop
+        && matches!(
+            delta_sync::replica_state().await,
+            Some(ReplicaState::Syncing | ReplicaState::Resyncing)
+        )
+    {
+        let attempts = delta_sync_resync_retry_attempts();
+        let delay = delta_sync_resync_retry_delay();
+        for _ in 0..attempts {
+            tokio::time::sleep(delay).await;
+            match build_solve_request_from_replica(metadata).await {
+                Ok(Some(request)) => return Ok(request),
+                Ok(None) => continue,
+                Err(err) => tracing::warn!(?err, "delta replica build attempt failed during retry"),
+            }
+        }
+    }
+
+    // Bootstrap fallback
+    let bootstrapped = delta_sync::ensure_replica_snapshot_from_env()
+        .await
+        .context(bootstrap_context)?;
+    if !bootstrapped {
+        anyhow::bail!(not_bootstrapped_msg);
+    }
+
+    match build_solve_request_from_replica(metadata).await {
+        Ok(Some(request)) => Ok(request),
+        Ok(None) => anyhow::bail!(post_bootstrap_failure_msg),
+        Err(err) => Err(err),
+    }
+}
 
 async fn build_solve_request_from_replica_resilient(
     metadata: &SolveRequestMetadata,
     body_mode: SolveRequestBodyMode,
 ) -> Result<Option<SolveRequest>> {
-    match build_solve_request_from_replica(metadata).await {
+    let first = build_solve_request_from_replica(metadata).await;
+    match first {
         Ok(Some(request)) => Ok(Some(request)),
         Ok(None) => {
             if body_mode != SolveRequestBodyMode::Thin {
-                return Ok(None);
-            }
-            if matches!(
-                delta_sync::replica_state().await,
-                Some(ReplicaState::Syncing | ReplicaState::Resyncing)
-            ) {
-                let attempts = delta_sync_resync_retry_attempts();
-                let delay = delta_sync_resync_retry_delay();
-                for _ in 0..attempts {
-                    tokio::time::sleep(delay).await;
-                    if let Ok(Some(request)) = build_solve_request_from_replica(metadata).await {
-                        return Ok(Some(request));
-                    }
-                }
-            }
-            let bootstrapped = delta_sync::ensure_replica_snapshot_from_env()
-                .await
-                .context("could not bootstrap delta replica for thin solve request")?;
-            if !bootstrapped {
-                anyhow::bail!(
+                Ok(None)
+            } else {
+                ensure_replica_then_build(
+                    metadata,
+                    true,
+                    "could not bootstrap delta replica for thin solve request",
                     "solve request uses thin body mode but delta replica is unavailable and \
-                     DRIVER_DELTA_SYNC_AUTOPILOT_URL is not configured"
-                );
-            }
-            match build_solve_request_from_replica(metadata).await? {
-                Some(request) => Ok(Some(request)),
-                None => anyhow::bail!(
-                    "solve request uses thin body mode but delta replica is still unavailable \
-                     after bootstrap"
-                ),
+                     DRIVER_DELTA_SYNC_AUTOPILOT_URL is not configured",
+                    "bootstrap succeeded but delta replica returned no snapshot",
+                )
+                .await
+                .map(Some)
             }
         }
         Err(err) => {
@@ -909,32 +945,23 @@ async fn build_solve_request_from_replica_resilient(
                     ?err,
                     "delta replica unavailable for solve request; fallback to request body"
                 );
-                return Ok(None);
-            }
-
-            tracing::warn!(
-                ?err,
-                "delta replica build failed for thin solve request; attempting bootstrap"
-            );
-            let bootstrapped = delta_sync::ensure_replica_snapshot_from_env()
-                .await
-                .context("could not bootstrap delta replica after thin parse failure")?;
-            if !bootstrapped {
-                anyhow::bail!(
-                    "solve request uses thin body mode but delta replica build failed and \
-                     bootstrap is not configured"
+                Ok(None)
+            } else {
+                tracing::warn!(
+                    ?err,
+                    "delta replica build failed for thin solve request; attempting bootstrap"
                 );
-            }
-            match build_solve_request_from_replica(metadata).await {
-                Ok(Some(request)) => Ok(Some(request)),
-                Ok(None) => anyhow::bail!(
-                    "solve request uses thin body mode but delta replica is unavailable after \
-                     bootstrap"
-                ),
-                Err(retry_err) => Err(retry_err.context(
-                    "solve request uses thin body mode but delta replica build failed after \
-                     bootstrap",
-                )),
+
+                ensure_replica_then_build(
+                    metadata,
+                    false,
+                    "could not bootstrap delta replica after thin parse failure",
+                    "solve request uses thin body mode but delta replica build failed and \
+                     bootstrap is not configured",
+                    "bootstrap succeeded but delta replica returned no snapshot",
+                )
+                .await
+                .map(Some)
             }
         }
     }
@@ -986,6 +1013,25 @@ async fn collect_request_body(request: Request<Body>) -> Result<body::Bytes> {
     let duration = start.elapsed();
     tracing::debug!(?duration, "finished streaming request body");
     Ok(body_bytes)
+}
+
+async fn read_body_once(
+    req_opt: &mut Option<Request<Body>>,
+    buf: &mut Option<body::Bytes>,
+) -> Result<body::Bytes> {
+    if let Some(b) = buf.as_ref() {
+        return Ok(b.clone());
+    }
+    let req = req_opt.take().context("request body already consumed")?;
+    let b = collect_request_body(req).await?;
+    *buf = Some(b.clone());
+    Ok(b)
+}
+
+fn headers_of(req: &Option<Request<Body>>) -> &HeaderMap {
+    req.as_ref()
+        .expect("request must be present before body is consumed")
+        .headers()
 }
 
 #[cfg(test)]

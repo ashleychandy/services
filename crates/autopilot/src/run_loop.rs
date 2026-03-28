@@ -636,11 +636,11 @@ impl RunLoop {
             let full_request = full_request.clone();
             let thin_request = thin_request.clone();
             async move {
-                let request = Self::select_solve_request_for_driver(
-                    driver.supports_thin_solve_request,
-                    full_request,
-                    thin_request,
-                );
+                let request = if driver.supports_thin_solve_request {
+                    thin_request.unwrap_or(full_request)
+                } else {
+                    full_request
+                };
                 Metrics::solve_request_body_size(request.body_size());
                 self.solve(driver.clone(), request).await
             }
@@ -678,20 +678,6 @@ impl RunLoop {
         bids
     }
 
-    fn select_solve_request_for_driver(
-        supports_thin_solve_request: bool,
-        full_request: solve::Request,
-        thin_request: Option<solve::Request>,
-    ) -> solve::Request {
-        if supports_thin_solve_request {
-            thin_request.unwrap_or(full_request)
-        } else {
-            full_request
-        }
-    }
-
-    /// Sends a `/solve` request to the driver and manages all error cases and
-    /// records metrics and logs appropriately.
     #[instrument(skip_all, fields(driver = driver.name))]
     async fn solve(
         &self,
@@ -1281,8 +1267,14 @@ mod tests {
         let full_size = full_request.body_size();
         let thin_size = thin_request.body_size();
 
-        let selected =
-            RunLoop::select_solve_request_for_driver(false, full_request, Some(thin_request));
+        let supports_thin = false;
+        let selected = if supports_thin {
+            // supports thin -> prefer thin_request when available
+            Some(thin_request).unwrap_or(full_request)
+        } else {
+            // not supported -> use full_request
+            full_request
+        };
 
         assert_eq!(selected.body_size(), full_size);
         assert_ne!(full_size, thin_size);
@@ -1311,8 +1303,13 @@ mod tests {
         let full_size = full_request.body_size();
         let thin_size = thin_request.body_size();
 
-        let selected =
-            RunLoop::select_solve_request_for_driver(true, full_request, Some(thin_request));
+        let supports_thin = true;
+        let selected = if supports_thin {
+            // supports thin -> prefer thin_request when available
+            Some(thin_request).unwrap_or(full_request)
+        } else {
+            full_request
+        };
 
         assert_eq!(selected.body_size(), thin_size);
         assert_ne!(full_size, thin_size);

@@ -109,10 +109,21 @@ async fn delta_sync_snapshot_stream_resync_recovery(web3: Web3) {
 
     let services = Services::new(&onchain).await;
     let (shutdown_before_resync, control_before_resync) = ShutdownController::new_manual_shutdown();
+    // Allocate an ephemeral metrics port to avoid collisions across
+    // tests/processes.
+    let metrics_listener_before = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind metrics listener");
+    let metrics_port_before = metrics_listener_before
+        .local_addr()
+        .expect("failed to read metrics listener addr")
+        .port();
+    drop(metrics_listener_before);
+
     let autopilot_before_resync: tokio::task::JoinHandle<()> = services
         .start_autopilot_with_shutdown_controller(
             None,
-            delta_autopilot_config(solver.address(), 9589, delta_api_port),
+            delta_autopilot_config(solver.address(), metrics_port_before, delta_api_port),
             control_before_resync,
         )
         .await;
@@ -173,10 +184,20 @@ async fn delta_sync_snapshot_stream_resync_recovery(web3: Web3) {
     .unwrap();
 
     let (_shutdown_after_resync, control_after_resync) = ShutdownController::new_manual_shutdown();
+    // Allocate another ephemeral metrics port for the restarted autopilot instance.
+    let metrics_listener_after = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind metrics listener");
+    let metrics_port_after = metrics_listener_after
+        .local_addr()
+        .expect("failed to read metrics listener addr")
+        .port();
+    drop(metrics_listener_after);
+
     let _autopilot_after_resync: tokio::task::JoinHandle<()> = services
         .start_autopilot_with_shutdown_controller(
             None,
-            delta_autopilot_config(solver.address(), 9590, delta_api_port),
+            delta_autopilot_config(solver.address(), metrics_port_after, delta_api_port),
             control_after_resync,
         )
         .await;
@@ -251,10 +272,20 @@ async fn delta_sync_update_pipeline_integration(web3: Web3) {
 
     let services = Services::new(&onchain).await;
     let (_shutdown, control) = ShutdownController::new_manual_shutdown();
+    // Use an ephemeral metrics port for this autopilot to avoid collisions.
+    let metrics_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind metrics listener");
+    let metrics_port = metrics_listener
+        .local_addr()
+        .expect("failed to read metrics listener addr")
+        .port();
+    drop(metrics_listener);
+
     let _autopilot: tokio::task::JoinHandle<()> = services
         .start_autopilot_with_shutdown_controller(
             None,
-            delta_autopilot_config(solver.address(), 9589, delta_api_addr.port()),
+            delta_autopilot_config(solver.address(), metrics_port, delta_api_addr.port()),
             control,
         )
         .await;
@@ -626,7 +657,7 @@ fn auction_prices(auction: &Value) -> BTreeMap<String, Value> {
         return prices;
     };
     for (token, price) in items {
-        prices.insert(token.clone(), price.clone());
+        prices.insert(token.to_lowercase(), price.clone());
     }
     prices
 }

@@ -460,7 +460,7 @@ async fn stream_delta_events(
     }));
 
     // Move the receiver out of the helper's result for use by the live stream.
-    let mut receiver = result.receiver;
+    let receiver = result.receiver;
     let cache = Arc::clone(&state.solvable_orders_cache);
     let live_stream = BroadcastStream::new(receiver).filter_map(move |item| {
         let cache = Arc::clone(&cache);
@@ -641,25 +641,13 @@ struct DrainOutcome {
     closed: bool,
 }
 
-/// Drains all live envelopes from `receiver` that haven't been covered by
-/// replay yet.
-///
-/// # Parameters
-/// - `receiver`: the broadcast receiver to drain
-/// - `already_replayed_up_to`: skip envelopes whose `to_sequence` is at or
-///   below this value — they are already included in the replay payloads
-/// - `client_baseline_sequence`: the client's original `after_sequence`,
-///   embedded into drained envelopes as `snapshot_sequence` so the client can
-///   validate its stream position
-/// - `highest_sequence_seen`: updated to the highest `to_sequence` observed so
-///   the live stream filter knows where to start
 fn drain_live_envelopes(
     receiver: &mut tokio::sync::broadcast::Receiver<crate::solvable_orders::DeltaEnvelope>,
     already_replayed_up_to: u64,
     client_baseline_sequence: u64,
     highest_sequence_seen: &mut u64,
 ) -> Result<DrainOutcome, DrainError> {
-    let mut drained = Vec::new();
+    let mut payloads: Vec<String> = Vec::new();
     let mut closed = false;
 
     loop {
@@ -677,12 +665,13 @@ fn drain_live_envelopes(
                     "non-monotonic delta to_sequence observed"
                 );
                 *highest_sequence_seen = (*highest_sequence_seen).max(envelope.to_sequence);
+
                 let payload = serde_json::to_string(&to_api_envelope(
                     envelope,
                     Some(client_baseline_sequence),
                 ))
                 .map_err(DrainError::Serialize)?;
-                drained.push(payload);
+                payloads.push(payload);
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Closed) => {
@@ -693,10 +682,7 @@ fn drain_live_envelopes(
         }
     }
 
-    Ok(DrainOutcome {
-        payloads: drained,
-        closed,
-    })
+    Ok(DrainOutcome { payloads, closed })
 }
 
 /// Result type returned by `subscribe_and_build_replay`.
@@ -1698,8 +1684,16 @@ mod tests {
             }
         });
 
-        // Give the read task a moment to subscribe and start polling.
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Wait for the server side to register its delta stream subscriber to
+        // avoid races where publishes happen before any receiver exists.
+        let start = Instant::now();
+        let subscribe_timeout = Duration::from_secs(2);
+        while cache.delta_receiver_count() == 0 {
+            if start.elapsed() > subscribe_timeout {
+                panic!("delta stream subscriber never registered");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         // Publish events rapidly to overwhelm the buffer (size = 1).
         for sequence in 1..=10u64 {

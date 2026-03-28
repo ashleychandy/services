@@ -228,6 +228,18 @@ impl SolveRequest {
         !self.orders.is_empty()
     }
 
+    pub(crate) fn tokens_meta(&self) -> impl Iterator<Item = (eth::Address, bool)> + '_ {
+        self.tokens.iter().map(|t| (t.address, t.trusted))
+    }
+
+    pub(crate) fn deadline(&self) -> chrono::DateTime<chrono::Utc> {
+        self.deadline
+    }
+
+    pub(crate) fn surplus_jit_owners(&self) -> &[eth::Address] {
+        &self.surplus_capturing_jit_order_owners
+    }
+
     pub fn from_replica_parts(
         id: i64,
         deadline: chrono::DateTime<chrono::Utc>,
