@@ -51,6 +51,20 @@ static BOOT_ID: OnceLock<String> = OnceLock::new();
 
 static DELTA_HISTORY_MIN_RETAINED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+macro_rules! send_or_warn {
+    ($sender:expr, $value:expr, $context:literal) => {
+        // Avoid spurious warnings when there are no receivers yet.
+        if $sender.receiver_count() == 0 {
+            tracing::debug!(context = $context, "delta sender has no receivers; dropping envelope");
+        } else {
+            match $sender.send($value) {
+                Ok(_) => {}
+                Err(e) => tracing::warn!(context = $context, error = ?e, "failed to send; receiver dropped"),
+            }
+        }
+    };
+}
+
 pub fn boot_id() -> &'static str {
     BOOT_ID
         .get_or_init(|| uuid::Uuid::new_v4().to_string())
@@ -477,7 +491,7 @@ impl SolvableOrdersCache {
             prune_delta_history(&mut inner.delta_history, max_age);
         }
         // Send while holding the cache lock to keep replay + live ordering consistent
-        let _ = self.delta_sender.send(envelope);
+        send_or_warn!(self.delta_sender, envelope, "delta broadcast");
     }
 
     #[cfg(test)]
@@ -496,7 +510,7 @@ impl SolvableOrdersCache {
             if let Some(envelope) = apply_auction_id_change(inner, auction_id) {
                 // Send while holding cache lock to keep replay + live ordering
                 // consistent (same pattern as update()).
-                let _ = self.delta_sender.send(envelope);
+                send_or_warn!(self.delta_sender, envelope, "delta broadcast");
             }
         }
     }
@@ -524,13 +538,21 @@ impl SolvableOrdersCache {
         after_sequence: Option<u64>,
     ) -> Result<(broadcast::Receiver<DeltaEnvelope>, DeltaReplay), DeltaSubscribeError> {
         let lock = self.cache.lock().await;
+
+        let receiver = self.delta_sender.subscribe();
+
         let latest = lock.as_ref().map(|inner| inner.delta_sequence).unwrap_or(0);
         if after_sequence.is_none() && latest > 0 {
             return Err(DeltaSubscribeError::MissingAfterSequence { latest });
         }
-        let receiver = self.delta_sender.subscribe();
+
         let replay = Self::build_delta_replay(after_sequence.unwrap_or_default(), lock.as_ref())
             .map_err(DeltaSubscribeError::DeltaAfter)?;
+
+        // Release the cache lock before returning so publishers can proceed and
+        // new envelopes will be buffered by the receiver.
+        drop(lock);
+
         Ok((receiver, replay))
     }
 
@@ -905,7 +927,7 @@ impl SolvableOrdersCache {
         // Replay history is updated under the cache lock; subscribers build replay
         // while holding the same lock, so sending while locked keeps replay +
         // live ordering consistent.
-        let _ = self.delta_sender.send(envelope);
+        send_or_warn!(self.delta_sender, envelope, "delta broadcast");
 
         tracing::debug!(%block, "updated current auction cache");
         Metrics::get()

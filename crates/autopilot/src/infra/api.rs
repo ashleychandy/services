@@ -61,6 +61,95 @@ enum ApiKeyOverride {
 }
 
 #[cfg(test)]
+mod invariant_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drain_never_produces_stale_envelopes() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(16);
+        let checkpoint = 10u64;
+        let mut replay_to = checkpoint;
+
+        // Send envelopes spanning both sides of checkpoint
+        for seq in 8u64..=14 {
+            sender
+                .send(crate::solvable_orders::DeltaEnvelope {
+                    auction_id: 0,
+                    auction_sequence: seq,
+                    from_sequence: seq - 1,
+                    to_sequence: seq,
+                    published_at: chrono::Utc::now(),
+                    published_at_instant: std::time::Instant::now(),
+                    events: vec![],
+                })
+                .unwrap();
+        }
+
+        let outcome =
+            drain_live_envelopes(&mut receiver, checkpoint, checkpoint, &mut replay_to).unwrap();
+
+        // Every payload must have to_sequence > checkpoint
+        for payload in &outcome.payloads {
+            let wire: serde_json::Value = serde_json::from_str(payload).unwrap();
+            let to_seq = wire["toSequence"].as_u64().unwrap();
+            assert!(
+                to_seq > checkpoint,
+                "drain produced stale envelope with to_sequence={to_seq} <= \
+                 checkpoint={checkpoint}"
+            );
+        }
+
+        // replay_to must be monotonically updated
+        assert!(replay_to >= checkpoint);
+    }
+
+    /// Verifies replay + drain produces a contiguous sequence.
+    #[tokio::test]
+    async fn replay_and_drain_produce_contiguous_sequence() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(16);
+
+        // Simulate publish during replay window
+        for seq in 5u64..=8 {
+            sender
+                .send(crate::solvable_orders::DeltaEnvelope {
+                    auction_id: 0,
+                    auction_sequence: seq,
+                    from_sequence: seq - 1,
+                    to_sequence: seq,
+                    published_at: chrono::Utc::now(),
+                    published_at_instant: std::time::Instant::now(),
+                    events: vec![],
+                })
+                .unwrap();
+        }
+
+        let mut replay_to = 4u64;
+        let outcome = drain_live_envelopes(&mut receiver, 4, 4, &mut replay_to).unwrap();
+
+        // Verify contiguity
+        let mut sequences: Vec<u64> = outcome
+            .payloads
+            .iter()
+            .map(|p| {
+                let wire: serde_json::Value = serde_json::from_str(p).unwrap();
+                wire["toSequence"].as_u64().unwrap()
+            })
+            .collect();
+        sequences.sort_unstable();
+
+        for window in sequences.windows(2) {
+            assert_eq!(
+                window[1],
+                window[0] + 1,
+                "sequence gap detected: {} -> {}",
+                window[0],
+                window[1]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 impl Default for ApiKeyOverride {
     fn default() -> Self {
         Self::NotSet
@@ -276,25 +365,18 @@ async fn get_delta_snapshot(headers: HeaderMap, AxumState(state): AxumState<Stat
 
     tracing::debug!(sequence = snapshot.sequence, "serving delta snapshot");
 
-    let snapshot_bytes = match tokio::task::spawn_blocking(move || {
-        let response = DeltaSnapshotResponse {
-            version: 1,
-            boot_id: crate::solvable_orders::boot_id().to_owned(),
-            auction_id: snapshot.auction_id,
-            auction_sequence: snapshot.auction_sequence,
-            sequence: snapshot.sequence,
-            oldest_available: snapshot.oldest_available,
-            auction: dto::auction::from_domain(snapshot.auction),
-        };
-        serde_json::to_vec(&response)
-    })
-    .await
-    {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(err)) => {
-            tracing::error!(?err, "failed to serialize delta snapshot response");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
-        }
+    let response = DeltaSnapshotResponse {
+        version: 1,
+        boot_id: crate::solvable_orders::boot_id().to_owned(),
+        auction_id: snapshot.auction_id,
+        auction_sequence: snapshot.auction_sequence,
+        sequence: snapshot.sequence,
+        oldest_available: snapshot.oldest_available,
+        auction: dto::auction::from_domain(snapshot.auction),
+    };
+
+    let snapshot_bytes = match serialize_snapshot_response(response).await {
+        Ok(bytes) => bytes,
         Err(err) => {
             tracing::error!(?err, "failed to serialize delta snapshot response");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
@@ -467,11 +549,35 @@ async fn stream_delta_events(
         async move {
             match item {
                 Ok(envelope) => {
+                    // Strict: skip anything at or below replay boundary. This
+                    // handles duplicates that may overlap with the drained
+                    // replay.
                     if envelope.to_sequence <= replay_to_sequence {
+                        tracing::trace!(
+                            to_sequence = envelope.to_sequence,
+                            replay_to_sequence,
+                            "live stream: skipping envelope already covered by replay"
+                        );
                         return None;
                     }
-                    match serde_json::to_string(&to_api_envelope(envelope, Some(baseline_sequence)))
-                    {
+
+                    if envelope.from_sequence != replay_to_sequence {
+                        tracing::error!(
+                            from_sequence = envelope.from_sequence,
+                            replay_to_sequence,
+                            "live stream: non-contiguous envelope at replay/live boundary"
+                        );
+                        let payload = serde_json::json!({
+                            "message": "non-contiguous sequence detected at replay/live boundary",
+                            "latestSequence": envelope.to_sequence,
+                        })
+                        .to_string();
+                        return Some(Ok::<sse::Event, Infallible>(
+                            sse::Event::default().event("resync_required").data(payload),
+                        ));
+                    }
+
+                    match serialize_envelope_to_payload(&envelope, Some(baseline_sequence)) {
                         Ok(payload) => Some(Ok::<sse::Event, Infallible>(
                             sse::Event::default().event("delta").data(payload),
                         )),
@@ -548,9 +654,11 @@ async fn stream_delta_events(
                 // Send critical resync event over the unbounded control channel so
                 // it won't be dropped due to the bounded consumer buffer.
                 // control_sender_clone is injected into the spawn closure.
-                let _ = control_sender_clone.send(Ok(sse::Event::default()
+                if let Err(_) = control_sender_clone.send(Ok(sse::Event::default()
                     .event("resync_required")
-                    .data(resync_payload)));
+                    .data(resync_payload))) {
+                    tracing::debug!("resync control event dropped: channel closed");
+                }
 
                 tracing::warn!("delta stream dropped slow consumer");
                 break;
@@ -576,9 +684,12 @@ async fn stream_delta_events(
             "skipped": 0
         })
         .to_string();
-        let _ = control_sender.send(Ok(sse::Event::default()
+        if let Err(_) = control_sender.send(Ok(sse::Event::default()
             .event("resync_required")
-            .data(resync_payload)));
+            .data(resync_payload)))
+        {
+            tracing::debug!("resync control event dropped: channel closed");
+        }
     }
 
     let control_stream = UnboundedReceiverStream::new(control_receiver);
@@ -629,6 +740,46 @@ fn to_api_envelope(
     }
 }
 
+fn serialize_envelope_to_payload(
+    envelope: &crate::solvable_orders::DeltaEnvelope,
+    snapshot_sequence: Option<u64>,
+) -> Result<String, serde_json::Error> {
+    let mut buf = Vec::with_capacity(512 + envelope.events.len() * 256);
+    let api_envelope = to_api_envelope(envelope.clone(), snapshot_sequence);
+    serde_json::to_writer(&mut buf, &api_envelope)?;
+    // SAFETY: serde_json writes valid UTF-8
+    Ok(unsafe { String::from_utf8_unchecked(buf) })
+}
+
+/// Build replay payloads from a slice of envelopes reusing a single buffer.
+fn build_replay_payloads(
+    envelopes: &[crate::solvable_orders::DeltaEnvelope],
+    baseline_sequence: u64,
+) -> Result<Vec<String>, serde_json::Error> {
+    let mut payloads = Vec::with_capacity(envelopes.len());
+    let mut buf = Vec::with_capacity(1024);
+
+    for envelope in envelopes {
+        buf.clear();
+        serde_json::to_writer(
+            &mut buf,
+            &to_api_envelope(envelope.clone(), Some(baseline_sequence)),
+        )?;
+
+        let old = std::mem::replace(&mut buf, Vec::with_capacity(1024));
+        let s = unsafe { String::from_utf8_unchecked(old) };
+        payloads.push(s);
+    }
+
+    Ok(payloads)
+}
+
+async fn serialize_snapshot_response(
+    response: DeltaSnapshotResponse,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&response)
+}
+
 #[derive(Debug)]
 enum DrainError {
     Serialize(serde_json::Error),
@@ -666,11 +817,9 @@ fn drain_live_envelopes(
                 );
                 *highest_sequence_seen = (*highest_sequence_seen).max(envelope.to_sequence);
 
-                let payload = serde_json::to_string(&to_api_envelope(
-                    envelope,
-                    Some(client_baseline_sequence),
-                ))
-                .map_err(DrainError::Serialize)?;
+                let payload =
+                    serialize_envelope_to_payload(&envelope, Some(client_baseline_sequence))
+                        .map_err(DrainError::Serialize)?;
                 payloads.push(payload);
             }
             Err(TryRecvError::Empty) => break,
@@ -717,11 +866,14 @@ async fn subscribe_and_build_replay(
     let mut replay_to_sequence = replay.checkpoint_sequence;
     let mut payloads = Vec::with_capacity(replay.envelopes.len());
 
-    for envelope in replay.envelopes {
+    for envelope in &replay.envelopes {
         replay_to_sequence = replay_to_sequence.max(envelope.to_sequence);
-        let serialised = serde_json::to_string(&to_api_envelope(envelope, Some(baseline_sequence)))
+    }
+
+    if !replay.envelopes.is_empty() {
+        let mut replay_payloads = build_replay_payloads(&replay.envelopes, baseline_sequence)
             .map_err(SubscribeReplayError::Serialize)?;
-        payloads.push(serialised);
+        payloads.append(&mut replay_payloads);
     }
 
     let drain_outcome = drain_live_envelopes(
@@ -786,6 +938,7 @@ fn delta_sync_enabled() -> bool {
         {
             return value;
         }
+        return false;
     }
 
     shared::env::flag_enabled(
@@ -878,7 +1031,7 @@ fn delta_sync_api_key() -> Option<String> {
             .expect("delta sync api key override lock poisoned")
             .clone()
         {
-            ApiKeyOverride::NotSet => {} // fall through to OnceLock below
+            ApiKeyOverride::NotSet => return None,
             ApiKeyOverride::NoKeyRequired => return None,
             ApiKeyOverride::Key(key) => return Some(key),
         }
@@ -1791,6 +1944,48 @@ mod tests {
         let wire: WireEnvelope = serde_json::from_str(&drained.payloads[0]).unwrap();
         assert_eq!(wire.from_sequence, 5);
         assert_eq!(wire.to_sequence, 6);
+    }
+
+    #[tokio::test]
+    async fn drain_filters_pre_checkpoint_with_mixed_sequences() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(16);
+        let checkpoint = 6u64;
+        let mut replay_to = checkpoint;
+
+        for seq in 4u64..=9 {
+            sender
+                .send(crate::solvable_orders::DeltaEnvelope {
+                    auction_id: 0,
+                    auction_sequence: seq,
+                    from_sequence: seq - 1,
+                    to_sequence: seq,
+                    published_at: chrono::Utc::now(),
+                    published_at_instant: Instant::now(),
+                    events: vec![],
+                })
+                .unwrap();
+        }
+
+        let outcome =
+            drain_live_envelopes(&mut receiver, checkpoint, checkpoint, &mut replay_to).unwrap();
+
+        assert_eq!(
+            outcome.payloads.len(),
+            3,
+            "expected 3 post-checkpoint envelopes"
+        );
+
+        let sequences: Vec<u64> = outcome
+            .payloads
+            .iter()
+            .map(|p| {
+                let wire: serde_json::Value = serde_json::from_str(p).unwrap();
+                wire["toSequence"].as_u64().unwrap()
+            })
+            .collect();
+
+        assert_eq!(sequences, vec![7, 8, 9]);
+        assert_eq!(replay_to, 9);
     }
 
     #[tokio::test]

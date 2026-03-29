@@ -170,7 +170,16 @@ impl RunLoop {
                 // case the call mutates `last_block` internally.
                 let prev_block = last_block.clone();
 
-                let new_block = self_arc.update_caches(&mut last_block, false).await;
+                let new_block = match self_arc.update_caches(&mut last_block, false).await {
+                    Ok(b) => b,
+                    Err(err) => {
+                        tracing::warn!(?err, "failed to update caches (follower); backing off");
+                        // Back off briefly to avoid tight retry loops on transient DB
+                        // failures.
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
 
                 let already_seen = prev_block == Some(new_block.hash);
                 // Ensure we record the observed block for future iterations.
@@ -201,7 +210,16 @@ impl RunLoop {
                 continue;
             }
 
-            let start_block = self_arc.update_caches(&mut last_block, true).await;
+            let start_block = match self_arc.update_caches(&mut last_block, true).await {
+                Ok(block) => block,
+                Err(err) => {
+                    tracing::error!(?err, "cache update failed; skipping auction round");
+                    self_arc.solvable_orders_cache.track_auction_update("error");
+                    // Back off before retry to avoid hammering DB
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
             if let Some(auction) = self_arc
                 .next_auction(start_block, &mut last_auction, &mut last_block)
                 .await
@@ -237,7 +255,11 @@ impl RunLoop {
     }
 
     #[instrument(skip_all)]
-    async fn update_caches(&self, prev_block: &mut Option<B256>, is_leader: bool) -> BlockInfo {
+    async fn update_caches(
+        &self,
+        prev_block: &mut Option<B256>,
+        is_leader: bool,
+    ) -> Result<BlockInfo, anyhow::Error> {
         let current_block = *self.eth.current_block().borrow();
         let time_since_last_block = current_block.observed_at.elapsed();
         let auction_block = if time_since_last_block > self.config.max_run_loop_delay {
@@ -260,21 +282,20 @@ impl RunLoop {
                 .await;
         }
 
-        match self
+        if let Err(err) = self
             .solvable_orders_cache
             .update(auction_block.number, is_leader)
             .await
         {
-            Ok(()) => {
-                tracing::trace!("solvable orders cache updated");
-                self.solvable_orders_cache.track_auction_update("success");
-            }
-            Err(err) => {
-                self.solvable_orders_cache.track_auction_update("failure");
-                tracing::warn!(?err, "failed to update auction");
-            }
+            // Propagate the error to the caller so it can decide how to
+            // handle (log/backoff/metrics). Track success only here.
+            return Err(err);
         }
-        auction_block
+
+        tracing::trace!("solvable orders cache updated");
+        self.solvable_orders_cache.track_auction_update("success");
+
+        Ok(auction_block)
     }
 
     /// Sleeps until the next auction is supposed to start, builds it and
