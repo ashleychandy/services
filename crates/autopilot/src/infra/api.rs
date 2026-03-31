@@ -337,6 +337,14 @@ pub(crate) fn build_app(
 fn build_router(state: State) -> Router {
     let mut app = Router::new().route("/native_price/{token}", get(get_native_price));
     if delta_sync_enabled() {
+        // Warn at startup if delta sync is enabled but no API key is configured.
+        // This makes the operator aware that the endpoint is running unauthenticated.
+        if delta_sync_api_key().is_none() {
+            tracing::warn!(
+                "delta sync API is running without authentication; set \
+                 AUTOPILOT_DELTA_SYNC_API_KEY to require a key"
+            );
+        }
         app = app
             .route("/delta/snapshot", get(get_delta_snapshot))
             .route("/delta/stream", get(stream_delta_events))
@@ -747,8 +755,8 @@ fn serialize_envelope_to_payload(
     let mut buf = Vec::with_capacity(512 + envelope.events.len() * 256);
     let api_envelope = to_api_envelope(envelope.clone(), snapshot_sequence);
     serde_json::to_writer(&mut buf, &api_envelope)?;
-    // SAFETY: serde_json writes valid UTF-8
-    Ok(unsafe { String::from_utf8_unchecked(buf) })
+    // serde_json writes valid UTF-8, but convert using checked API for safety
+    Ok(String::from_utf8(buf).expect("serde_json always writes valid UTF-8"))
 }
 
 /// Build replay payloads from a slice of envelopes reusing a single buffer.
@@ -767,7 +775,7 @@ fn build_replay_payloads(
         )?;
 
         let old = std::mem::replace(&mut buf, Vec::with_capacity(1024));
-        let s = unsafe { String::from_utf8_unchecked(old) };
+        let s = String::from_utf8(old).expect("serde_json always writes valid UTF-8");
         payloads.push(s);
     }
 
@@ -1019,7 +1027,8 @@ fn api_key_hash(headers: &HeaderMap) -> Option<String> {
             let mut hasher = Sha256::new();
             hasher.update(value.as_bytes());
             let digest = hasher.finalize();
-            const_hex::encode(&digest[..8])
+            // Expose at least 16 bytes (128 bits) to reduce collision probability
+            const_hex::encode(&digest[..16])
         })
 }
 
@@ -2316,7 +2325,7 @@ mod tests {
         let hash2 = api_key_hash(&headers).unwrap();
 
         assert_eq!(hash1, hash2);
-        assert_eq!(hash1.len(), 16);
+        assert_eq!(hash1.len(), 32);
         assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
