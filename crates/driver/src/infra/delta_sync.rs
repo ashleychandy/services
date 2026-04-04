@@ -183,6 +183,14 @@ pub(crate) async fn set_replica_snapshot_for_tests(snapshot: Snapshot) {
         .expect("failed to apply test snapshot to replica");
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
+pub(crate) async fn set_replica_state_for_tests(state: ReplicaState) {
+    let replica = delta_replica();
+    let mut lock = replica.write().await;
+    *lock = Replica::default();
+    lock.set_state(state);
+}
+
 /// Global test guard to serialize replica usage across tests.
 #[cfg(any(test, feature = "test-helpers"))]
 pub struct DeltaReplicaTestGuard {

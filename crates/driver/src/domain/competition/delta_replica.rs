@@ -549,6 +549,16 @@ mod tests {
         assert_eq!(hash_with_padding, hash_without_padding);
     }
 
+    #[test]
+    fn checksum_prices_returns_err_for_malformed_price() {
+        let token = Address::repeat_byte(0xAA);
+        let mut prices = HashMap::new();
+        prices.insert(token, "not-a-number".to_string());
+
+        let result = Replica::checksum_prices(&prices);
+        assert!(result.is_err());
+    }
+
     fn envelope(from_sequence: u64, to_sequence: u64, events: Vec<Event>) -> Envelope {
         Envelope {
             version: 1,

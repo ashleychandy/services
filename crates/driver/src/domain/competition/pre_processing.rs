@@ -1052,7 +1052,12 @@ mod tests {
         super::*,
         crate::{
             domain::competition::delta_replica::{RawAuctionData, Snapshot},
-            infra::delta_sync::{DeltaReplicaTestGuard, set_replica_snapshot_for_tests},
+            infra::delta_sync::{
+                DeltaReplicaTestGuard,
+                set_driver_delta_sync_autopilot_url_override,
+                set_replica_snapshot_for_tests,
+                set_replica_state_for_tests,
+            },
         },
         axum::http::HeaderValue,
         std::collections::HashMap,
@@ -1246,5 +1251,61 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("auction id mismatch"));
+    }
+
+    #[tokio::test]
+    async fn retry_loop_skips_before_sleep_when_deadline_passed() {
+        let _guard = DeltaReplicaTestGuard::acquire();
+        set_driver_delta_sync_autopilot_url_override(None);
+        set_replica_state_for_tests(ReplicaState::Syncing).await;
+
+        let metadata = SolveRequestMetadata {
+            id: 1,
+            tokens: vec![],
+            deadline: chrono::Utc::now() - chrono::Duration::milliseconds(1),
+            surplus_capturing_jit_order_owners: vec![],
+        };
+
+        let start = Instant::now();
+        let result = ensure_replica_then_build(
+            &metadata,
+            true,
+            "test bootstrap context",
+            "not bootstrapped",
+            "post bootstrap failure",
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn retry_loop_skips_after_sleep_when_deadline_passes_during_backoff() {
+        let _guard = DeltaReplicaTestGuard::acquire();
+        set_driver_delta_sync_autopilot_url_override(None);
+        set_replica_state_for_tests(ReplicaState::Syncing).await;
+
+        let metadata = SolveRequestMetadata {
+            id: 1,
+            tokens: vec![],
+            deadline: chrono::Utc::now() + chrono::Duration::milliseconds(120),
+            surplus_capturing_jit_order_owners: vec![],
+        };
+
+        let start = Instant::now();
+        let result = ensure_replica_then_build(
+            &metadata,
+            true,
+            "test bootstrap context",
+            "not bootstrapped",
+            "post bootstrap failure",
+        )
+        .await;
+
+        assert!(result.is_err());
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(400));
+        assert!(elapsed < Duration::from_secs(2));
     }
 }

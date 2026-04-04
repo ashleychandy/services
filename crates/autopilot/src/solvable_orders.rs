@@ -880,10 +880,11 @@ impl SolvableOrdersCache {
         if projection_mismatch {
             events = compute_delta_events(previous_auction.as_ref(), &auction_for_cache);
 
-            // Record the mismatch and attempt to verify the fallback path.
             Metrics::get()
                 .delta_incremental_projection_mismatch_total
                 .inc();
+
+            // Attempt to verify the fallback path.
             tracing::warn!("incremental projection mismatch detected, using canonical fallback");
 
             if let Some(prev) = previous_auction.clone() {
@@ -2017,8 +2018,6 @@ fn apply_auction_id_change(inner: &mut Inner, auction_id: u64) -> Option<DeltaEn
         return None;
     }
 
-    inner.auction_id = auction_id;
-    inner.auction_sequence = 0;
     // Keep delta_sequence monotonic across auctions for replay continuity.
     if inner.delta_sequence == u64::MAX {
         Metrics::get().delta_incremental_failure_total.inc();
@@ -2028,6 +2027,9 @@ fn apply_auction_id_change(inner: &mut Inner, auction_id: u64) -> Option<DeltaEn
         );
         return None;
     }
+
+    inner.auction_id = auction_id;
+    inner.auction_sequence = 0;
     let next_sequence = inner.delta_sequence + 1;
     let envelope = DeltaEnvelope {
         auction_id,
@@ -2875,7 +2877,7 @@ mod tests {
         // disable_order_balance_filter=true: StubBalanceFetcher returns U256::ZERO
         // for every query, so balance filtering must be disabled or the inserted
         // order would be filtered out before reaching the delta machinery.
-        let cache = SolvableOrdersCache::new(
+        let mut cache = SolvableOrdersCache::new(
             Duration::from_secs(0),
             persistence,
             order_validation::banned::Users::none(),
@@ -2889,6 +2891,9 @@ mod tests {
             Address::repeat_byte(0xFF),
             true,
         );
+        Arc::get_mut(&mut cache)
+            .expect("cache arc should be uniquely owned in test")
+            .incremental_primary = true;
 
         // Insert a real order so the production pipeline exercises price
         // estimation, filtering, and diff logic.  Use ByteArray constructors
@@ -3016,6 +3021,188 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore]
+    async fn integration_projection_mismatch_metric_not_incremented_in_happy_path() {
+        let postgres = Arc::new(
+            Postgres::with_defaults()
+                .await
+                .expect("postgres must be running at postgresql://"),
+        );
+
+        let mut tx = postgres.pool.begin().await.expect("begin tx");
+        database::clear_DANGER_(&mut tx)
+            .await
+            .expect("failed to clear database");
+        tx.commit().await.expect("commit tx");
+
+        let persistence = Persistence::new(None, Arc::clone(&postgres)).await;
+
+        let balance_fetcher = Arc::new(StubBalanceFetcher::default());
+        let deny_listed_tokens = DenyListedTokens::default();
+
+        let native_price_estimator = StubNativePriceEstimator::default();
+        let cache_store = Cache::new(Duration::from_secs(10), Default::default());
+        let caching_estimator = CachingNativePriceEstimator::new(
+            Box::new(native_price_estimator),
+            cache_store,
+            1,
+            Default::default(),
+            HEALTHY_PRICE_ESTIMATION_TIME,
+        );
+        let native_price_updater =
+            NativePriceUpdater::new(caching_estimator, Duration::MAX, Default::default());
+
+        let (provider, _wallet) = unbuffered_provider("http://localhost:0", None);
+        let block_stream = mock_single_block(BlockInfo::default());
+        let block_retriever = Arc::new(BlockRetriever {
+            provider,
+            block_stream,
+        });
+        let cow_amm_registry = cow_amm::Registry::new(block_retriever);
+
+        let protocol_fees = domain::ProtocolFees::new(
+            &configs::autopilot::fee_policy::FeePoliciesConfig::default(),
+            Vec::new(),
+            false,
+        );
+
+        let cache = SolvableOrdersCache::new(
+            Duration::from_secs(0),
+            persistence,
+            order_validation::banned::Users::none(),
+            balance_fetcher,
+            deny_listed_tokens,
+            native_price_updater,
+            Address::repeat_byte(0xEE),
+            protocol_fees,
+            cow_amm_registry,
+            Duration::from_secs(1),
+            Address::repeat_byte(0xFF),
+            true,
+        );
+
+        // Seed a consistent previous cache state and keep DB empty, so update
+        // follows the happy path without projection mismatches.
+        let seeded_auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(seeded_auction, 1, 1, 1, VecDeque::new())
+            .await;
+
+        let initial = Metrics::get()
+            .delta_incremental_projection_mismatch_total
+            .get();
+
+        cache.update(2, false).await.expect("update should succeed");
+
+        let now = Metrics::get()
+            .delta_incremental_projection_mismatch_total
+            .get();
+        assert_eq!(now, initial);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_projection_mismatch_metric_increments_exactly_once_via_update() {
+        let postgres = Arc::new(
+            Postgres::with_defaults()
+                .await
+                .expect("postgres must be running at postgresql://"),
+        );
+
+        let mut tx = postgres.pool.begin().await.expect("begin tx");
+        database::clear_DANGER_(&mut tx)
+            .await
+            .expect("failed to clear database");
+        tx.commit().await.expect("commit tx");
+
+        let persistence = Persistence::new(None, Arc::clone(&postgres)).await;
+
+        let balance_fetcher = Arc::new(StubBalanceFetcher::default());
+        let deny_listed_tokens = DenyListedTokens::default();
+
+        let native_price_estimator = StubNativePriceEstimator::default();
+        let cache_store = Cache::new(Duration::from_secs(10), Default::default());
+        let caching_estimator = CachingNativePriceEstimator::new(
+            Box::new(native_price_estimator),
+            cache_store,
+            1,
+            Default::default(),
+            HEALTHY_PRICE_ESTIMATION_TIME,
+        );
+        let native_price_updater =
+            NativePriceUpdater::new(caching_estimator, Duration::MAX, Default::default());
+
+        let (provider, _wallet) = unbuffered_provider("http://localhost:0", None);
+        let block_stream = mock_single_block(BlockInfo::default());
+        let block_retriever = Arc::new(BlockRetriever {
+            provider,
+            block_stream,
+        });
+        let cow_amm_registry = cow_amm::Registry::new(block_retriever);
+
+        let protocol_fees = domain::ProtocolFees::new(
+            &configs::autopilot::fee_policy::FeePoliciesConfig::default(),
+            Vec::new(),
+            false,
+        );
+
+        let mut cache = SolvableOrdersCache::new(
+            Duration::from_secs(0),
+            persistence,
+            order_validation::banned::Users::none(),
+            balance_fetcher,
+            deny_listed_tokens,
+            native_price_updater,
+            Address::repeat_byte(0xEE),
+            protocol_fees,
+            cow_amm_registry,
+            Duration::from_secs(1),
+            Address::repeat_byte(0xFF),
+            true,
+        );
+
+        Arc::get_mut(&mut cache)
+            .expect("cache arc should be uniquely owned in test")
+            .incremental_primary = true;
+
+        // Seed previous auction with one order but reset incremental indexed
+        // state to empty. Incremental event staging then misses the removal and
+        // forces projection mismatch in update().
+        let seeded_auction = domain::RawAuctionData {
+            block: 1,
+            orders: vec![test_order(1, 10)],
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        cache
+            .set_state_for_tests(seeded_auction, 1, 1, 1, VecDeque::new())
+            .await;
+
+        {
+            let mut lock = cache.cache.lock().await;
+            if let Some(inner) = lock.as_mut() {
+                inner.indexed_state = Arc::new(IndexedAuctionState::default());
+            }
+        }
+
+        let initial = Metrics::get()
+            .delta_incremental_projection_mismatch_total
+            .get();
+
+        cache.update(2, false).await.expect("update should succeed");
+
+        let now = Metrics::get()
+            .delta_incremental_projection_mismatch_total
+            .get();
+        assert_eq!(now, initial + 1);
+    }
+
     #[cfg(test)]
     struct DeltaHistoryMinRetainedGuard {
         previous: Option<usize>,
@@ -3041,6 +3228,10 @@ mod tests {
                 .expect("delta history min retained override lock poisoned") = self.previous;
         }
     }
+
+    #[cfg(test)]
+    static DELTA_HISTORY_MAX_AGE_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[tokio::test]
     async fn get_orders_with_native_prices_with_timeout() {
@@ -4246,6 +4437,36 @@ mod tests {
         assert_eq!(events, canonical);
     }
 
+    #[tokio::test]
+    async fn projection_mismatch_metric_not_incremented_by_apply_incremental_changes() {
+        let cache = test_cache().await;
+        let initial = Metrics::get()
+            .delta_incremental_projection_mismatch_total
+            .get();
+
+        let previous = normalize(domain::RawAuctionData {
+            block: 1,
+            orders: vec![test_order(1, 10)],
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        });
+        let current = normalize(domain::RawAuctionData {
+            block: 2,
+            orders: vec![test_order(2, 20)],
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        });
+
+        let (_auction_for_cache, projection_mismatch) =
+            cache.apply_incremental_changes(Some(&previous), current, &[]);
+        assert!(projection_mismatch);
+
+        let now = Metrics::get()
+            .delta_incremental_projection_mismatch_total
+            .get();
+        assert_eq!(now, initial);
+    }
+
     #[test]
     fn compute_delta_events_from_inputs_dedups_candidates_and_skips_unchanged_price_tokens() {
         let previous = normalize(domain::RawAuctionData {
@@ -4439,6 +4660,33 @@ mod tests {
         assert!(apply_auction_id_change(&mut inner, 5).is_none());
         assert_eq!(inner.delta_sequence, previous_sequence);
         assert!(inner.delta_history.is_empty());
+    }
+
+    #[test]
+    fn apply_auction_id_change_returns_none_on_sequence_overflow() {
+        let mut inner = Inner {
+            auction: domain::RawAuctionData {
+                block: 1,
+                orders: Vec::new(),
+                prices: HashMap::new(),
+                surplus_capturing_jit_order_owners: Vec::new(),
+            },
+            solvable_orders: boundary::SolvableOrders {
+                orders: HashMap::new(),
+                quotes: HashMap::new(),
+                latest_settlement_block: 0,
+                fetched_from_db: chrono::Utc::now(),
+            },
+            auction_id: 1,
+            auction_sequence: 0,
+            delta_sequence: u64::MAX,
+            delta_history: VecDeque::new(),
+            indexed_state: Arc::new(IndexedAuctionState::default()),
+        };
+
+        assert!(apply_auction_id_change(&mut inner, 2).is_none());
+        assert_eq!(inner.delta_sequence, u64::MAX);
+        assert_eq!(inner.auction_id, 1);
     }
 
     #[cfg(debug_assertions)]
@@ -4740,6 +4988,30 @@ mod tests {
         assert!(checksum.price_hash.starts_with("0x"));
     }
 
+    #[tokio::test]
+    #[ignore]
+    async fn update_returns_error_on_sequence_overflow() {
+        let cache = test_cache().await;
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        cache
+            .set_state_for_tests(auction, 1, 1, u64::MAX, VecDeque::new())
+            .await;
+
+        let result = cache.update(2, false).await;
+        let err = result.expect_err("update should fail on sequence overflow");
+        assert!(
+            err.to_string().contains("delta sequence overflow"),
+            "expected overflow error, got: {err:?}"
+        );
+        assert_eq!(cache.delta_sequence().await, Some(u64::MAX));
+    }
+
     #[test]
     fn checksum_order_uids_is_order_independent() {
         let orders1 = vec![test_order(1, 10), test_order(2, 20), test_order(3, 30)];
@@ -4952,6 +5224,137 @@ mod tests {
         let _guard = DeltaHistoryMinRetainedGuard::set(42);
         let value = delta_history_min_retained();
         assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn delta_history_max_age_returns_stable_value_across_calls() {
+        let _env_guard = DELTA_HISTORY_MAX_AGE_ENV_LOCK
+            .lock()
+            .expect("delta history max age env lock poisoned");
+
+        let key = "AUTOPILOT_DELTA_SYNC_HISTORY_MAX_AGE_SECS";
+        let original = std::env::var(key).ok();
+
+        let age1 = delta_history_max_age();
+        // The OnceLock should ignore env changes after the first read.
+        unsafe { std::env::set_var(key, "1") };
+        let age2 = delta_history_max_age();
+
+        match original {
+            Some(value) => {
+                unsafe { std::env::set_var(key, value) };
+            }
+            None => {
+                unsafe { std::env::remove_var(key) };
+            }
+        }
+
+        assert_eq!(age1, age2);
+    }
+
+    #[test]
+    fn alive_uids_filter_excludes_already_processed_orders() {
+        let mut alive_uids = HashSet::new();
+        alive_uids.insert(domain::OrderUid([1; 56]));
+        alive_uids.insert(domain::OrderUid([2; 56]));
+
+        let all_visible = [
+            domain::OrderUid([1; 56]),
+            domain::OrderUid([2; 56]),
+            domain::OrderUid([3; 56]),
+        ];
+
+        let to_reprocess = all_visible
+            .iter()
+            .filter(|uid| !alive_uids.contains(uid))
+            .copied()
+            .collect::<Vec<_>>();
+
+        assert_eq!(to_reprocess, vec![domain::OrderUid([3; 56])]);
+    }
+
+    #[tokio::test]
+    async fn jit_owner_change_reapplies_fees_only_to_non_alive_orders() {
+        let mut cache = test_cache().await;
+        Arc::get_mut(&mut cache)
+            .expect("cache arc should be uniquely owned in test")
+            .disable_order_balance_filter = true;
+
+        let uid1 = domain::OrderUid([1; 56]);
+        let uid2 = domain::OrderUid([2; 56]);
+
+        let owner1 = Address::repeat_byte(0x11);
+        let owner2 = Address::repeat_byte(0x22);
+        let token_sell = Address::repeat_byte(0xA1);
+        let token_buy = Address::repeat_byte(0xB1);
+
+        let mut boundary_order1 = model::order::Order::default();
+        boundary_order1.metadata.uid = model::order::OrderUid(uid1.0);
+        boundary_order1.metadata.owner = owner1;
+        boundary_order1.data.sell_token = token_sell;
+        boundary_order1.data.buy_token = token_buy;
+        boundary_order1.data.sell_amount = U256::from(10);
+        boundary_order1.data.buy_amount = U256::from(10);
+
+        let mut boundary_order2 = model::order::Order::default();
+        boundary_order2.metadata.uid = model::order::OrderUid(uid2.0);
+        boundary_order2.metadata.owner = owner2;
+        boundary_order2.data.sell_token = token_sell;
+        boundary_order2.data.buy_token = token_buy;
+        boundary_order2.data.sell_amount = U256::from(20);
+        boundary_order2.data.buy_amount = U256::from(20);
+
+        let db_solvable_orders = boundary::SolvableOrders {
+            orders: HashMap::from([
+                (uid1, Arc::new(boundary_order1.clone())),
+                (uid2, Arc::new(boundary_order2.clone())),
+            ]),
+            quotes: HashMap::new(),
+            latest_settlement_block: 0,
+            fetched_from_db: chrono::Utc::now(),
+        };
+
+        let mut previous_indexed_state = IndexedAuctionState::default();
+        previous_indexed_state
+            .current_orders_by_uid
+            .insert(uid1, test_order(1, 10));
+        previous_indexed_state
+            .current_orders_by_uid
+            .insert(uid2, test_order(2, 99));
+        previous_indexed_state.surplus_capturing_jit_order_owners =
+            vec![Address::repeat_byte(0xFF)];
+
+        let mut change_bundle = ChangeBundle {
+            order_updated_candidates: vec![uid1],
+            ..Default::default()
+        };
+
+        let inputs = cache
+            .collect_inputs_incremental(
+                &previous_indexed_state,
+                db_solvable_orders,
+                &mut change_bundle,
+                1,
+                false,
+            )
+            .await
+            .expect("incremental collection should succeed");
+
+        let indexed = inputs
+            .indexed_state
+            .expect("incremental path should return indexed state");
+
+        // uid1 is alive and processed in the alive loop.
+        assert!(change_bundle.order_updated_candidates.contains(&uid1));
+
+        // uid2 is non-alive; it should still be recomputed because JIT owners changed.
+        let expected_uid2 = cache.protocol_fees.apply(&boundary_order2, None, &[]);
+        let actual_uid2 = indexed
+            .current_orders_by_uid
+            .get(&uid2)
+            .expect("uid2 should remain solver-visible");
+        assert_eq!(actual_uid2, &expected_uid2);
+        assert_ne!(actual_uid2, &test_order(2, 99));
     }
 
     // ========================================================================

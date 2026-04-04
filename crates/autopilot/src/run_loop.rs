@@ -218,7 +218,9 @@ impl RunLoop {
                 continue;
             }
 
-            let start_block = match self_arc.update_caches(&mut last_block, true).await {
+            let update_result = self_arc.update_caches(&mut last_block, true).await;
+            Self::maybe_mark_startup_probe_ready(&self_arc.probes, &update_result);
+            let start_block = match update_result {
                 Ok(block) => block,
                 Err(err) => {
                     tracing::error!(?err, "cache update failed; skipping auction round");
@@ -228,12 +230,6 @@ impl RunLoop {
                     continue;
                 }
             };
-
-            // Mark startup probe as ready only after the first successful
-            // cache refresh.
-            if let Some(startup) = &*self_arc.probes.startup {
-                startup.store(true, Ordering::Release);
-            }
 
             if let Some(auction) = self_arc
                 .next_auction(start_block, &mut last_auction, &mut last_block)
@@ -263,6 +259,18 @@ impl RunLoop {
                 notify.notify_one();
             }
         });
+    }
+
+    fn mark_startup_probe_ready(probes: &Probes) {
+        if let Some(startup) = &*probes.startup {
+            startup.store(true, Ordering::Release);
+        }
+    }
+
+    fn maybe_mark_startup_probe_ready<T, E>(probes: &Probes, update_result: &Result<T, E>) {
+        if update_result.is_ok() {
+            Self::mark_startup_probe_ready(probes);
+        }
     }
 
     #[instrument(skip_all)]
@@ -1262,6 +1270,48 @@ mod tests {
         eth_domain_types as eth,
         std::collections::{HashMap, HashSet},
     };
+
+    #[test]
+    fn mark_startup_probe_ready_sets_probe() {
+        let startup = AtomicBool::new(false);
+        let probes = Probes {
+            liveness: Arc::new(Liveness::new(Duration::from_secs(1))),
+            startup: Arc::new(Some(startup)),
+        };
+
+        let probe = probes
+            .startup
+            .as_ref()
+            .as_ref()
+            .expect("startup probe should exist");
+        assert!(!probe.load(Ordering::Acquire));
+
+        RunLoop::mark_startup_probe_ready(&probes);
+        assert!(probe.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn startup_probe_only_set_after_successful_cache_update() {
+        let startup = AtomicBool::new(false);
+        let probes = Probes {
+            liveness: Arc::new(Liveness::new(Duration::from_secs(1))),
+            startup: Arc::new(Some(startup)),
+        };
+
+        let probe = probes
+            .startup
+            .as_ref()
+            .as_ref()
+            .expect("startup probe should exist");
+
+        let failed: Result<(), anyhow::Error> = Err(anyhow::anyhow!("cache update failed"));
+        RunLoop::maybe_mark_startup_probe_ready(&probes, &failed);
+        assert!(!probe.load(Ordering::Acquire));
+
+        let success: Result<(), anyhow::Error> = Ok(());
+        RunLoop::maybe_mark_startup_probe_ready(&probes, &success);
+        assert!(probe.load(Ordering::Acquire));
+    }
 
     fn test_auction() -> domain::auction::Auction {
         let token = Address::repeat_byte(0x11);
