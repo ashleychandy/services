@@ -24,7 +24,11 @@ use {
         convert::Infallible,
         net::SocketAddr,
         ops::RangeInclusive,
-        sync::{Arc, OnceLock},
+        sync::{
+            Arc,
+            OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
         time::{Duration, Instant},
     },
     subtle::ConstantTimeEq,
@@ -545,6 +549,8 @@ async fn stream_delta_events(
 
     // Build SSE streams (unchanged from original)
     let replay_to_sequence = result.replay_to_sequence;
+    // Tracks the latest contiguous sequence emitted to the client.
+    let last_sequence = Arc::new(AtomicU64::new(replay_to_sequence));
     let replay_stream = tokio_stream::iter(result.payloads.into_iter().map(|payload| {
         Ok::<sse::Event, Infallible>(sse::Event::default().event("delta").data(payload))
     }));
@@ -554,6 +560,7 @@ async fn stream_delta_events(
     let cache = Arc::clone(&state.solvable_orders_cache);
     let live_stream = BroadcastStream::new(receiver).filter_map(move |item| {
         let cache = Arc::clone(&cache);
+        let last_sequence = Arc::clone(&last_sequence);
         async move {
             match item {
                 Ok(envelope) => {
@@ -569,14 +576,15 @@ async fn stream_delta_events(
                         return None;
                     }
 
-                    if envelope.from_sequence != replay_to_sequence {
+                    let expected = last_sequence.load(Ordering::SeqCst);
+                    if envelope.from_sequence != expected {
                         tracing::error!(
                             from_sequence = envelope.from_sequence,
-                            replay_to_sequence,
-                            "live stream: non-contiguous envelope at replay/live boundary"
+                            expected,
+                            "live stream: non-contiguous envelope"
                         );
                         let payload = serde_json::json!({
-                            "message": "non-contiguous sequence detected at replay/live boundary",
+                            "message": "non-contiguous sequence detected",
                             "latestSequence": envelope.to_sequence,
                         })
                         .to_string();
@@ -584,6 +592,8 @@ async fn stream_delta_events(
                             sse::Event::default().event("resync_required").data(payload),
                         ));
                     }
+
+                    last_sequence.store(envelope.to_sequence, Ordering::SeqCst);
 
                     match serialize_envelope_to_payload(&envelope, Some(baseline_sequence)) {
                         Ok(payload) => Some(Ok::<sse::Event, Infallible>(

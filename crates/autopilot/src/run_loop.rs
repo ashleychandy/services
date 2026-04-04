@@ -45,7 +45,10 @@ use {
     std::{
         collections::{HashMap, HashSet},
         num::NonZeroUsize,
-        sync::{Arc, atomic::AtomicBool},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         time::{Duration, Instant},
     },
     tracing::{Instrument, instrument},
@@ -174,6 +177,11 @@ impl RunLoop {
                     Ok(b) => b,
                     Err(err) => {
                         tracing::warn!(?err, "failed to update caches (follower); backing off");
+                        // Track failure so metrics show follower-side cache update
+                        // issues (keeps parity with leader error tracking).
+                        self_arc
+                            .solvable_orders_cache
+                            .track_auction_update("failure");
                         // Back off briefly to avoid tight retry loops on transient DB
                         // failures.
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -220,16 +228,19 @@ impl RunLoop {
                     continue;
                 }
             };
+
+            // Mark startup probe as ready only after the first successful
+            // cache refresh.
+            if let Some(startup) = &*self_arc.probes.startup {
+                startup.store(true, Ordering::Release);
+            }
+
             if let Some(auction) = self_arc
                 .next_auction(start_block, &mut last_auction, &mut last_block)
                 .await
             {
                 let auction_id = auction.id;
 
-                self_arc
-                    .solvable_orders_cache
-                    .set_auction_id(auction_id.try_into().unwrap())
-                    .await;
                 self_arc
                     .single_run(auction)
                     .instrument(tracing::info_span!("auction", auction_id))

@@ -269,7 +269,7 @@ pub async fn replica_health() -> Option<ReplicaHealth> {
         .map(|timestamp| now.signed_duration_since(timestamp).num_seconds())
         .and_then(|seconds| u64::try_from(seconds).ok());
 
-    let local_checksum = base_url.as_ref().map(|_| replica.checksum());
+    let local_checksum = base_url.as_ref().and_then(|_| replica.checksum());
 
     if let Some(age) = last_update_age_seconds {
         metrics::get()

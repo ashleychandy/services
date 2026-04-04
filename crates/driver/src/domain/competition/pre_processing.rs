@@ -891,8 +891,20 @@ async fn ensure_replica_then_build(
     {
         let attempts = delta_sync_resync_retry_attempts();
         let delay = delta_sync_resync_retry_delay();
+        let deadline = metadata
+            .deadline
+            .checked_sub_signed(chrono::Duration::milliseconds(50))
+            .unwrap_or(metadata.deadline);
         for _ in 0..attempts {
+            if chrono::Utc::now() >= deadline {
+                tracing::warn!("skipping retry: solve deadline imminent");
+                break;
+            }
             tokio::time::sleep(delay).await;
+            if chrono::Utc::now() >= deadline {
+                tracing::warn!("skipping retry after backoff: solve deadline imminent");
+                break;
+            }
             match build_solve_request_from_replica(metadata).await {
                 Ok(Some(request)) => return Ok(request),
                 Ok(None) => continue,

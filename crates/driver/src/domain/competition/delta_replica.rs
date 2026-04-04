@@ -167,14 +167,14 @@ impl Replica {
         self.last_update
     }
 
-    pub fn checksum(&self) -> ReplicaChecksum {
+    pub fn checksum(&self) -> Option<ReplicaChecksum> {
         let order_uid_hash = Self::checksum_order_uids(&self.orders);
-        let price_hash = Self::checksum_prices(&self.prices);
-        ReplicaChecksum {
+        let price_hash = Self::checksum_prices(&self.prices).ok()?;
+        Some(ReplicaChecksum {
             sequence: self.sequence,
             order_uid_hash,
             price_hash,
-        }
+        })
     }
 
     pub fn set_state(&mut self, state: ReplicaState) {
@@ -360,22 +360,28 @@ impl Replica {
         format!("0x{}", const_hex::encode(hasher.finalize()))
     }
 
-    fn checksum_prices(prices: &HashMap<Address, String>) -> String {
+    fn checksum_prices(prices: &HashMap<Address, String>) -> Result<String, String> {
         let mut entries = prices.iter().collect::<Vec<_>>();
         entries.sort_by(|(lhs, _), (rhs, _)| lhs.as_slice().cmp(rhs.as_slice()));
 
         let mut hasher = Sha256::new();
         for (token, price) in entries {
             hasher.update(token.as_slice());
+            // Parse and canonicalize price string. Avoid panicking in production
+            // if the stored price is malformed — emit a metric and return an
+            // error marker instead so health-check code can continue running.
             let canonical = eth::U256::from_str(price)
                 .map(|value| value.to_string())
-                .expect(&format!(
-                    "checksum invariant violated: price string for token {token:?} was not a \
-                     canonical decimal"
-                ));
+                .map_err(|err| {
+                    metrics::get()
+                        .delta_replica_checksum_decode_errors_total
+                        .inc();
+                    tracing::warn!(%price, ?token, ?err, "checksum: invalid price string");
+                    format!("invalid price for token {token:?}")
+                })?;
             hasher.update(canonical.as_bytes());
         }
-        format!("0x{}", const_hex::encode(hasher.finalize()))
+        Ok(format!("0x{}", const_hex::encode(hasher.finalize())))
     }
 
     fn parse_order(order: &Value) -> Result<ReplicaOrder, Error> {
@@ -536,9 +542,9 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert(token, "0010".to_string());
 
-        let hash_with_padding = Replica::checksum_prices(&prices);
+        let hash_with_padding = Replica::checksum_prices(&prices).unwrap();
         prices.insert(token, "10".to_string());
-        let hash_without_padding = Replica::checksum_prices(&prices);
+        let hash_without_padding = Replica::checksum_prices(&prices).unwrap();
 
         assert_eq!(hash_with_padding, hash_without_padding);
     }

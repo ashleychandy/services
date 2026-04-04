@@ -50,6 +50,7 @@ use {
 static BOOT_ID: OnceLock<String> = OnceLock::new();
 
 static DELTA_HISTORY_MIN_RETAINED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static DELTA_HISTORY_MAX_AGE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
 macro_rules! send_or_warn {
     ($sender:expr, $value:expr, $context:literal) => {
@@ -286,6 +287,17 @@ pub struct DeltaReplay {
     pub envelopes: Vec<DeltaEnvelope>,
 }
 
+/// Cached in-memory state for the solvable orders delta stream.
+///
+/// Semantics:
+/// - `auction_sequence`: per-auction sequence counter. Resets to `0` (sentinel)
+///   when an `AuctionChanged` transition is emitted (see
+///   `apply_auction_id_change`). The first `update()` after a transition will
+///   emit `auction_sequence = 1`. Do NOT use `auction_sequence` for global
+///   ordering across auction transitions — it only orders events inside a
+///   single auction.
+/// - `delta_sequence`: global, monotonic sequence counter. Never resets and is
+///   the authoritative ordering counter used for replay and gap detection.
 struct Inner {
     auction: domain::RawAuctionData,
     solvable_orders: boundary::SolvableOrders,
@@ -304,6 +316,7 @@ struct IndexedAuctionState {
     filtered_in_flight: HashSet<OrderUid>,
     filtered_no_balance: HashSet<OrderUid>,
     filtered_no_price: HashSet<OrderUid>,
+    surplus_capturing_jit_order_owners: Vec<Address>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -821,17 +834,25 @@ impl SolvableOrdersCache {
 
         let next_sequence = previous_delta_sequence
             .map(|value| {
-                value.checked_add(1).unwrap_or_else(|| {
+                if value == u64::MAX {
                     Metrics::get().delta_incremental_failure_total.inc();
                     tracing::error!(
                         previous_delta_sequence = value,
-                        "delta sequence overflow, saturating to u64::MAX"
+                        "delta sequence overflow; sequence cannot advance"
                     );
-                    u64::MAX
-                })
+                    Err(anyhow::anyhow!("delta sequence overflow"))
+                } else {
+                    Ok(value + 1)
+                }
             })
+            .transpose()?
             .unwrap_or(1);
         let current_auction_id = previous_auction_id.unwrap_or_default();
+        // `auction_sequence` is a per-auction counter and restarts at `1`
+        // after an `AuctionChanged` transition (which sets the internal
+        // `auction_sequence` to `0` as a sentinel). `delta_sequence` is the
+        // global monotonic counter and must be used for ordering across
+        // auction boundaries.
         let next_auction_sequence = previous_auction_sequence
             .map(|value| value + 1)
             .unwrap_or(1);
@@ -1416,8 +1437,20 @@ impl SolvableOrdersCache {
             .map(|cow_amm| *cow_amm.address())
             .collect();
 
+        let jit_owners_changed = {
+            let mut prev = previous_indexed_state
+                .surplus_capturing_jit_order_owners
+                .clone();
+            let mut curr = surplus_capturing_jit_order_owners.clone();
+            prev.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+            curr.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+            prev != curr
+        };
+
+        let mut alive_uids = HashSet::new();
         for order in alive_orders {
             let uid = domain::OrderUid(order.metadata.uid.0);
+            alive_uids.insert(uid);
             let quote = db_solvable_orders
                 .quotes
                 .get(&uid)
@@ -1440,6 +1473,34 @@ impl SolvableOrdersCache {
                 false,
             );
         }
+
+        if jit_owners_changed {
+            let visible_uids = indexed_state
+                .current_orders_by_uid
+                .keys()
+                .filter(|uid| !alive_uids.contains(uid))
+                .copied()
+                .collect::<Vec<_>>();
+            for uid in visible_uids {
+                if let Some(order) = db_solvable_orders.orders.get(&uid) {
+                    let quote = db_solvable_orders
+                        .quotes
+                        .get(&uid)
+                        .map(|quote| quote.as_ref().clone());
+                    let domain_order = self.protocol_fees.apply(
+                        order.as_ref(),
+                        quote,
+                        &surplus_capturing_jit_order_owners,
+                    );
+                    indexed_state
+                        .current_orders_by_uid
+                        .insert(uid, domain_order);
+                }
+            }
+        }
+
+        indexed_state.surplus_capturing_jit_order_owners =
+            surplus_capturing_jit_order_owners.clone();
 
         invalid_order_uids.extend(invalid_for_impacted);
         if store_events {
@@ -1581,10 +1642,6 @@ impl SolvableOrdersCache {
         if reconstructed_surface == auction_surface {
             return (with_non_delta_fields(reconstructed, &auction), false);
         }
-
-        Metrics::get()
-            .delta_incremental_projection_mismatch_total
-            .inc();
 
         tracing::warn!(
             "incremental projection mismatch detected; storing canonical auction and recomputing \
@@ -1946,6 +2003,15 @@ fn prune_delta_history(delta_history: &mut VecDeque<DeltaEnvelope>, max_age: chr
     }
 }
 
+/// Update the cached `auction_id` and emit an `AuctionChanged` delta envelope
+/// when the auction changes.
+///
+/// The function uses `auction_sequence = 0` as a sentinel value to mark the
+/// auction boundary. Consumers should treat the envelope with
+/// `auction_sequence == 0` as an advisory transition marker. The first real
+/// per-auction update after this transition will emit `auction_sequence = 1`.
+/// `delta_sequence` remains monotonic across auction transitions and is the
+/// authoritative counter for replay/gap detection.
 fn apply_auction_id_change(inner: &mut Inner, auction_id: u64) -> Option<DeltaEnvelope> {
     if inner.auction_id == auction_id {
         return None;
@@ -1954,7 +2020,15 @@ fn apply_auction_id_change(inner: &mut Inner, auction_id: u64) -> Option<DeltaEn
     inner.auction_id = auction_id;
     inner.auction_sequence = 0;
     // Keep delta_sequence monotonic across auctions for replay continuity.
-    let next_sequence = inner.delta_sequence.saturating_add(1);
+    if inner.delta_sequence == u64::MAX {
+        Metrics::get().delta_incremental_failure_total.inc();
+        tracing::error!(
+            "delta sequence overflow during auction transition; auction changed envelope not \
+             emitted"
+        );
+        return None;
+    }
+    let next_sequence = inner.delta_sequence + 1;
     let envelope = DeltaEnvelope {
         auction_id,
         auction_sequence: 0,
@@ -1995,12 +2069,14 @@ fn delta_history_min_retained() -> usize {
 }
 
 fn delta_history_max_age() -> Duration {
-    std::env::var("AUTOPILOT_DELTA_SYNC_HISTORY_MAX_AGE_SECS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value: &u64| *value > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_DELTA_HISTORY_MAX_AGE)
+    *DELTA_HISTORY_MAX_AGE.get_or_init(|| {
+        std::env::var("AUTOPILOT_DELTA_SYNC_HISTORY_MAX_AGE_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value: &u64| *value > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_DELTA_HISTORY_MAX_AGE)
+    })
 }
 
 fn delta_events_equivalent(canonical: &[DeltaEvent], staged: &[DeltaEvent]) -> bool {
@@ -2364,6 +2440,7 @@ fn build_indexed_state(
             .iter()
             .map(|(token, price)| (Address::from(*token), *price))
             .collect(),
+        surplus_capturing_jit_order_owners: auction.surplus_capturing_jit_order_owners.clone(),
         ..Default::default()
     };
 
