@@ -70,6 +70,37 @@ enum SolveRequestBodyMode {
     Thin,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplicaRetryBackoffTier {
+    None,
+    Short,
+    Full,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ReplicaBuildError {
+    #[error("solve request auction id is negative")]
+    InvalidRequestAuctionId,
+    #[error("delta replica auction id mismatch: replica={replica}, request={request}")]
+    AuctionIdMismatch { replica: u64, request: u64 },
+    #[error("could not parse replicated token price")]
+    InvalidReplicatedTokenPrice,
+}
+
+impl ReplicaBuildError {
+    fn retry_tier(&self) -> ReplicaRetryBackoffTier {
+        match self {
+            // Snapshot not matching request id is often transitional while the
+            // replica catches up; allow a shorter bounded retry.
+            Self::AuctionIdMismatch { .. } => ReplicaRetryBackoffTier::Short,
+            // These are deterministic input/data issues for this request.
+            Self::InvalidRequestAuctionId | Self::InvalidReplicatedTokenPrice => {
+                ReplicaRetryBackoffTier::None
+            }
+        }
+    }
+}
+
 /// Tasks for fetching data needed to properly process auctions.
 /// These are shared by all connected solvers.
 /// The reason why we have 1 task per piece of data instead of 1 task
@@ -328,7 +359,10 @@ impl Utilities {
                                 .await
                             {
                                 Ok(Some(from_replica)) => from_replica,
-                                Ok(None) => from_body,
+                                Ok(None) => {
+                                    metrics::get().thin_solve_replica_fallbacks.inc();
+                                    from_body
+                                }
                                 Err(err) => return Err(err),
                             }
                         }
@@ -344,7 +378,6 @@ impl Utilities {
                     }
                 }
             } else {
-                metrics::get().thin_solve_replica_fallbacks.inc();
                 tracing::info!(
                     state = ?replica_state,
                     replica_fresh,
@@ -830,19 +863,18 @@ async fn parse_full_solve_request(solve_request: body::Bytes) -> Result<SolveReq
 
 async fn build_solve_request_from_replica(
     metadata: &SolveRequestMetadata,
-) -> Result<Option<SolveRequest>> {
+) -> std::result::Result<Option<SolveRequest>, ReplicaBuildError> {
     let Some(snapshot) = delta_sync::snapshot().await else {
         return Ok(None);
     };
 
     let request_auction_id =
-        u64::try_from(metadata.id).context("solve request auction id is negative")?;
+        u64::try_from(metadata.id).map_err(|_| ReplicaBuildError::InvalidRequestAuctionId)?;
     if snapshot.auction_id != request_auction_id {
-        anyhow::bail!(
-            "delta replica auction id mismatch: replica={}, request={}",
-            snapshot.auction_id,
-            request_auction_id
-        );
+        return Err(ReplicaBuildError::AuctionIdMismatch {
+            replica: snapshot.auction_id,
+            request: request_auction_id,
+        });
     }
 
     let tokens = metadata
@@ -855,10 +887,10 @@ async fn build_solve_request_from_replica(
                 .get(&token.address)
                 .map(|value| eth::U256::from_str(value))
                 .transpose()
-                .context("could not parse replicated token price")?;
+                .map_err(|_| ReplicaBuildError::InvalidReplicatedTokenPrice)?;
             Ok((token.address, price, token.trusted))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<std::result::Result<Vec<_>, ReplicaBuildError>>()?;
 
     tracing::debug!(
         auction_id = snapshot.auction_id,
@@ -878,19 +910,28 @@ async fn build_solve_request_from_replica(
 }
 async fn ensure_replica_then_build(
     metadata: &SolveRequestMetadata,
-    run_retry_loop: bool,
+    retry_tier: ReplicaRetryBackoffTier,
     bootstrap_context: &'static str,
     not_bootstrapped_msg: &'static str,
     post_bootstrap_failure_msg: &'static str,
 ) -> Result<SolveRequest> {
-    if run_retry_loop
+    if !matches!(retry_tier, ReplicaRetryBackoffTier::None)
         && matches!(
             delta_sync::replica_state().await,
             Some(ReplicaState::Syncing | ReplicaState::Resyncing)
         )
     {
-        let attempts = delta_sync_resync_retry_attempts();
-        let delay = delta_sync_resync_retry_delay();
+        let base_attempts = delta_sync_resync_retry_attempts();
+        let base_delay = delta_sync_resync_retry_delay();
+        let (attempts, delay) = match retry_tier {
+            ReplicaRetryBackoffTier::Full => (base_attempts, base_delay),
+            ReplicaRetryBackoffTier::Short => {
+                let short_attempts = base_attempts.min(2).max(1);
+                let short_delay = std::cmp::max(base_delay / 2, Duration::from_millis(100));
+                (short_attempts, short_delay)
+            }
+            ReplicaRetryBackoffTier::None => (0, base_delay),
+        };
         let deadline = metadata
             .deadline
             .checked_sub_signed(chrono::Duration::milliseconds(50))
@@ -924,7 +965,7 @@ async fn ensure_replica_then_build(
     match build_solve_request_from_replica(metadata).await {
         Ok(Some(request)) => Ok(request),
         Ok(None) => anyhow::bail!(post_bootstrap_failure_msg),
-        Err(err) => Err(err),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -936,12 +977,14 @@ async fn build_solve_request_from_replica_resilient(
     match first {
         Ok(Some(request)) => Ok(Some(request)),
         Ok(None) => {
+            // Replica not ready is typically transient (syncing/resyncing), so
+            // allow bounded retries in thin mode.
             if body_mode != SolveRequestBodyMode::Thin {
                 Ok(None)
             } else {
                 ensure_replica_then_build(
                     metadata,
-                    true,
+                    ReplicaRetryBackoffTier::Full,
                     "could not bootstrap delta replica for thin solve request",
                     "solve request uses thin body mode but delta replica is unavailable and \
                      DRIVER_DELTA_SYNC_AUTOPILOT_URL is not configured",
@@ -952,6 +995,7 @@ async fn build_solve_request_from_replica_resilient(
             }
         }
         Err(err) => {
+            // Keep error-path fallback conservative in thin mode.
             if body_mode != SolveRequestBodyMode::Thin {
                 tracing::warn!(
                     ?err,
@@ -959,14 +1003,16 @@ async fn build_solve_request_from_replica_resilient(
                 );
                 Ok(None)
             } else {
+                let retry_tier = err.retry_tier();
                 tracing::warn!(
                     ?err,
+                    ?retry_tier,
                     "delta replica build failed for thin solve request; attempting bootstrap"
                 );
 
                 ensure_replica_then_build(
                     metadata,
-                    false,
+                    retry_tier,
                     "could not bootstrap delta replica after thin parse failure",
                     "solve request uses thin body mode but delta replica build failed and \
                      bootstrap is not configured",
@@ -1269,7 +1315,7 @@ mod tests {
         let start = Instant::now();
         let result = ensure_replica_then_build(
             &metadata,
-            true,
+            ReplicaRetryBackoffTier::Full,
             "test bootstrap context",
             "not bootstrapped",
             "post bootstrap failure",
@@ -1296,7 +1342,7 @@ mod tests {
         let start = Instant::now();
         let result = ensure_replica_then_build(
             &metadata,
-            true,
+            ReplicaRetryBackoffTier::Full,
             "test bootstrap context",
             "not bootstrapped",
             "post bootstrap failure",

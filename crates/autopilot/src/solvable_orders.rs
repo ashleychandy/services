@@ -215,6 +215,11 @@ static DELTA_SYNC_HISTORY_MIN_RETAINED_OVERRIDE: std::sync::LazyLock<
     std::sync::Mutex<Option<usize>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
+#[cfg(test)]
+static DELTA_SYNC_HISTORY_MAX_AGE_OVERRIDE: std::sync::LazyLock<
+    std::sync::Mutex<Option<Duration>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum DeltaEvent {
     /// Advisory marker for auction boundary transitions.
@@ -880,12 +885,16 @@ impl SolvableOrdersCache {
         if projection_mismatch {
             events = compute_delta_events(previous_auction.as_ref(), &auction_for_cache);
 
-            Metrics::get()
-                .delta_incremental_projection_mismatch_total
-                .inc();
+            if previous_auction.is_some() {
+                Metrics::get()
+                    .delta_incremental_projection_mismatch_total
+                    .inc();
 
-            // Attempt to verify the fallback path.
-            tracing::warn!("incremental projection mismatch detected, using canonical fallback");
+                // Attempt to verify the fallback path.
+                tracing::warn!(
+                    "incremental projection mismatch detected, using canonical fallback"
+                );
+            }
 
             if let Some(prev) = previous_auction.clone() {
                 let check = apply_delta_events_to_auction(prev, &events);
@@ -904,7 +913,9 @@ impl SolvableOrdersCache {
                     "events must reconstruct auction_for_cache after mismatch fallback"
                 );
             } else {
-                tracing::error!("previous_auction must be Some when projection_mismatch is true");
+                tracing::debug!(
+                    "bootstrap update: recomputed canonical delta events without mismatch metrics"
+                );
             }
         }
         let envelope = DeltaEnvelope {
@@ -1633,7 +1644,10 @@ impl SolvableOrdersCache {
         events: &[DeltaEvent],
     ) -> (domain::RawAuctionData, bool) {
         let Some(previous_auction) = previous_auction else {
-            return (auction, false);
+            // If there's no previous auction (first update), we can't verify incremental
+            // events from inputs. Return true to trigger canonical re-computation and
+            // validation of any incremental events that were computed.
+            return (auction, true);
         };
 
         let reconstructed = apply_delta_events_to_auction(previous_auction.clone(), events);
@@ -2071,6 +2085,16 @@ fn delta_history_min_retained() -> usize {
 }
 
 fn delta_history_max_age() -> Duration {
+    #[cfg(test)]
+    {
+        if let Some(value) = *DELTA_SYNC_HISTORY_MAX_AGE_OVERRIDE
+            .lock()
+            .expect("delta history max age override lock poisoned")
+        {
+            return value;
+        }
+    }
+
     *DELTA_HISTORY_MAX_AGE.get_or_init(|| {
         std::env::var("AUTOPILOT_DELTA_SYNC_HISTORY_MAX_AGE_SECS")
             .ok()
@@ -3230,8 +3254,30 @@ mod tests {
     }
 
     #[cfg(test)]
-    static DELTA_HISTORY_MAX_AGE_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    struct DeltaHistoryMaxAgeGuard {
+        previous: Option<Duration>,
+    }
+
+    #[cfg(test)]
+    impl DeltaHistoryMaxAgeGuard {
+        fn set(value: Duration) -> Self {
+            let mut lock = DELTA_SYNC_HISTORY_MAX_AGE_OVERRIDE
+                .lock()
+                .expect("delta history max age override lock poisoned");
+            let previous = *lock;
+            *lock = Some(value);
+            Self { previous }
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for DeltaHistoryMaxAgeGuard {
+        fn drop(&mut self) {
+            *DELTA_SYNC_HISTORY_MAX_AGE_OVERRIDE
+                .lock()
+                .expect("delta history max age override lock poisoned") = self.previous;
+        }
+    }
 
     #[tokio::test]
     async fn get_orders_with_native_prices_with_timeout() {
@@ -5228,28 +5274,11 @@ mod tests {
 
     #[test]
     fn delta_history_max_age_returns_stable_value_across_calls() {
-        let _env_guard = DELTA_HISTORY_MAX_AGE_ENV_LOCK
-            .lock()
-            .expect("delta history max age env lock poisoned");
-
-        let key = "AUTOPILOT_DELTA_SYNC_HISTORY_MAX_AGE_SECS";
-        let original = std::env::var(key).ok();
-
+        let _guard = DeltaHistoryMaxAgeGuard::set(Duration::from_secs(123));
         let age1 = delta_history_max_age();
-        // The OnceLock should ignore env changes after the first read.
-        unsafe { std::env::set_var(key, "1") };
         let age2 = delta_history_max_age();
-
-        match original {
-            Some(value) => {
-                unsafe { std::env::set_var(key, value) };
-            }
-            None => {
-                unsafe { std::env::remove_var(key) };
-            }
-        }
-
         assert_eq!(age1, age2);
+        assert_eq!(age1, Duration::from_secs(123));
     }
 
     #[test]

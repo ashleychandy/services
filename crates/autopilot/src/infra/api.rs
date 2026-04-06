@@ -547,10 +547,35 @@ async fn stream_delta_events(
         "delta stream replay served"
     );
 
-    // Build SSE streams (unchanged from original)
+    // IMPORTANT: snapshotSequence semantics and transition
+    //
+    // Phase 1 (Replay + Drain):
+    //   All events have snapshotSequence = baseline_sequence
+    //   These events are valid relative to the snapshot at baseline_sequence.
+    //   Clients validate these events against their cached snapshot from
+    // baseline_sequence.
+    //
+    // Phase 2 (Live):
+    //   All events have snapshotSequence = replay_to_sequence
+    //   This marks an ANCHOR TRANSITION. The new snapshot anchor is at
+    // replay_to_sequence.   After seeing the first live event, clients should
+    // treat state at replay_to_sequence   as their new snapshot anchor for
+    // validation.
+    //
+    // This transition is intentional and correct. The live phase anchor changes
+    // because:
+    // - Replay phase validates against: snapshot(baseline_sequence) + replay deltas
+    // - Live phase validates against: state(replay_to_sequence) + live deltas
+    // Both are equivalent states, but the reference point shifts.
     let replay_to_sequence = result.replay_to_sequence;
     // Tracks the latest contiguous sequence emitted to the client.
     let last_sequence = Arc::new(AtomicU64::new(replay_to_sequence));
+
+    tracing::debug!(
+        baseline_snapshot_sequence = baseline_sequence,
+        live_phase_anchor_sequence = replay_to_sequence,
+        "delta stream will transition from replay audit baseline to live phase anchor"
+    );
     let replay_stream = tokio_stream::iter(result.payloads.into_iter().map(|payload| {
         Ok::<sse::Event, Infallible>(sse::Event::default().event("delta").data(payload))
     }));
@@ -595,7 +620,11 @@ async fn stream_delta_events(
 
                     last_sequence.store(envelope.to_sequence, Ordering::SeqCst);
 
-                    match serialize_envelope_to_payload(&envelope, Some(baseline_sequence)) {
+                    // Live phase: snapshotSequence = replay_to_sequence (ANCHOR TRANSITION)
+                    // After replay completes, we transition to a new snapshot anchor.
+                    // Live envelopes validate against state(replay_to_sequence), which is
+                    // equivalent to snapshot(baseline_sequence) + all replay deltas.
+                    match serialize_envelope_to_payload(&envelope, Some(replay_to_sequence)) {
                         Ok(payload) => Some(Ok::<sse::Event, Infallible>(
                             sse::Event::default().event("delta").data(payload),
                         )),
@@ -813,7 +842,7 @@ struct DrainOutcome {
 fn drain_live_envelopes(
     receiver: &mut tokio::sync::broadcast::Receiver<crate::solvable_orders::DeltaEnvelope>,
     already_replayed_up_to: u64,
-    client_baseline_sequence: u64,
+    baseline_sequence: u64,
     highest_sequence_seen: &mut u64,
 ) -> Result<DrainOutcome, DrainError> {
     let mut payloads: Vec<String> = Vec::new();
@@ -835,9 +864,11 @@ fn drain_live_envelopes(
                 );
                 *highest_sequence_seen = (*highest_sequence_seen).max(envelope.to_sequence);
 
-                let payload =
-                    serialize_envelope_to_payload(&envelope, Some(client_baseline_sequence))
-                        .map_err(DrainError::Serialize)?;
+                // Drain phase: snapshotSequence = baseline_sequence
+                // These envelopes are "catch-up" deltas from the snapshot baseline.
+                // They validate against snapshot(baseline_sequence).
+                let payload = serialize_envelope_to_payload(&envelope, Some(baseline_sequence))
+                    .map_err(DrainError::Serialize)?;
                 payloads.push(payload);
             }
             Err(TryRecvError::Empty) => break,
@@ -956,7 +987,6 @@ fn delta_sync_enabled() -> bool {
         {
             return value;
         }
-        return false;
     }
 
     shared::env::flag_enabled(
@@ -1050,7 +1080,7 @@ fn delta_sync_api_key() -> Option<String> {
             .expect("delta sync api key override lock poisoned")
             .clone()
         {
-            ApiKeyOverride::NotSet => return None,
+            ApiKeyOverride::NotSet => {}
             ApiKeyOverride::NoKeyRequired => return None,
             ApiKeyOverride::Key(key) => return Some(key),
         }
