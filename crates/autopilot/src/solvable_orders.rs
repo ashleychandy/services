@@ -258,6 +258,12 @@ impl ProjectionResult {
         }
     }
 
+    pub fn auction_ref(&self) -> &domain::RawAuctionData {
+        match self {
+            Self::Bootstrap(a) | Self::Match(a) | Self::Mismatch(a) => a,
+        }
+    }
+
     pub fn should_recompute_events(&self) -> bool {
         matches!(self, Self::Bootstrap(_) | Self::Mismatch(_))
     }
@@ -802,10 +808,19 @@ impl SolvableOrdersCache {
                             &full_inputs.invalid_order_uids,
                             &full_inputs.filtered_order_events,
                         );
-                        let indexed_state_matches = incremental_inputs
-                            .indexed_state
-                            .as_ref()
-                            .is_some_and(|state| state.as_ref() == &full_indexed_state);
+                        let indexed_state_matches = match &incremental_inputs.mode {
+                            CollectionMode::Incremental(state) => {
+                                state.as_ref() == &full_indexed_state
+                            }
+                            CollectionMode::Full => {
+                                let incremental_indexed_state = build_indexed_state(
+                                    &incremental_auction,
+                                    &incremental_inputs.invalid_order_uids,
+                                    &incremental_inputs.filtered_order_events,
+                                );
+                                incremental_indexed_state == full_indexed_state
+                            }
+                        };
                         if !indexed_state_matches {
                             tracing::warn!(
                                 "incremental indexed state diverged from full rebuild; falling \
@@ -956,7 +971,8 @@ impl SolvableOrdersCache {
         );
 
         if projection_result.should_recompute_events() {
-            events = compute_delta_events(previous_auction.as_ref(), &projection_result.auction());
+            events =
+                compute_delta_events(previous_auction.as_ref(), projection_result.auction_ref());
 
             if projection_result.is_mismatch() && previous_auction.is_some() {
                 Metrics::get()
@@ -972,7 +988,7 @@ impl SolvableOrdersCache {
             if let Some(prev) = previous_auction.clone() {
                 let check = apply_delta_events_to_auction(prev, &events);
                 let lhs = normalized_delta_surface(check);
-                let rhs = normalized_delta_surface(projection_result.auction());
+                let rhs = normalized_delta_surface(projection_result.auction_ref().clone());
                 if lhs != rhs {
                     Metrics::get().delta_incremental_failure_total.inc();
                     tracing::error!(
@@ -992,6 +1008,7 @@ impl SolvableOrdersCache {
             }
         }
 
+        let should_recompute = projection_result.should_recompute_events();
         let auction_for_cache = projection_result.auction();
         let envelope = DeltaEnvelope {
             auction_id: current_auction_id,
@@ -1007,7 +1024,7 @@ impl SolvableOrdersCache {
             .unwrap_or_else(|_| chrono::Duration::seconds(60));
         prune_delta_history(&mut delta_history, max_age, &self.delta_config);
 
-        let indexed_state = if projection_result.should_recompute_events() {
+        let indexed_state = if should_recompute {
             Arc::new(build_indexed_state(
                 &auction_for_cache,
                 &inputs.invalid_order_uids,
@@ -5411,9 +5428,10 @@ mod tests {
             .await
             .expect("incremental collection should succeed");
 
-        let indexed = inputs
-            .indexed_state
-            .expect("incremental path should return indexed state");
+        let indexed = match inputs.mode {
+            CollectionMode::Incremental(state) => state,
+            CollectionMode::Full => panic!("incremental path should return indexed state"),
+        };
 
         // uid1 is alive and processed in the alive loop.
         assert!(change_bundle.order_updated_candidates.contains(&uid1));

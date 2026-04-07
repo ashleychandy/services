@@ -83,7 +83,7 @@ mod invariant_tests {
                     from_sequence: seq - 1,
                     to_sequence: seq,
                     published_at: chrono::Utc::now(),
-                    published_at_instant: std::time::Instant::now(),
+                    created_at_instant: std::time::Instant::now(),
                     events: vec![],
                 })
                 .unwrap();
@@ -121,7 +121,7 @@ mod invariant_tests {
                     from_sequence: seq - 1,
                     to_sequence: seq,
                     published_at: chrono::Utc::now(),
-                    published_at_instant: std::time::Instant::now(),
+                    created_at_instant: std::time::Instant::now(),
                     events: vec![],
                 })
                 .unwrap();
@@ -1547,7 +1547,7 @@ mod tests {
             from_sequence: 4,
             to_sequence: 5,
             published_at,
-            published_at_instant: Instant::now(),
+            created_at_instant: Instant::now(),
             events: vec![
                 DeltaEvent::OrderAdded(test_order(1, 10)),
                 DeltaEvent::OrderRemoved(domain::OrderUid([9; 56])),
@@ -1719,7 +1719,7 @@ mod tests {
             from_sequence: 1,
             to_sequence: 2,
             published_at: chrono::Utc::now(),
-            published_at_instant: Instant::now(),
+            created_at_instant: Instant::now(),
             events,
         };
         cache
@@ -1908,7 +1908,7 @@ mod tests {
                     from_sequence: sequence - 1,
                     to_sequence: sequence,
                     published_at: chrono::Utc::now(),
-                    published_at_instant: Instant::now(),
+                    created_at_instant: Instant::now(),
                     events: vec![DeltaEvent::OrderAdded(test_order(sequence as u8, 10))],
                 })
                 .await;
@@ -1936,7 +1936,7 @@ mod tests {
                 from_sequence: 5,
                 to_sequence: 6,
                 published_at: chrono::Utc::now(),
-                published_at_instant: Instant::now(),
+                created_at_instant: Instant::now(),
                 events: vec![DeltaEvent::OrderAdded(test_order(1, 10))],
             })
             .unwrap();
@@ -1971,7 +1971,7 @@ mod tests {
                 from_sequence: 4,
                 to_sequence: 5,
                 published_at: chrono::Utc::now(),
-                published_at_instant: Instant::now(),
+                created_at_instant: Instant::now(),
                 events: vec![DeltaEvent::OrderAdded(test_order(9, 90))],
             })
             .unwrap();
@@ -1982,7 +1982,7 @@ mod tests {
                 from_sequence: 5,
                 to_sequence: 6,
                 published_at: chrono::Utc::now(),
-                published_at_instant: Instant::now(),
+                created_at_instant: Instant::now(),
                 events: vec![DeltaEvent::OrderUpdated(test_order(1, 11))],
             })
             .unwrap();
@@ -2011,7 +2011,7 @@ mod tests {
                     from_sequence: seq - 1,
                     to_sequence: seq,
                     published_at: chrono::Utc::now(),
-                    published_at_instant: Instant::now(),
+                    created_at_instant: Instant::now(),
                     events: vec![],
                 })
                 .unwrap();
@@ -2051,7 +2051,7 @@ mod tests {
                 from_sequence: 0,
                 to_sequence: 1,
                 published_at: chrono::Utc::now(),
-                published_at_instant: Instant::now(),
+                created_at_instant: Instant::now(),
                 events: vec![DeltaEvent::OrderAdded(test_order(1, 10))],
             })
             .unwrap();
@@ -2062,7 +2062,7 @@ mod tests {
                 from_sequence: 1,
                 to_sequence: 2,
                 published_at: chrono::Utc::now(),
-                published_at_instant: Instant::now(),
+                created_at_instant: Instant::now(),
                 events: vec![DeltaEvent::OrderAdded(test_order(2, 20))],
             })
             .unwrap();
@@ -2317,7 +2317,7 @@ mod tests {
             from_sequence: 0,
             to_sequence: 1,
             published_at: chrono::Utc::now(),
-            published_at_instant: Instant::now(),
+            created_at_instant: Instant::now(),
             events: vec![DeltaEvent::OrderAdded(test_order(1, 100))],
         };
         cache
