@@ -70,11 +70,53 @@ enum SolveRequestBodyMode {
     Thin,
 }
 
+/// Retry configuration for replica synchronization attempts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetryConfig {
+    attempts: usize,
+    delay: Duration,
+}
+
+impl RetryConfig {
+    const NONE: Self = Self {
+        attempts: 0,
+        delay: Duration::ZERO,
+    };
+
+    fn full(base_attempts: usize, base_delay: Duration) -> Self {
+        Self {
+            attempts: base_attempts,
+            delay: base_delay,
+        }
+    }
+
+    fn short(base_attempts: usize, base_delay: Duration) -> Self {
+        Self {
+            attempts: base_attempts.min(2).max(1),
+            delay: std::cmp::max(base_delay / 2, Duration::from_millis(100)),
+        }
+    }
+
+    fn should_retry(&self) -> bool {
+        self.attempts > 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReplicaRetryBackoffTier {
     None,
     Short,
     Full,
+}
+
+impl ReplicaRetryBackoffTier {
+    fn to_config(self, base_attempts: usize, base_delay: Duration) -> RetryConfig {
+        match self {
+            Self::None => RetryConfig::NONE,
+            Self::Short => RetryConfig::short(base_attempts, base_delay),
+            Self::Full => RetryConfig::full(base_attempts, base_delay),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -915,24 +957,16 @@ async fn ensure_replica_then_build(
     not_bootstrapped_msg: &'static str,
     post_bootstrap_failure_msg: &'static str,
 ) -> Result<SolveRequest> {
-    if !matches!(retry_tier, ReplicaRetryBackoffTier::None)
+    let base_attempts = delta_sync_resync_retry_attempts();
+    let base_delay = delta_sync_resync_retry_delay();
+    let retry_config = retry_tier.to_config(base_attempts, base_delay);
+
+    if retry_config.should_retry()
         && matches!(
             delta_sync::replica_state().await,
             Some(ReplicaState::Syncing | ReplicaState::Resyncing)
         )
     {
-        let base_attempts = delta_sync_resync_retry_attempts();
-        let base_delay = delta_sync_resync_retry_delay();
-        let (attempts, delay) = match retry_tier {
-            ReplicaRetryBackoffTier::Full => (base_attempts, base_delay),
-            ReplicaRetryBackoffTier::Short => {
-                let short_attempts = base_attempts.min(2).max(1);
-                let short_delay = std::cmp::max(base_delay / 2, Duration::from_millis(100));
-                (short_attempts, short_delay)
-            }
-            ReplicaRetryBackoffTier::None => (0, base_delay),
-        };
-
         // Reserve 50ms buffer before deadline
         let deadline = metadata
             .deadline
@@ -946,29 +980,35 @@ async fn ensure_replica_then_build(
             let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
 
             // Calculate maximum attempts that fit within time budget
-            let max_attempts_by_time = if delay.is_zero() {
-                attempts
+            // Use ceiling division to avoid skipping retries when remaining_time < delay
+            let max_attempts_by_time = if retry_config.delay.is_zero() {
+                retry_config.attempts
             } else {
-                (remaining.as_millis() / delay.as_millis()).min(attempts as u128) as usize
+                let delay_ms = retry_config.delay.as_millis();
+                let remaining_ms = remaining.as_millis();
+                // Ceiling division: (a + b - 1) / b
+                let calculated = (remaining_ms + delay_ms - 1) / delay_ms;
+                calculated.min(retry_config.attempts as u128) as usize
             };
 
-            let effective_attempts = attempts.min(max_attempts_by_time);
+            let effective_attempts = retry_config.attempts.min(max_attempts_by_time);
 
             tracing::debug!(
-                requested_attempts = attempts,
+                requested_attempts = retry_config.attempts,
                 effective_attempts,
-                delay_ms = delay.as_millis(),
+                delay_ms = retry_config.delay.as_millis(),
                 remaining_ms = remaining.as_millis(),
                 "retry loop time budget"
             );
 
             for attempt in 0..effective_attempts {
+                // Check deadline before sleeping to avoid unnecessary delay
                 if chrono::Utc::now() >= deadline {
                     tracing::warn!(attempt, "deadline reached, stopping retries");
                     break;
                 }
 
-                tokio::time::sleep(delay).await;
+                tokio::time::sleep(retry_config.delay).await;
 
                 if chrono::Utc::now() >= deadline {
                     tracing::warn!(attempt, "deadline reached after backoff, stopping retries");

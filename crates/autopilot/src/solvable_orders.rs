@@ -4526,9 +4526,8 @@ mod tests {
             surplus_capturing_jit_order_owners: Vec::new(),
         });
 
-        let (_auction_for_cache, projection_mismatch) =
-            cache.apply_incremental_changes(Some(&previous), current, &[]);
-        assert!(projection_mismatch);
+        let projection_result = cache.apply_incremental_changes(Some(&previous), current, &[]);
+        assert!(matches!(projection_result, ProjectionResult::Mismatch(_)));
 
         let now = Metrics::get()
             .delta_incremental_projection_mismatch_total
@@ -5118,8 +5117,9 @@ mod tests {
     #[test]
     fn prune_delta_history_respects_min_retained() {
         let config = DeltaSyncConfig {
-            min_retained: 3,
-            max_age: Duration::from_secs(60),
+            history_min_retained: 3,
+            history_max_age: Duration::from_secs(60),
+            broadcast_capacity: 256,
         };
 
         let now = chrono::Utc::now();
@@ -5162,8 +5162,9 @@ mod tests {
     #[test]
     fn prune_delta_history_with_zero_age_respects_minimum() {
         let config = DeltaSyncConfig {
-            min_retained: 2,
-            max_age: Duration::from_secs(60),
+            history_min_retained: 2,
+            history_max_age: Duration::from_secs(60),
+            broadcast_capacity: 256,
         };
 
         let now = chrono::Utc::now();
@@ -5305,19 +5306,21 @@ mod tests {
     #[test]
     fn delta_sync_config_allows_custom_min_retained() {
         let config = DeltaSyncConfig {
-            min_retained: 42,
-            max_age: Duration::from_secs(60),
+            history_min_retained: 42,
+            history_max_age: Duration::from_secs(60),
+            broadcast_capacity: 256,
         };
-        assert_eq!(config.min_retained, 42);
+        assert_eq!(config.history_min_retained, 42);
     }
 
     #[test]
     fn delta_sync_config_allows_custom_max_age() {
         let config = DeltaSyncConfig {
-            min_retained: 10,
-            max_age: Duration::from_secs(123),
+            history_min_retained: 10,
+            history_max_age: Duration::from_secs(123),
+            broadcast_capacity: 256,
         };
-        assert_eq!(config.max_age, Duration::from_secs(123));
+        assert_eq!(config.history_max_age, Duration::from_secs(123));
     }
 
     #[test]
