@@ -1465,6 +1465,7 @@ mod tests {
             Duration::from_secs(1),
             Address::repeat_byte(0xFF),
             false,
+            None,
         )
     }
 
@@ -1518,6 +1519,7 @@ mod tests {
             Duration::from_secs(1),
             Address::repeat_byte(0xFF),
             true,
+            None,
         );
 
         (cache, postgres)

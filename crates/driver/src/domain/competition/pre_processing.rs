@@ -932,24 +932,66 @@ async fn ensure_replica_then_build(
             }
             ReplicaRetryBackoffTier::None => (0, base_delay),
         };
+
+        // Reserve 50ms buffer before deadline
         let deadline = metadata
             .deadline
             .checked_sub_signed(chrono::Duration::milliseconds(50))
             .unwrap_or(metadata.deadline);
-        for _ in 0..attempts {
-            if chrono::Utc::now() >= deadline {
-                tracing::warn!("skipping retry: solve deadline imminent");
-                break;
-            }
-            tokio::time::sleep(delay).await;
-            if chrono::Utc::now() >= deadline {
-                tracing::warn!("skipping retry after backoff: solve deadline imminent");
-                break;
-            }
-            match build_solve_request_from_replica(metadata).await {
-                Ok(Some(request)) => return Ok(request),
-                Ok(None) => continue,
-                Err(err) => tracing::warn!(?err, "delta replica build attempt failed during retry"),
+
+        let now = chrono::Utc::now();
+        if now >= deadline {
+            tracing::warn!("deadline already passed, skipping retries");
+        } else {
+            let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
+
+            // Calculate maximum attempts that fit within time budget
+            let max_attempts_by_time = if delay.is_zero() {
+                attempts
+            } else {
+                (remaining.as_millis() / delay.as_millis()).min(attempts as u128) as usize
+            };
+
+            let effective_attempts = attempts.min(max_attempts_by_time);
+
+            tracing::debug!(
+                requested_attempts = attempts,
+                effective_attempts,
+                delay_ms = delay.as_millis(),
+                remaining_ms = remaining.as_millis(),
+                "retry loop time budget"
+            );
+
+            for attempt in 0..effective_attempts {
+                if chrono::Utc::now() >= deadline {
+                    tracing::warn!(attempt, "deadline reached, stopping retries");
+                    break;
+                }
+
+                tokio::time::sleep(delay).await;
+
+                if chrono::Utc::now() >= deadline {
+                    tracing::warn!(attempt, "deadline reached after backoff, stopping retries");
+                    break;
+                }
+
+                match build_solve_request_from_replica(metadata).await {
+                    Ok(Some(request)) => {
+                        tracing::debug!(attempt, "replica build succeeded on retry");
+                        return Ok(request);
+                    }
+                    Ok(None) => {
+                        tracing::debug!(attempt, "replica not ready, continuing retries");
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            attempt,
+                            "delta replica build attempt failed during retry"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1270,7 +1312,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_solve_request_from_replica_rejects_auction_id_mismatch() {
-        let _guard = DeltaReplicaTestGuard::acquire();
+        let _guard = DeltaReplicaTestGuard::acquire().await;
         set_replica_snapshot_for_tests(Snapshot {
             version: 1,
             boot_id: None,
@@ -1301,7 +1343,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_loop_skips_before_sleep_when_deadline_passed() {
-        let _guard = DeltaReplicaTestGuard::acquire();
+        let _guard = DeltaReplicaTestGuard::acquire().await;
         set_driver_delta_sync_autopilot_url_override(None);
         set_replica_state_for_tests(ReplicaState::Syncing).await;
 
@@ -1328,7 +1370,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_loop_skips_after_sleep_when_deadline_passes_during_backoff() {
-        let _guard = DeltaReplicaTestGuard::acquire();
+        let _guard = DeltaReplicaTestGuard::acquire().await;
         set_driver_delta_sync_autopilot_url_override(None);
         set_replica_state_for_tests(ReplicaState::Syncing).await;
 

@@ -498,6 +498,7 @@ pub async fn run(config: Configuration, shutdown_controller: ShutdownController)
         config.native_price_timeout,
         *eth.contracts().settlement().address(),
         config.disable_order_balance_filter,
+        None, // Use default delta sync config
     );
 
     let liveness = Arc::new(Liveness::new(config.max_auction_age));

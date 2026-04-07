@@ -1,6 +1,4 @@
 #[cfg(any(test, feature = "test-helpers"))]
-use std::sync::Mutex as StdMutex;
-#[cfg(any(test, feature = "test-helpers"))]
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use {
@@ -32,7 +30,8 @@ const DELTA_SYNC_API_KEY_HEADER: &str = "X-Delta-Sync-Api-Key";
 static DELTA_REPLICA: LazyLock<StdRwLock<Arc<RwLock<Replica>>>> =
     LazyLock::new(|| StdRwLock::new(Arc::new(RwLock::new(Replica::default()))));
 #[cfg(any(test, feature = "test-helpers"))]
-static DELTA_REPLICA_TEST_MUTEX: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+static DELTA_REPLICA_TEST_MUTEX: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 static DELTA_CHECKSUM_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -168,10 +167,28 @@ pub(crate) async fn snapshot() -> Option<ReplicaSnapshot> {
 /// Reset the global delta replica (intended for test isolation).
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn reset_delta_replica_for_tests() {
-    let mut lock = DELTA_REPLICA
-        .write()
-        .expect("delta replica lock poisoned during reset");
-    *lock = Arc::new(RwLock::new(Replica::default()));
+    reset_delta_replica_in_place(delta_replica());
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn reset_delta_replica_in_place(replica: Arc<RwLock<Replica>>) {
+    match tokio::runtime::Handle::current().runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::CurrentThread => {
+            std::thread::spawn(move || {
+                let mut lock = replica.blocking_write();
+                *lock = Replica::default();
+            })
+            .join()
+            .expect("failed to join delta replica reset thread");
+        }
+        tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(move || {
+                let mut lock = replica.blocking_write();
+                *lock = Replica::default();
+            });
+        }
+        _ => panic!("unsupported runtime flavor"),
+    }
 }
 
 #[cfg(test)]
@@ -192,17 +209,21 @@ pub(crate) async fn set_replica_state_for_tests(state: ReplicaState) {
 }
 
 /// Global test guard to serialize replica usage across tests.
+///
+/// The guard resets the shared replica in place on acquisition and drop, so
+/// any existing `Arc` clones observe the reset state.
 #[cfg(any(test, feature = "test-helpers"))]
 pub struct DeltaReplicaTestGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
 impl DeltaReplicaTestGuard {
-    pub fn acquire() -> Self {
-        let lock = DELTA_REPLICA_TEST_MUTEX
-            .lock()
-            .expect("delta replica test mutex poisoned");
+    /// Acquires the test guard and resets the global replica.
+    ///
+    /// IMPORTANT: Call this BEFORE capturing `delta_replica()` in your test.
+    pub async fn acquire() -> Self {
+        let lock = Arc::clone(&DELTA_REPLICA_TEST_MUTEX).lock_owned().await;
         reset_delta_replica_for_tests();
         Self { _lock: lock }
     }
@@ -569,8 +590,14 @@ async fn follow_stream(
             chunk = response.chunk() => {
                 match chunk? {
                     Some(bytes) => {
-                        let chunk = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
-                        buffer.push_str(&chunk);
+                        // Only allocate if \r actually exists (optimization for well-behaved SSE servers)
+                        let text = if bytes.contains(&b'\r') {
+                            String::from_utf8_lossy(&bytes).replace("\r\n", "\n")
+                        } else {
+                            String::from_utf8_lossy(&bytes).into_owned()
+                        };
+
+                        buffer.push_str(&text);
 
                         while let Some(idx) = buffer.find("\n\n") {
                             let block = buffer[..idx].to_string();
@@ -1388,6 +1415,34 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
         assert_eq!(health.order_count, 1);
         assert!(health.last_update.is_some());
         assert!(health.last_update_age_seconds.is_some());
+    }
+
+    #[tokio::test]
+    async fn delta_replica_test_guard_resets_preexisting_clone() {
+        let replica = delta_replica();
+
+        {
+            let mut lock = replica.write().await;
+            lock.apply_snapshot(Snapshot {
+                version: 1,
+                boot_id: None,
+                auction_id: Some(7),
+                sequence: 9,
+                auction: crate::domain::competition::delta_replica::RawAuctionData {
+                    orders: vec![valid_order(&valid_uid(1))],
+                    prices: HashMap::new(),
+                },
+            })
+            .unwrap();
+        }
+
+        let _guard = DeltaReplicaTestGuard::acquire().await;
+
+        let view = replica.read().await;
+        assert!(matches!(view.state(), ReplicaState::Uninitialized));
+        assert_eq!(view.sequence(), 0);
+        assert!(view.orders().is_empty());
+        assert!(view.prices().is_empty());
     }
 
     #[tokio::test]

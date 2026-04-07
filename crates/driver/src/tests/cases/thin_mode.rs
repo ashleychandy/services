@@ -25,7 +25,7 @@ impl Drop for ReplicaOverrideGuard {
 
 #[tokio::test]
 async fn thin_mode_falls_back_to_full_body_when_replica_unavailable() {
-    let _replica_guard = DeltaReplicaTestGuard::acquire();
+    let _replica_guard = DeltaReplicaTestGuard::acquire().await;
     let _env = ReplicaOverrideGuard::enable();
 
     let test = tests::setup()

@@ -2,7 +2,6 @@ use {
     crate::infra::observe::metrics,
     alloy::primitives::Address,
     eth_domain_types as eth,
-    hex,
     serde::Deserialize,
     serde_json::Value,
     sha2::{Digest, Sha256},
@@ -108,6 +107,7 @@ pub struct Replica {
     sequence: u64,
     auction_id: u64,
     orders: HashMap<String, ReplicaOrder>,
+    order_uid_bytes: HashMap<String, [u8; 56]>,
     prices: HashMap<Address, String>,
     state: ReplicaState,
     last_update: Option<chrono::DateTime<chrono::Utc>>,
@@ -135,6 +135,7 @@ impl Default for Replica {
             sequence: 0,
             auction_id: 0,
             orders: HashMap::new(),
+            order_uid_bytes: HashMap::new(),
             prices: HashMap::new(),
             state: ReplicaState::Uninitialized,
             last_update: None,
@@ -168,7 +169,7 @@ impl Replica {
     }
 
     pub fn checksum(&self) -> Option<ReplicaChecksum> {
-        let order_uid_hash = Self::checksum_order_uids(&self.orders);
+        let order_uid_hash = Self::checksum_order_uids(&self.order_uid_bytes);
         let price_hash = Self::checksum_prices(&self.prices).ok()?;
         Some(ReplicaChecksum {
             sequence: self.sequence,
@@ -187,16 +188,15 @@ impl Replica {
         for (token, price) in &snapshot.auction.prices {
             validate_price_string(*token, price)?;
         }
-        let new_orders = snapshot
-            .auction
-            .orders
-            .into_iter()
-            .map(|order| {
-                let uid = order_uid(&order)?;
-                let order = Self::parse_order(&order)?;
-                Ok((uid, order))
-            })
-            .collect::<Result<HashMap<_, _>, Error>>()?;
+        let mut new_orders = HashMap::with_capacity(snapshot.auction.orders.len());
+        let mut new_order_uid_bytes = HashMap::with_capacity(snapshot.auction.orders.len());
+        for order in snapshot.auction.orders {
+            let uid = order_uid(&order)?;
+            let uid_bytes = decode_order_uid_bytes(&uid)?;
+            let order = Self::parse_order(&order)?;
+            new_order_uid_bytes.insert(uid.clone(), uid_bytes);
+            new_orders.insert(uid, order);
+        }
         let new_prices = snapshot.auction.prices;
         let new_sequence = snapshot.sequence;
 
@@ -205,6 +205,7 @@ impl Replica {
         self.sequence = new_sequence;
         self.auction_id = auction_id;
         self.orders = new_orders;
+        self.order_uid_bytes = new_order_uid_bytes;
         self.prices = new_prices;
         self.state = ReplicaState::Ready;
         self.last_update = Some(chrono::Utc::now());
@@ -252,6 +253,7 @@ impl Replica {
         enum Mutation {
             UpsertOrder {
                 uid: String,
+                uid_bytes: [u8; 56],
                 order: ReplicaOrder,
             },
             RemoveOrder {
@@ -271,8 +273,13 @@ impl Replica {
                 Event::JitOwnersChanged { .. } => {}
                 Event::OrderAdded { order } | Event::OrderUpdated { order } => {
                     let uid = order_uid(&order)?;
+                    let uid_bytes = decode_order_uid_bytes(&uid)?;
                     let order = Self::parse_order(&order)?;
-                    mutations.push(Mutation::UpsertOrder { uid, order });
+                    mutations.push(Mutation::UpsertOrder {
+                        uid,
+                        uid_bytes,
+                        order,
+                    });
                 }
                 Event::OrderRemoved { uid } => {
                     if !is_valid_order_uid(&uid) {
@@ -300,10 +307,16 @@ impl Replica {
 
         for mutation in mutations {
             match mutation {
-                Mutation::UpsertOrder { uid, order } => {
+                Mutation::UpsertOrder {
+                    uid,
+                    uid_bytes,
+                    order,
+                } => {
+                    self.order_uid_bytes.insert(uid.clone(), uid_bytes);
                     self.orders.insert(uid, order);
                 }
                 Mutation::RemoveOrder { uid } => {
+                    self.order_uid_bytes.remove(&uid);
                     if self.orders.remove(&uid).is_none() {
                         metrics::get()
                             .delta_replica_unknown_order_removals_total
@@ -339,23 +352,13 @@ impl Replica {
         }
     }
 
-    fn checksum_order_uids(orders: &HashMap<String, ReplicaOrder>) -> String {
-        let mut uids = orders.keys().cloned().collect::<Vec<_>>();
-        uids.sort();
+    fn checksum_order_uids(order_uid_bytes: &HashMap<String, [u8; 56]>) -> String {
+        let mut entries = order_uid_bytes.iter().collect::<Vec<_>>();
+        entries.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
 
         let mut hasher = Sha256::new();
-        for uid in uids {
-            let bytes = uid.strip_prefix("0x").unwrap_or(&uid);
-            match hex::decode(bytes) {
-                Ok(decoded) => hasher.update(decoded),
-                Err(err) => {
-                    metrics::get()
-                        .delta_replica_checksum_decode_errors_total
-                        .inc();
-                    tracing::warn!(%uid, ?err, "checksum: failed to hex-decode order uid");
-                    return "error".to_string();
-                }
-            }
+        for (_, uid_bytes) in entries {
+            hasher.update(uid_bytes);
         }
         format!("0x{}", const_hex::encode(hasher.finalize()))
     }
@@ -483,6 +486,14 @@ fn is_valid_order_uid(uid: &str) -> bool {
             .iter()
             .skip(2)
             .all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn decode_order_uid_bytes(uid: &str) -> Result<[u8; 56], Error> {
+    let mut bytes = [0u8; 56];
+    let uid_without_prefix = uid.strip_prefix("0x").unwrap_or(uid);
+    const_hex::decode_to_slice(uid_without_prefix, &mut bytes)
+        .map_err(|_| Error::InvalidOrderUidFormat(uid.to_string()))?;
+    Ok(bytes)
 }
 
 fn validate_price_string(token: Address, value: &str) -> Result<(), Error> {

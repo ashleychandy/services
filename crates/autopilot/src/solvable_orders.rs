@@ -49,9 +49,6 @@ use {
 
 static BOOT_ID: OnceLock<String> = OnceLock::new();
 
-static DELTA_HISTORY_MIN_RETAINED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static DELTA_HISTORY_MAX_AGE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-
 macro_rules! send_or_warn {
     ($sender:expr, $value:expr, $context:literal) => {
         // Avoid spurious warnings when there are no receivers yet.
@@ -201,24 +198,74 @@ pub struct SolvableOrdersCache {
     delta_sender: broadcast::Sender<DeltaEnvelope>,
     shadow_compare_incremental: bool,
     incremental_primary: bool,
+    delta_config: DeltaSyncConfig,
 }
 
 type Balances = HashMap<Query, U256>;
 
+/// Configuration for delta sync behavior.
+#[derive(Clone, Debug)]
+pub struct DeltaSyncConfig {
+    /// Minimum number of delta envelopes to retain regardless of age.
+    pub history_min_retained: usize,
+    /// Maximum age for delta history entries before pruning.
+    pub history_max_age: Duration,
+    /// Broadcast channel capacity for live delta streaming.
+    pub broadcast_capacity: usize,
+}
+
+impl Default for DeltaSyncConfig {
+    fn default() -> Self {
+        Self {
+            history_min_retained: MIN_DELTA_HISTORY_RETAINED,
+            history_max_age: DEFAULT_DELTA_HISTORY_MAX_AGE,
+            broadcast_capacity: DELTA_BROADCAST_CAPACITY,
+        }
+    }
+}
+
+/// Maximum number of delta envelopes retained in memory for replay.
+/// This determines how far back a subscriber can replay from.
 const MAX_DELTA_HISTORY: usize = 1024;
+
+/// Default maximum age for delta history entries before pruning.
 const DEFAULT_DELTA_HISTORY_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// Minimum number of delta envelopes to retain regardless of age.
 const MIN_DELTA_HISTORY_RETAINED: usize = 10;
-const DELTA_BROADCAST_CAPACITY: usize = MAX_DELTA_HISTORY;
 
-#[cfg(test)]
-static DELTA_SYNC_HISTORY_MIN_RETAINED_OVERRIDE: std::sync::LazyLock<
-    std::sync::Mutex<Option<usize>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+/// Broadcast channel capacity for live delta streaming.
+/// Sized for producer-consumer lag tolerance. If a subscriber falls
+/// behind by more than this many envelopes, it will receive a lagged
+/// error and must re-subscribe with replay.
+const DELTA_BROADCAST_CAPACITY: usize = 256;
 
-#[cfg(test)]
-static DELTA_SYNC_HISTORY_MAX_AGE_OVERRIDE: std::sync::LazyLock<
-    std::sync::Mutex<Option<Duration>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+/// Result of applying incremental changes to an auction.
+#[derive(Clone, Debug)]
+pub enum ProjectionResult {
+    /// First update with no previous auction to compare against.
+    Bootstrap(domain::RawAuctionData),
+    /// Incremental projection matched canonical rebuild.
+    Match(domain::RawAuctionData),
+    /// Incremental projection diverged; canonical auction returned.
+    Mismatch(domain::RawAuctionData),
+}
+
+impl ProjectionResult {
+    pub fn auction(self) -> domain::RawAuctionData {
+        match self {
+            Self::Bootstrap(a) | Self::Match(a) | Self::Mismatch(a) => a,
+        }
+    }
+
+    pub fn should_recompute_events(&self) -> bool {
+        matches!(self, Self::Bootstrap(_) | Self::Mismatch(_))
+    }
+
+    pub fn is_mismatch(&self) -> bool {
+        matches!(self, Self::Mismatch(_))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DeltaEvent {
@@ -252,9 +299,12 @@ pub struct DeltaEnvelope {
     pub auction_sequence: u64,
     pub from_sequence: u64,
     pub to_sequence: u64,
+    /// Semantic timestamp (wire format, for serialization).
     pub published_at: chrono::DateTime<chrono::Utc>,
-    /// Monotonic timestamp used only for in-memory pruning.
-    pub published_at_instant: Instant,
+    /// Monotonic timestamp for in-memory pruning only.
+    /// Set at envelope creation time, not at event occurrence time.
+    /// Under load, this may diverge from `published_at`.
+    pub created_at_instant: Instant,
     pub events: Vec<DeltaEvent>,
 }
 
@@ -324,6 +374,15 @@ struct IndexedAuctionState {
     surplus_capturing_jit_order_owners: Vec<Address>,
 }
 
+/// Mode of auction input collection.
+#[derive(Clone, Debug)]
+pub enum CollectionMode {
+    /// Full rebuild from database.
+    Full,
+    /// Incremental update with indexed state.
+    Incremental(Arc<IndexedAuctionState>),
+}
+
 #[derive(Clone, Debug, Default)]
 struct ChangeBundle {
     order_added_candidates: Vec<domain::OrderUid>,
@@ -348,7 +407,7 @@ struct CollectedAuctionInputs {
     final_orders: Vec<domain::Order>,
     prices: BTreeMap<Address, U256>,
     surplus_capturing_jit_order_owners: Vec<Address>,
-    indexed_state: Option<Arc<IndexedAuctionState>>,
+    mode: CollectionMode,
 }
 
 impl SolvableOrdersCache {
@@ -366,8 +425,10 @@ impl SolvableOrdersCache {
         native_price_timeout: Duration,
         settlement_contract: Address,
         disable_order_balance_filter: bool,
+        delta_config: Option<DeltaSyncConfig>,
     ) -> Arc<Self> {
-        let (delta_sender, _) = broadcast::channel(DELTA_BROADCAST_CAPACITY);
+        let delta_config = delta_config.unwrap_or_default();
+        let (delta_sender, _) = broadcast::channel(delta_config.broadcast_capacity);
         let shadow_compare_incremental = shared::env::flag_enabled(
             std::env::var("AUTOPILOT_DELTA_SYNC_SHADOW_COMPARE")
                 .ok()
@@ -405,6 +466,7 @@ impl SolvableOrdersCache {
             delta_sender,
             shadow_compare_incremental,
             incremental_primary,
+            delta_config,
         })
     }
 
@@ -504,9 +566,9 @@ impl SolvableOrdersCache {
             inner.auction_sequence = envelope.auction_sequence;
             inner.delta_sequence = envelope.to_sequence;
             inner.delta_history.push_back(envelope.clone());
-            let max_age = chrono::Duration::from_std(delta_history_max_age())
+            let max_age = chrono::Duration::from_std(self.delta_config.history_max_age)
                 .unwrap_or_else(|_| chrono::Duration::seconds(60));
-            prune_delta_history(&mut inner.delta_history, max_age);
+            prune_delta_history(&mut inner.delta_history, max_age, &self.delta_config);
         }
         // Send while holding the cache lock to keep replay + live ordering consistent
         send_or_warn!(self.delta_sender, envelope, "delta broadcast");
@@ -525,7 +587,7 @@ impl SolvableOrdersCache {
     pub async fn set_auction_id(&self, auction_id: u64) {
         let mut lock = self.cache.lock().await;
         if let Some(inner) = lock.as_mut() {
-            if let Some(envelope) = apply_auction_id_change(inner, auction_id) {
+            if let Some(envelope) = apply_auction_id_change(inner, auction_id, &self.delta_config) {
                 // Send while holding cache lock to keep replay + live ordering
                 // consistent (same pattern as update()).
                 send_or_warn!(self.delta_sender, envelope, "delta broadcast");
@@ -593,7 +655,7 @@ impl SolvableOrdersCache {
                     from_sequence: 0,
                     to_sequence: 0,
                     published_at: chrono::Utc::now(),
-                    published_at_instant: Instant::now(),
+                    created_at_instant: Instant::now(),
                     events: Vec::new(),
                 }],
             });
@@ -644,7 +706,7 @@ impl SolvableOrdersCache {
                     from_sequence: after_sequence,
                     to_sequence: after_sequence,
                     published_at: chrono::Utc::now(),
-                    published_at_instant: Instant::now(),
+                    created_at_instant: Instant::now(),
                     events: Vec::new(),
                 }],
             })
@@ -831,8 +893,17 @@ impl SolvableOrdersCache {
         if store_events {
             let invalid_order_uids_clone = inputs.invalid_order_uids.clone();
             let filtered_order_events_clone = inputs.filtered_order_events.clone();
-            self.store_events_by_reason(invalid_order_uids_clone, OrderEventLabel::Invalid);
-            self.store_events_by_reason(filtered_order_events_clone, OrderEventLabel::Filtered);
+
+            // Store events with error propagation
+            self.store_events_by_reason_checked(invalid_order_uids_clone, OrderEventLabel::Invalid)
+                .await
+                .context("failed to store invalid order events")?;
+            self.store_events_by_reason_checked(
+                filtered_order_events_clone,
+                OrderEventLabel::Filtered,
+            )
+            .await
+            .context("failed to store filtered order events")?;
         }
 
         let mut cache = self.cache.lock().await;
@@ -866,7 +937,7 @@ impl SolvableOrdersCache {
             .map(|inner| inner.delta_history.clone())
             .unwrap_or_default();
 
-        let mut events = if inputs.indexed_state.is_some() {
+        let mut events = if matches!(inputs.mode, CollectionMode::Incremental(_)) {
             Self::compute_delta_events_from_inputs(
                 previous_auction.as_ref(),
                 &canonical_auction,
@@ -877,15 +948,17 @@ impl SolvableOrdersCache {
         } else {
             compute_delta_events(previous_auction.as_ref(), &canonical_auction)
         };
-        let (auction_for_cache, projection_mismatch) = self.apply_incremental_changes(
+
+        let projection_result = self.apply_incremental_changes(
             previous_auction.as_ref(),
             canonical_auction.clone(),
             &events,
         );
-        if projection_mismatch {
-            events = compute_delta_events(previous_auction.as_ref(), &auction_for_cache);
 
-            if previous_auction.is_some() {
+        if projection_result.should_recompute_events() {
+            events = compute_delta_events(previous_auction.as_ref(), &projection_result.auction());
+
+            if projection_result.is_mismatch() && previous_auction.is_some() {
                 Metrics::get()
                     .delta_incremental_projection_mismatch_total
                     .inc();
@@ -899,7 +972,7 @@ impl SolvableOrdersCache {
             if let Some(prev) = previous_auction.clone() {
                 let check = apply_delta_events_to_auction(prev, &events);
                 let lhs = normalized_delta_surface(check);
-                let rhs = normalized_delta_surface(auction_for_cache.clone());
+                let rhs = normalized_delta_surface(projection_result.auction());
                 if lhs != rhs {
                     Metrics::get().delta_incremental_failure_total.inc();
                     tracing::error!(
@@ -918,34 +991,37 @@ impl SolvableOrdersCache {
                 );
             }
         }
+
+        let auction_for_cache = projection_result.auction();
         let envelope = DeltaEnvelope {
             auction_id: current_auction_id,
             auction_sequence: next_auction_sequence,
             from_sequence: next_sequence.saturating_sub(1),
             to_sequence: next_sequence,
             published_at: chrono::Utc::now(),
-            published_at_instant: Instant::now(),
+            created_at_instant: Instant::now(),
             events,
         };
         delta_history.push_back(envelope.clone());
-        let max_age = chrono::Duration::from_std(delta_history_max_age())
+        let max_age = chrono::Duration::from_std(self.delta_config.history_max_age)
             .unwrap_or_else(|_| chrono::Duration::seconds(60));
-        prune_delta_history(&mut delta_history, max_age);
+        prune_delta_history(&mut delta_history, max_age, &self.delta_config);
 
-        let indexed_state = if projection_mismatch {
+        let indexed_state = if projection_result.should_recompute_events() {
             Arc::new(build_indexed_state(
                 &auction_for_cache,
                 &inputs.invalid_order_uids,
                 &inputs.filtered_order_events,
             ))
         } else {
-            inputs.indexed_state.unwrap_or_else(|| {
-                Arc::new(build_indexed_state(
+            match inputs.mode {
+                CollectionMode::Incremental(state) => state,
+                CollectionMode::Full => Arc::new(build_indexed_state(
                     &auction_for_cache,
                     &inputs.invalid_order_uids,
                     &inputs.filtered_order_events,
-                ))
-            })
+                )),
+            }
         };
 
         *cache = Some(Inner {
@@ -1131,7 +1207,7 @@ impl SolvableOrdersCache {
             final_orders,
             prices,
             surplus_capturing_jit_order_owners,
-            indexed_state: None,
+            mode: CollectionMode::Full,
         })
     }
 
@@ -1579,7 +1655,7 @@ impl SolvableOrdersCache {
             final_orders,
             prices,
             surplus_capturing_jit_order_owners,
-            indexed_state: Some(Arc::new(indexed_state)),
+            mode: CollectionMode::Incremental(Arc::new(indexed_state)),
         })
     }
 
@@ -1630,24 +1706,19 @@ impl SolvableOrdersCache {
     /// Applies delta events to the previous auction and compares with the
     /// canonical full-rebuild `auction`.
     ///
-    /// Returns `(auction_for_cache, mismatch)`:
-    /// - If no mismatch: returns the reconstructed auction with non-delta
-    ///   fields copied from `auction` (block number, jit owners). Events are
-    ///   correct.
-    /// - If mismatch: returns `auction` unchanged (canonical). Caller MUST
-    ///   recompute events via `compute_delta_events` against the returned
-    ///   value.
+    /// Returns a `ProjectionResult` indicating whether this is a bootstrap,
+    /// match, or mismatch case.
     fn apply_incremental_changes(
         &self,
         previous_auction: Option<&domain::RawAuctionData>,
         auction: domain::RawAuctionData,
         events: &[DeltaEvent],
-    ) -> (domain::RawAuctionData, bool) {
+    ) -> ProjectionResult {
         let Some(previous_auction) = previous_auction else {
             // If there's no previous auction (first update), we can't verify incremental
-            // events from inputs. Return true to trigger canonical re-computation and
+            // events from inputs. Return Bootstrap to trigger canonical re-computation and
             // validation of any incremental events that were computed.
-            return (auction, true);
+            return ProjectionResult::Bootstrap(auction);
         };
 
         let reconstructed = apply_delta_events_to_auction(previous_auction.clone(), events);
@@ -1655,7 +1726,7 @@ impl SolvableOrdersCache {
         let auction_surface = normalized_delta_surface(auction.clone());
 
         if reconstructed_surface == auction_surface {
-            return (with_non_delta_fields(reconstructed, &auction), false);
+            return ProjectionResult::Match(with_non_delta_fields(reconstructed, &auction));
         }
 
         tracing::warn!(
@@ -1664,7 +1735,7 @@ impl SolvableOrdersCache {
         );
 
         // Return canonical auction unchanged. Caller must recompute events.
-        (auction, true)
+        ProjectionResult::Mismatch(auction)
     }
 
     fn compute_delta_events_from_inputs(
@@ -1970,6 +2041,39 @@ impl SolvableOrdersCache {
         fut.await
     }
 
+    /// Store order events with error propagation.
+    /// This method properly handles async database operations without blocking.
+    async fn store_events_by_reason_checked(
+        &self,
+        orders: impl IntoIterator<Item = (OrderUid, OrderFilterReason)>,
+        label: OrderEventLabel,
+    ) -> Result<()> {
+        let mut by_reason: HashMap<OrderFilterReason, Vec<OrderUid>> = HashMap::new();
+        for (uid, reason) in orders {
+            by_reason.entry(reason).or_default().push(uid);
+        }
+
+        if by_reason.is_empty() {
+            return Ok(());
+        }
+
+        for (reason, uids) in by_reason {
+            let order_uids: Vec<domain::OrderUid> = uids
+                .into_iter()
+                .map(|uid| domain::OrderUid(uid.0))
+                .collect();
+
+            self.persistence
+                .store_order_events_checked(order_uids, label, Some(reason))
+                .await
+                .with_context(|| {
+                    format!("failed to store order events for label={label:?}, reason={reason:?}")
+                })?;
+        }
+
+        Ok(())
+    }
+
     fn store_events_by_reason(
         &self,
         orders: impl IntoIterator<Item = (OrderUid, OrderFilterReason)>,
@@ -1990,9 +2094,13 @@ impl SolvableOrdersCache {
     }
 }
 
-fn prune_delta_history(delta_history: &mut VecDeque<DeltaEnvelope>, max_age: chrono::Duration) {
+fn prune_delta_history(
+    delta_history: &mut VecDeque<DeltaEnvelope>,
+    max_age: chrono::Duration,
+    config: &DeltaSyncConfig,
+) {
     let max_age_std = max_age.to_std().unwrap_or_else(|_| Duration::from_secs(0));
-    let min_retained = delta_history_min_retained();
+    let min_retained = config.history_min_retained;
 
     // How many elements may be removed by age while still retaining the minimum
     // required elements.
@@ -2003,7 +2111,7 @@ fn prune_delta_history(delta_history: &mut VecDeque<DeltaEnvelope>, max_age: chr
     let to_remove_by_age = delta_history
         .iter()
         .take(pruneable)
-        .take_while(|e| e.published_at_instant.elapsed() > max_age_std)
+        .take_while(|e| e.created_at_instant.elapsed() > max_age_std)
         .count();
 
     // Also compute how many must be removed to respect `MAX_DELTA_HISTORY`.
@@ -2027,7 +2135,11 @@ fn prune_delta_history(delta_history: &mut VecDeque<DeltaEnvelope>, max_age: chr
 /// per-auction update after this transition will emit `auction_sequence = 1`.
 /// `delta_sequence` remains monotonic across auction transitions and is the
 /// authoritative counter for replay/gap detection.
-fn apply_auction_id_change(inner: &mut Inner, auction_id: u64) -> Option<DeltaEnvelope> {
+fn apply_auction_id_change(
+    inner: &mut Inner,
+    auction_id: u64,
+    config: &DeltaSyncConfig,
+) -> Option<DeltaEnvelope> {
     if inner.auction_id == auction_id {
         return None;
     }
@@ -2051,58 +2163,17 @@ fn apply_auction_id_change(inner: &mut Inner, auction_id: u64) -> Option<DeltaEn
         from_sequence: inner.delta_sequence,
         to_sequence: next_sequence,
         published_at: chrono::Utc::now(),
-        published_at_instant: Instant::now(),
+        created_at_instant: Instant::now(),
         events: vec![DeltaEvent::AuctionChanged {
             new_auction_id: auction_id,
         }],
     };
     inner.delta_sequence = next_sequence;
     inner.delta_history.push_back(envelope.clone());
-    let max_age = chrono::Duration::from_std(delta_history_max_age())
+    let max_age = chrono::Duration::from_std(config.history_max_age)
         .unwrap_or_else(|_| chrono::Duration::seconds(60));
-    prune_delta_history(&mut inner.delta_history, max_age);
+    prune_delta_history(&mut inner.delta_history, max_age, config);
     Some(envelope)
-}
-
-fn delta_history_min_retained() -> usize {
-    #[cfg(test)]
-    {
-        if let Some(value) = *DELTA_SYNC_HISTORY_MIN_RETAINED_OVERRIDE
-            .lock()
-            .expect("delta history min retained override lock poisoned")
-        {
-            return value;
-        }
-    }
-
-    *DELTA_HISTORY_MIN_RETAINED.get_or_init(|| {
-        std::env::var("AUTOPILOT_DELTA_SYNC_HISTORY_MIN_RETAINED")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value: &usize| *value > 0)
-            .unwrap_or(MIN_DELTA_HISTORY_RETAINED)
-    })
-}
-
-fn delta_history_max_age() -> Duration {
-    #[cfg(test)]
-    {
-        if let Some(value) = *DELTA_SYNC_HISTORY_MAX_AGE_OVERRIDE
-            .lock()
-            .expect("delta history max age override lock poisoned")
-        {
-            return value;
-        }
-    }
-
-    *DELTA_HISTORY_MAX_AGE.get_or_init(|| {
-        std::env::var("AUTOPILOT_DELTA_SYNC_HISTORY_MAX_AGE_SECS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value: &u64| *value > 0)
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_DELTA_HISTORY_MAX_AGE)
-    })
 }
 
 fn delta_events_equivalent(canonical: &[DeltaEvent], staged: &[DeltaEvent]) -> bool {
@@ -2846,6 +2917,7 @@ mod tests {
             Duration::from_secs(1),
             Address::repeat_byte(0xFF),
             false,
+            None, // Use default delta sync config
         )
     }
 
@@ -2914,6 +2986,7 @@ mod tests {
             Duration::from_secs(1),
             Address::repeat_byte(0xFF),
             true,
+            None,
         );
         Arc::get_mut(&mut cache)
             .expect("cache arc should be uniquely owned in test")
@@ -3104,6 +3177,7 @@ mod tests {
             Duration::from_secs(1),
             Address::repeat_byte(0xFF),
             true,
+            None,
         );
 
         // Seed a consistent previous cache state and keep DB empty, so update
@@ -3189,6 +3263,7 @@ mod tests {
             Duration::from_secs(1),
             Address::repeat_byte(0xFF),
             true,
+            None,
         );
 
         Arc::get_mut(&mut cache)
@@ -3225,58 +3300,6 @@ mod tests {
             .delta_incremental_projection_mismatch_total
             .get();
         assert_eq!(now, initial + 1);
-    }
-
-    #[cfg(test)]
-    struct DeltaHistoryMinRetainedGuard {
-        previous: Option<usize>,
-    }
-
-    #[cfg(test)]
-    impl DeltaHistoryMinRetainedGuard {
-        fn set(value: usize) -> Self {
-            let mut lock = DELTA_SYNC_HISTORY_MIN_RETAINED_OVERRIDE
-                .lock()
-                .expect("delta history min retained override lock poisoned");
-            let previous = *lock;
-            *lock = Some(value);
-            Self { previous }
-        }
-    }
-
-    #[cfg(test)]
-    impl Drop for DeltaHistoryMinRetainedGuard {
-        fn drop(&mut self) {
-            *DELTA_SYNC_HISTORY_MIN_RETAINED_OVERRIDE
-                .lock()
-                .expect("delta history min retained override lock poisoned") = self.previous;
-        }
-    }
-
-    #[cfg(test)]
-    struct DeltaHistoryMaxAgeGuard {
-        previous: Option<Duration>,
-    }
-
-    #[cfg(test)]
-    impl DeltaHistoryMaxAgeGuard {
-        fn set(value: Duration) -> Self {
-            let mut lock = DELTA_SYNC_HISTORY_MAX_AGE_OVERRIDE
-                .lock()
-                .expect("delta history max age override lock poisoned");
-            let previous = *lock;
-            *lock = Some(value);
-            Self { previous }
-        }
-    }
-
-    #[cfg(test)]
-    impl Drop for DeltaHistoryMaxAgeGuard {
-        fn drop(&mut self) {
-            *DELTA_SYNC_HISTORY_MAX_AGE_OVERRIDE
-                .lock()
-                .expect("delta history max age override lock poisoned") = self.previous;
-        }
     }
 
     #[tokio::test]
@@ -4669,12 +4692,13 @@ mod tests {
             indexed_state: Arc::new(IndexedAuctionState::default()),
         };
 
-        let envelope = apply_auction_id_change(&mut inner, 2).expect("envelope expected");
+        let config = DeltaSyncConfig::default();
+        let envelope = apply_auction_id_change(&mut inner, 2, &config).expect("envelope expected");
         assert_eq!(envelope.from_sequence, 9);
         assert_eq!(envelope.to_sequence, 10);
         assert_eq!(inner.delta_sequence, 10);
 
-        let envelope = apply_auction_id_change(&mut inner, 3).expect("envelope expected");
+        let envelope = apply_auction_id_change(&mut inner, 3, &config).expect("envelope expected");
         assert_eq!(envelope.from_sequence, 10);
         assert_eq!(envelope.to_sequence, 11);
         assert_eq!(inner.delta_sequence, 11);
@@ -4703,7 +4727,8 @@ mod tests {
         };
 
         let previous_sequence = inner.delta_sequence;
-        assert!(apply_auction_id_change(&mut inner, 5).is_none());
+        let config = DeltaSyncConfig::default();
+        assert!(apply_auction_id_change(&mut inner, 5, &config).is_none());
         assert_eq!(inner.delta_sequence, previous_sequence);
         assert!(inner.delta_history.is_empty());
     }
@@ -4730,7 +4755,8 @@ mod tests {
             indexed_state: Arc::new(IndexedAuctionState::default()),
         };
 
-        assert!(apply_auction_id_change(&mut inner, 2).is_none());
+        let config = DeltaSyncConfig::default();
+        assert!(apply_auction_id_change(&mut inner, 2, &config).is_none());
         assert_eq!(inner.delta_sequence, u64::MAX);
         assert_eq!(inner.auction_id, 1);
     }
@@ -4758,7 +4784,7 @@ mod tests {
             from_sequence: 1,
             to_sequence: 2,
             published_at: chrono::Utc::now(),
-            published_at_instant: Instant::now(),
+            created_at_instant: Instant::now(),
             events: vec![DeltaEvent::OrderAdded(test_order(1, 10))],
         };
         let inner = Inner {
@@ -4795,7 +4821,7 @@ mod tests {
             from_sequence: 3,
             to_sequence: 4,
             published_at: chrono::Utc::now(),
-            published_at_instant: Instant::now(),
+            created_at_instant: Instant::now(),
             events: vec![DeltaEvent::AuctionChanged { new_auction_id: 8 }],
         };
         let inner = Inner {
@@ -4839,12 +4865,16 @@ mod tests {
                 from_sequence: i as u64,
                 to_sequence: (i + 1) as u64,
                 published_at: now,
-                published_at_instant: instant_now,
+                created_at_instant: instant_now,
                 events: vec![DeltaEvent::OrderAdded(test_order(1, 10))],
             });
         }
 
-        prune_delta_history(&mut delta_history, chrono::Duration::seconds(600));
+        prune_delta_history(
+            &mut delta_history,
+            chrono::Duration::seconds(600),
+            &DeltaSyncConfig::default(),
+        );
 
         assert_eq!(delta_history.len(), MAX_DELTA_HISTORY);
         assert_eq!(delta_history.front().unwrap().from_sequence, 5_u64);
@@ -4852,7 +4882,11 @@ mod tests {
 
     #[test]
     fn prune_delta_history_evicts_by_age() {
-        let _guard = DeltaHistoryMinRetainedGuard::set(1);
+        let config = DeltaSyncConfig {
+            history_min_retained: 1,
+            history_max_age: Duration::from_secs(300),
+            broadcast_capacity: 256,
+        };
 
         let now = chrono::Utc::now();
         let instant_now = Instant::now();
@@ -4863,7 +4897,7 @@ mod tests {
                 from_sequence: 1,
                 to_sequence: 2,
                 published_at: now - chrono::Duration::seconds(120),
-                published_at_instant: instant_now - Duration::from_secs(120),
+                created_at_instant: instant_now - Duration::from_secs(120),
                 events: vec![DeltaEvent::OrderAdded(test_order(1, 10))],
             },
             DeltaEnvelope {
@@ -4872,11 +4906,11 @@ mod tests {
                 from_sequence: 2,
                 to_sequence: 3,
                 published_at: now,
-                published_at_instant: instant_now,
+                created_at_instant: instant_now,
                 events: vec![DeltaEvent::OrderAdded(test_order(2, 20))],
             },
         ]);
-        prune_delta_history(&mut delta_history, chrono::Duration::seconds(60));
+        prune_delta_history(&mut delta_history, chrono::Duration::seconds(60), &config);
 
         assert_eq!(delta_history.len(), 1);
         assert_eq!(delta_history.front().unwrap().to_sequence, 3);
@@ -5083,7 +5117,10 @@ mod tests {
 
     #[test]
     fn prune_delta_history_respects_min_retained() {
-        let _guard = DeltaHistoryMinRetainedGuard::set(3);
+        let config = DeltaSyncConfig {
+            min_retained: 3,
+            max_age: Duration::from_secs(60),
+        };
 
         let now = chrono::Utc::now();
         let instant_now = Instant::now();
@@ -5094,7 +5131,7 @@ mod tests {
                 from_sequence: 1,
                 to_sequence: 2,
                 published_at: now - chrono::Duration::seconds(200),
-                published_at_instant: instant_now - Duration::from_secs(200),
+                created_at_instant: instant_now - Duration::from_secs(200),
                 events: vec![],
             },
             DeltaEnvelope {
@@ -5103,7 +5140,7 @@ mod tests {
                 from_sequence: 2,
                 to_sequence: 3,
                 published_at: now - chrono::Duration::seconds(150),
-                published_at_instant: instant_now - Duration::from_secs(150),
+                created_at_instant: instant_now - Duration::from_secs(150),
                 events: vec![],
             },
             DeltaEnvelope {
@@ -5112,19 +5149,22 @@ mod tests {
                 from_sequence: 3,
                 to_sequence: 4,
                 published_at: now - chrono::Duration::seconds(100),
-                published_at_instant: instant_now - Duration::from_secs(100),
+                created_at_instant: instant_now - Duration::from_secs(100),
                 events: vec![],
             },
         ]);
 
-        prune_delta_history(&mut delta_history, chrono::Duration::seconds(50));
+        prune_delta_history(&mut delta_history, chrono::Duration::seconds(50), &config);
 
         assert_eq!(delta_history.len(), 3);
     }
 
     #[test]
     fn prune_delta_history_with_zero_age_respects_minimum() {
-        let _guard = DeltaHistoryMinRetainedGuard::set(2);
+        let config = DeltaSyncConfig {
+            min_retained: 2,
+            max_age: Duration::from_secs(60),
+        };
 
         let now = chrono::Utc::now();
         let instant_now = Instant::now();
@@ -5135,7 +5175,7 @@ mod tests {
                 from_sequence: 1,
                 to_sequence: 2,
                 published_at: now - chrono::Duration::seconds(100),
-                published_at_instant: instant_now - Duration::from_secs(100),
+                created_at_instant: instant_now - Duration::from_secs(100),
                 events: vec![],
             },
             DeltaEnvelope {
@@ -5144,12 +5184,12 @@ mod tests {
                 from_sequence: 2,
                 to_sequence: 3,
                 published_at: now,
-                published_at_instant: instant_now,
+                created_at_instant: instant_now,
                 events: vec![],
             },
         ]);
 
-        prune_delta_history(&mut delta_history, chrono::Duration::zero());
+        prune_delta_history(&mut delta_history, chrono::Duration::zero(), &config);
 
         assert_eq!(delta_history.len(), 2);
     }
@@ -5263,22 +5303,21 @@ mod tests {
     }
 
     #[test]
-    fn delta_history_min_retained_respects_override_guard() {
-        // The global OnceLock may already be initialized by other tests.
-        // The intended behaviour tested here is that the test-only override
-        // (`DeltaHistoryMinRetainedGuard`) takes precedence — ensure that.
-        let _guard = DeltaHistoryMinRetainedGuard::set(42);
-        let value = delta_history_min_retained();
-        assert_eq!(value, 42);
+    fn delta_sync_config_allows_custom_min_retained() {
+        let config = DeltaSyncConfig {
+            min_retained: 42,
+            max_age: Duration::from_secs(60),
+        };
+        assert_eq!(config.min_retained, 42);
     }
 
     #[test]
-    fn delta_history_max_age_returns_stable_value_across_calls() {
-        let _guard = DeltaHistoryMaxAgeGuard::set(Duration::from_secs(123));
-        let age1 = delta_history_max_age();
-        let age2 = delta_history_max_age();
-        assert_eq!(age1, age2);
-        assert_eq!(age1, Duration::from_secs(123));
+    fn delta_sync_config_allows_custom_max_age() {
+        let config = DeltaSyncConfig {
+            min_retained: 10,
+            max_age: Duration::from_secs(123),
+        };
+        assert_eq!(config.max_age, Duration::from_secs(123));
     }
 
     #[test]
@@ -5644,7 +5683,7 @@ mod tests {
                     from_sequence: i - 1,
                     to_sequence: i,
                     published_at: chrono::Utc::now(),
-                    published_at_instant: Instant::now(),
+                    created_at_instant: Instant::now(),
                     events: vec![DeltaEvent::OrderAdded(test_order(i as u8, 100))],
                 })
                 .await;
@@ -5757,7 +5796,7 @@ mod tests {
                     from_sequence: i - 1,
                     to_sequence: i,
                     published_at: chrono::Utc::now(),
-                    published_at_instant: Instant::now(),
+                    created_at_instant: Instant::now(),
                     events: vec![DeltaEvent::BlockChanged { block: i }],
                 })
                 .await;
@@ -5803,7 +5842,7 @@ mod tests {
                 from_sequence: i - 1,
                 to_sequence: i,
                 published_at: chrono::Utc::now(),
-                published_at_instant: Instant::now(),
+                created_at_instant: Instant::now(),
                 events: vec![DeltaEvent::OrderAdded(test_order(
                     i as u8,
                     ((100 + i * 10) % 256) as u8,
@@ -5836,7 +5875,7 @@ mod tests {
                     from_sequence: i - 1,
                     to_sequence: i,
                     published_at: chrono::Utc::now(),
-                    published_at_instant: Instant::now(),
+                    created_at_instant: Instant::now(),
                     events: vec![DeltaEvent::OrderAdded(test_order(
                         i as u8,
                         ((100 + i * 10) % 256) as u8,
