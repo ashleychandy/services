@@ -382,7 +382,7 @@ struct IndexedAuctionState {
 
 /// Mode of auction input collection.
 #[derive(Clone, Debug)]
-pub enum CollectionMode {
+enum CollectionMode {
     /// Full rebuild from database.
     Full,
     /// Incremental update with indexed state.
@@ -906,19 +906,16 @@ impl SolvableOrdersCache {
         );
 
         if store_events {
-            let invalid_order_uids_clone = inputs.invalid_order_uids.clone();
-            let filtered_order_events_clone = inputs.filtered_order_events.clone();
-
-            // Store events with error propagation
-            self.store_events_by_reason_checked(invalid_order_uids_clone, OrderEventLabel::Invalid)
-                .await
-                .context("failed to store invalid order events")?;
-            self.store_events_by_reason_checked(
-                filtered_order_events_clone,
+            // Order-event persistence is best-effort debugging data and must not
+            // block auction production.
+            self.store_events_by_reason(
+                inputs.invalid_order_uids.clone(),
+                OrderEventLabel::Invalid,
+            );
+            self.store_events_by_reason(
+                inputs.filtered_order_events.clone(),
                 OrderEventLabel::Filtered,
-            )
-            .await
-            .context("failed to store filtered order events")?;
+            );
         }
 
         let mut cache = self.cache.lock().await;
@@ -2056,39 +2053,6 @@ impl SolvableOrdersCache {
             .with_label_values(&[label])
             .start_timer();
         fut.await
-    }
-
-    /// Store order events with error propagation.
-    /// This method properly handles async database operations without blocking.
-    async fn store_events_by_reason_checked(
-        &self,
-        orders: impl IntoIterator<Item = (OrderUid, OrderFilterReason)>,
-        label: OrderEventLabel,
-    ) -> Result<()> {
-        let mut by_reason: HashMap<OrderFilterReason, Vec<OrderUid>> = HashMap::new();
-        for (uid, reason) in orders {
-            by_reason.entry(reason).or_default().push(uid);
-        }
-
-        if by_reason.is_empty() {
-            return Ok(());
-        }
-
-        for (reason, uids) in by_reason {
-            let order_uids: Vec<domain::OrderUid> = uids
-                .into_iter()
-                .map(|uid| domain::OrderUid(uid.0))
-                .collect();
-
-            self.persistence
-                .store_order_events_checked(order_uids, label, Some(reason))
-                .await
-                .with_context(|| {
-                    format!("failed to store order events for label={label:?}, reason={reason:?}")
-                })?;
-        }
-
-        Ok(())
     }
 
     fn store_events_by_reason(

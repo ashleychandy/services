@@ -35,7 +35,6 @@ use {
     futures::{StreamExt, TryStreamExt},
     number::conversions::{big_decimal_to_u256, u256_to_big_decimal, u256_to_big_uint},
     shared::db_order_conversions::full_order_into_model_order,
-    sqlx::Acquire,
     std::{
         collections::{HashMap, HashSet},
         ops::DerefMut,
@@ -301,41 +300,6 @@ impl Persistence {
     ) {
         let order_uids: Vec<_> = order_uids.into_iter().collect();
         self.store_order_events_owned(order_uids, std::convert::identity, label, None);
-    }
-
-    /// Inserts order events synchronously in the caller task and propagates
-    /// any database errors.
-    pub async fn store_order_events_checked(
-        &self,
-        order_uids: Vec<domain::OrderUid>,
-        label: boundary::OrderEventLabel,
-        reason: Option<OrderFilterReason>,
-    ) -> anyhow::Result<()> {
-        let mut conn = self
-            .postgres
-            .pool
-            .acquire()
-            .await
-            .context("failed to acquire a connection to store order events")?;
-
-        let timestamp = Utc::now();
-        let order_uids: Vec<_> = order_uids.into_iter().map(|uid| ByteArray(uid.0)).collect();
-        let mut tx = conn
-            .begin()
-            .await
-            .context("failed to begin order events tx")?;
-
-        for chunk in order_uids.chunks(1000) {
-            database::order_events::insert_order_events(&mut tx, chunk, timestamp, label, reason)
-                .await
-                .context("failed to insert order events batch")?;
-        }
-
-        tx.commit()
-            .await
-            .context("failed to commit order events tx")?;
-
-        Ok(())
     }
 
     /// A variants of [`store_order_events`] where [`items`] is already an owned

@@ -16,7 +16,7 @@ use {
     serde::{Deserialize, Serialize},
     std::{
         collections::HashMap,
-        sync::{Arc, LazyLock, OnceLock, RwLock as StdRwLock},
+        sync::{Arc, LazyLock, OnceLock, RwLock as StdRwLock, atomic::AtomicU32},
         time::{Duration, Instant},
     },
     tokio::sync::{Mutex, RwLock},
@@ -66,11 +66,31 @@ static DELTA_REPLICA_RESNAPSHOT_INTERVAL: OnceLock<Option<Duration>> = OnceLock:
 static BOOTSTRAP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 #[cfg(any(test, feature = "test-helpers"))]
 pub static REPLICA_PREPROCESSING_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+// Circuit breaker for consecutive thin-replica binding failures. This prevents
+// repeated thin-replica attempts when the replica is persistently diverged
+// (e.g. checksum or sequence mismatches).
+static CONSECUTIVE_BINDING_FAILURES: AtomicU32 = AtomicU32::new(0);
+const BINDING_FAILURE_CIRCUIT_BREAKER: u32 = 3;
+
+pub fn record_binding_failure() {
+    CONSECUTIVE_BINDING_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+pub fn record_binding_success() {
+    CONSECUTIVE_BINDING_FAILURES.store(0, std::sync::atomic::Ordering::Release);
+}
+
+pub fn replica_binding_circuit_open() -> bool {
+    CONSECUTIVE_BINDING_FAILURES.load(std::sync::atomic::Ordering::Acquire)
+        >= BINDING_FAILURE_CIRCUIT_BREAKER
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReplicaSnapshot {
     pub(crate) auction_id: u64,
     pub(crate) sequence: u64,
+    pub(crate) order_uid_hash: String,
+    pub(crate) price_hash: String,
     pub(crate) orders: Vec<crate::infra::api::routes::solve::dto::solve_request::Order>,
     pub(crate) prices: HashMap<alloy::primitives::Address, String>,
 }
@@ -240,9 +260,12 @@ fn snapshot_from_replica(replica: &Replica) -> Option<ReplicaSnapshot> {
     if !matches!(replica.state(), ReplicaState::Ready) {
         return None;
     }
+    let checksum = replica.checksum()?;
     Some(ReplicaSnapshot {
         auction_id: replica.auction_id(),
         sequence: replica.sequence(),
+        order_uid_hash: checksum.order_uid_hash,
+        price_hash: checksum.price_hash,
         orders: replica.orders().values().cloned().collect(),
         prices: replica.prices().clone(),
     })
@@ -326,6 +349,13 @@ pub async fn replica_health() -> Option<ReplicaHealth> {
 
 pub async fn replica_state() -> Option<ReplicaState> {
     Some(delta_replica().read().await.state())
+}
+
+pub async fn mark_replica_resyncing() {
+    delta_replica()
+        .write()
+        .await
+        .set_state(ReplicaState::Resyncing);
 }
 
 pub async fn replica_is_fresh() -> Option<bool> {
@@ -497,6 +527,10 @@ async fn run(
                     break;
                 }
                 Ok(StreamControl::RetryStream) => {
+                    {
+                        let mut lock = replica.write().await;
+                        lock.set_state(ReplicaState::Resyncing);
+                    }
                     tracing::warn!("delta stream requested retry without resnapshot");
                     tokio::time::sleep(STREAM_RETRY_BACKOFF).await;
                 }
@@ -556,6 +590,7 @@ async fn follow_stream(
                 .oldest_available
                 .is_some_and(|oldest| after_sequence < oldest)
             {
+                replica.write().await.set_state(ReplicaState::Resyncing);
                 tracing::warn!(
                     after_sequence,
                     latest_sequence = payload.latest_sequence,
@@ -567,6 +602,7 @@ async fn follow_stream(
             }
             let lag = payload.latest_sequence.saturating_sub(after_sequence);
             if lag <= delta_stream_gone_retry_threshold() {
+                replica.write().await.set_state(ReplicaState::Resyncing);
                 tracing::warn!(
                     after_sequence,
                     latest_sequence = payload.latest_sequence,
@@ -613,6 +649,23 @@ async fn follow_stream(
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                if delta_sync_checksum_enabled() {
+                    let local_checksum = replica.read().await.checksum();
+                    if let Some(local_checksum) = local_checksum {
+                        match compare_replica_checksum(base_url, local_checksum).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                replica.write().await.set_state(ReplicaState::Resyncing);
+                                tracing::warn!("delta replica checksum mismatch; resnapshot required");
+                                return Ok(StreamControl::Resnapshot);
+                            }
+                            Err(err) => {
+                                tracing::warn!(?err, "delta replica checksum comparison failed");
+                            }
+                        }
+                    }
+                }
+
                 if let Some(max_staleness) = max_staleness {
                     let last_update = replica.read().await.last_update();
                     let now = chrono::Utc::now();
@@ -665,6 +718,7 @@ async fn handle_sse_block(
             if let (Some(session), Some(received)) = (session_boot_id, envelope.boot_id.as_deref())
             {
                 if session != received {
+                    replica.write().await.set_state(ReplicaState::Resyncing);
                     tracing::warn!(
                         session_boot_id = %session,
                         received_boot_id = %received,
@@ -679,6 +733,7 @@ async fn handle_sse_block(
                 lock.apply_delta(envelope)
             };
             if let Err(err) = applied {
+                replica.write().await.set_state(ReplicaState::Resyncing);
                 tracing::warn!(?err, "delta envelope apply failed; resnapshot required");
                 return Ok(BlockControl::Resnapshot);
             }
@@ -691,8 +746,12 @@ async fn handle_sse_block(
             );
             Ok(BlockControl::Continue)
         }
-        "resync_required" => Ok(BlockControl::Resnapshot),
+        "resync_required" => {
+            replica.write().await.set_state(ReplicaState::Resyncing);
+            Ok(BlockControl::Resnapshot)
+        }
         "error" => {
+            replica.write().await.set_state(ReplicaState::Resyncing);
             tracing::warn!(payload = %data, "delta stream returned error event");
             Ok(BlockControl::Resnapshot)
         }
@@ -739,13 +798,13 @@ fn delta_sync_checksum_enabled() -> bool {
 async fn compare_replica_checksum(
     base_url: &Url,
     local_checksum: ReplicaChecksum,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let url = shared::url::join(base_url, "delta/checksum");
     let response = apply_delta_sync_auth(DELTA_CHECKSUM_CLIENT.get(url))
         .send()
         .await?;
     if response.status() == StatusCode::NO_CONTENT {
-        return Ok(());
+        return Ok(true);
     }
     let response = response.error_for_status()?;
     let remote = response.json::<DeltaChecksumResponse>().await?;
@@ -759,8 +818,9 @@ async fn compare_replica_checksum(
             remote_sequence = remote.sequence,
             "delta replica checksum mismatch"
         );
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 fn delta_stream_gone_retry_threshold() -> u64 {

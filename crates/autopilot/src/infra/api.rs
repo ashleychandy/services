@@ -27,7 +27,7 @@ use {
         sync::{
             Arc,
             OnceLock,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         time::{Duration, Instant},
     },
@@ -52,6 +52,7 @@ static DELTA_SYNC_API_KEY: OnceLock<Option<String>> = OnceLock::new();
 static DELTA_STREAM_MAX_LAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static DELTA_STREAM_BUFFER_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static DELTA_STREAM_KEEPALIVE_INTERVAL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+static DELTA_SYNC_SERVING_ENABLED: AtomicBool = AtomicBool::new(true);
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -301,6 +302,10 @@ pub async fn serve(
     .await
 }
 
+pub fn set_delta_sync_serving_enabled(enabled: bool) {
+    DELTA_SYNC_SERVING_ENABLED.store(enabled, Ordering::Release);
+}
+
 pub async fn serve_with_listener(
     listener: tokio::net::TcpListener,
     estimator: Arc<dyn NativePriceEstimating>,
@@ -365,6 +370,9 @@ fn build_router(state: State) -> Router {
 }
 
 async fn get_delta_snapshot(headers: HeaderMap, AxumState(state): AxumState<State>) -> Response {
+    if let Err(response) = ensure_delta_sync_serving_enabled() {
+        return response;
+    }
     if let Err(response) = authorize_delta_sync(&headers) {
         return response;
     }
@@ -415,6 +423,9 @@ async fn stream_delta_events(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     AxumState(state): AxumState<State>,
 ) -> Response {
+    if let Err(response) = ensure_delta_sync_serving_enabled() {
+        return response;
+    }
     if let Err(response) = authorize_delta_sync(&headers) {
         return response;
     }
@@ -482,9 +493,13 @@ async fn stream_delta_events(
                 Ok(r) => r,
 
                 Err(SubscribeReplayError::Drain(DrainError::Lagged(skipped2))) => {
+                    let (latest_sequence, oldest_available) =
+                        delta_stream_resync_hint(&state.solvable_orders_cache, baseline_sequence)
+                            .await;
                     tracing::warn!(
                         after_sequence = baseline_sequence,
                         skipped2,
+                        latest_sequence,
                         "delta stream lagged even after retry"
                     );
                     return delta_stream_gone_response(
@@ -492,8 +507,8 @@ async fn stream_delta_events(
                             "resnapshot required because subscription lagged by {skipped2} \
                              messages"
                         ),
-                        skipped2,
-                        None,
+                        latest_sequence,
+                        oldest_available,
                     );
                 }
 
@@ -504,13 +519,16 @@ async fn stream_delta_events(
                 }
 
                 Err(err) => {
+                    let (latest_sequence, oldest_available) =
+                        delta_stream_resync_hint(&state.solvable_orders_cache, baseline_sequence)
+                            .await;
                     tracing::warn!(?err, "failed to re-subscribe after lag");
                     return delta_stream_gone_response(
                         format!(
                             "resnapshot required because subscription lagged by {skipped} messages"
                         ),
-                        baseline_sequence,
-                        None,
+                        latest_sequence,
+                        oldest_available,
                     );
                 }
             }
@@ -528,16 +546,19 @@ async fn stream_delta_events(
     let max_stream_lag = delta_stream_max_lag();
     if initial_lag > max_stream_lag {
         metrics.stream_lagged.inc();
+        let (latest_sequence, oldest_available) =
+            delta_stream_resync_hint(&state.solvable_orders_cache, result.replay_to_sequence).await;
         tracing::warn!(
             after_sequence = baseline_sequence,
             replay_to_sequence = result.replay_to_sequence,
+            latest_sequence,
             initial_lag,
             "delta stream requires resnapshot due to lag"
         );
         return delta_stream_gone_response(
             format!("resnapshot required because subscription lagged by {initial_lag} messages"),
-            result.replay_to_sequence,
-            None,
+            latest_sequence,
+            oldest_available,
         );
     }
 
@@ -678,6 +699,24 @@ async fn stream_delta_events(
         let mut stream = Box::pin(stream);
         loop {
             tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                                if !delta_sync_serving_enabled() {
+                                    let latest_sequence = cache.delta_sequence().await.unwrap_or(replay_to_sequence);
+                                    let resync_payload = serde_json::json!({
+                                        "message": "delta stream lost leader authority",
+                                        "latestSequence": latest_sequence,
+                                        "skipped": 0
+                                    })
+                                    .to_string();
+                                    if let Err(_) = control_sender_clone.send(Ok(sse::Event::default()
+                                        .event("resync_required")
+                                        .data(resync_payload))) {
+                                        tracing::debug!("resync control event dropped: channel closed");
+                                    }
+                                    tracing::warn!("delta stream lost leader authority");
+                                    break;
+                                }
+                            }
                             _ = forward_sender.closed() => {
                                 break;
                             }
@@ -749,6 +788,9 @@ async fn stream_delta_events(
 }
 
 async fn get_delta_checksum(headers: HeaderMap, AxumState(state): AxumState<State>) -> Response {
+    if let Err(response) = ensure_delta_sync_serving_enabled() {
+        return response;
+    }
     if let Err(response) = authorize_delta_sync(&headers) {
         return response;
     }
@@ -978,6 +1020,16 @@ fn delta_stream_gone_response(
     (StatusCode::GONE, Json(payload)).into_response()
 }
 
+async fn delta_stream_resync_hint(
+    cache: &SolvableOrdersCache,
+    fallback_latest: u64,
+) -> (u64, Option<u64>) {
+    match cache.delta_snapshot().await {
+        Some(snapshot) => (snapshot.sequence, Some(snapshot.oldest_available)),
+        None => (fallback_latest, None),
+    }
+}
+
 fn delta_sync_enabled() -> bool {
     #[cfg(any(test, feature = "test-util"))]
     {
@@ -995,6 +1047,22 @@ fn delta_sync_enabled() -> bool {
             .as_deref(),
         false,
     )
+}
+
+fn delta_sync_serving_enabled() -> bool {
+    DELTA_SYNC_SERVING_ENABLED.load(Ordering::Acquire)
+}
+
+fn ensure_delta_sync_serving_enabled() -> Result<(), Response> {
+    if delta_sync_enabled() && !delta_sync_serving_enabled() {
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "delta sync is unavailable on this autopilot instance",
+        )
+            .into_response())
+    } else {
+        Ok(())
+    }
 }
 
 fn delta_stream_max_lag() -> u64 {
@@ -1393,14 +1461,6 @@ mod tests {
             let previous = lock.clone();
             *lock = new_value;
             Self { previous }
-        }
-
-        /// Explicitly clear the override (identical to dropping the guard, but
-        /// useful when the guard needs to be cleared early in a test).
-        fn clear(&self) {
-            *DELTA_SYNC_API_KEY_OVERRIDE
-                .lock()
-                .expect("delta sync api key override lock poisoned") = ApiKeyOverride::NotSet;
         }
     }
 
@@ -2115,6 +2175,40 @@ mod tests {
         );
         assert_eq!(payload["oldestAvailable"], 5);
         assert_eq!(payload["latestSequence"], 12);
+    }
+
+    #[tokio::test]
+    async fn delta_stream_resync_hint_uses_current_cache_state() {
+        let cache = test_cache().await;
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: vec![test_order(1, 100)],
+            prices: std::collections::HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        let history = VecDeque::from([DeltaEnvelope {
+            auction_id: 3,
+            auction_sequence: 7,
+            from_sequence: 10,
+            to_sequence: 11,
+            published_at: chrono::Utc::now(),
+            created_at_instant: Instant::now(),
+            events: vec![],
+        }]);
+        cache.set_state_for_tests(auction, 3, 7, 11, history).await;
+
+        let (latest_sequence, oldest_available) = delta_stream_resync_hint(&cache, 2).await;
+        assert_eq!(latest_sequence, 11);
+        assert_eq!(oldest_available, Some(10));
+    }
+
+    #[tokio::test]
+    async fn delta_stream_resync_hint_falls_back_when_cache_is_empty() {
+        let cache = test_cache().await;
+
+        let (latest_sequence, oldest_available) = delta_stream_resync_hint(&cache, 17).await;
+        assert_eq!(latest_sequence, 17);
+        assert_eq!(oldest_available, None);
     }
 
     #[tokio::test]

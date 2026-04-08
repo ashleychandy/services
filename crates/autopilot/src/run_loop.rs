@@ -161,6 +161,7 @@ impl RunLoop {
         let mut leader_lock_tracker = LeaderLockTracker::new(leader);
         while !control.should_shutdown() {
             leader_lock_tracker.try_acquire().await;
+            crate::infra::api::set_delta_sync_serving_enabled(leader_lock_tracker.is_leader());
 
             if !leader_lock_tracker.is_leader() {
                 // Follower: wait for a block notification (or timeout) before
@@ -173,7 +174,9 @@ impl RunLoop {
                 // case the call mutates `last_block` internally.
                 let prev_block = last_block.clone();
 
-                let new_block = match self_arc.update_caches(&mut last_block, false).await {
+                let update_result = self_arc.update_caches(&mut last_block, false).await;
+                Self::maybe_mark_startup_probe_ready(&self_arc.probes, &update_result);
+                let new_block = match update_result {
                     Ok(b) => b,
                     Err(err) => {
                         tracing::warn!(?err, "failed to update caches (follower); backing off");
@@ -213,6 +216,7 @@ impl RunLoop {
 
             // Re-confirm leadership after waiting
             leader_lock_tracker.try_acquire().await;
+            crate::infra::api::set_delta_sync_serving_enabled(leader_lock_tracker.is_leader());
             if !leader_lock_tracker.is_leader() {
                 // Lost leadership after waiting, skip this cycle
                 continue;
@@ -243,6 +247,7 @@ impl RunLoop {
                     .await
             }
         }
+        crate::infra::api::set_delta_sync_serving_enabled(false);
         leader_lock_tracker.release().await;
     }
 
@@ -644,19 +649,32 @@ impl RunLoop {
     /// Returns all fair solutions sorted by their score (best to worst).
     #[instrument(skip_all)]
     async fn fetch_solutions(&self, auction: &domain::Auction) -> Vec<competition::Bid<Unscored>> {
+        let needs_thin_request = self
+            .drivers
+            .iter()
+            .any(|driver| driver.supports_thin_solve_request);
+        let thin_binding = if needs_thin_request {
+            self.solvable_orders_cache
+                .delta_checksum()
+                .await
+                .map(|checksum| solve::ReplicaBinding {
+                    sequence: checksum.sequence,
+                    order_uid_hash: checksum.order_uid_hash,
+                    price_hash: checksum.price_hash,
+                })
+        } else {
+            None
+        };
         let full_request = solve::Request::new(
             auction,
             &self.trusted_tokens.all(),
             self.config.solve_deadline,
             self.config.compress_solve_request,
             solve::SolveRequestBodyMode::Full,
+            None,
         )
         .await;
-        let thin_request = if self
-            .drivers
-            .iter()
-            .any(|driver| driver.supports_thin_solve_request)
-        {
+        let thin_request = if let Some(thin_binding) = thin_binding.as_ref() {
             let start = Instant::now();
             let request = solve::Request::new(
                 auction,
@@ -664,10 +682,14 @@ impl RunLoop {
                 self.config.solve_deadline,
                 self.config.compress_solve_request,
                 solve::SolveRequestBodyMode::Thin,
+                Some(thin_binding),
             )
             .await;
             Metrics::thin_request_serialization_time(start.elapsed());
             Some(request)
+        } else if needs_thin_request {
+            tracing::warn!("thin solve request disabled because delta replica binding is missing");
+            None
         } else {
             None
         };
@@ -1336,6 +1358,7 @@ mod tests {
             Duration::from_secs(30),
             false,
             solve::SolveRequestBodyMode::Full,
+            None,
         )
         .await;
         let thin_request = solve::Request::new(
@@ -1344,6 +1367,11 @@ mod tests {
             Duration::from_secs(30),
             false,
             solve::SolveRequestBodyMode::Thin,
+            Some(&solve::ReplicaBinding {
+                sequence: 1,
+                order_uid_hash: "0x01".to_string(),
+                price_hash: "0x02".to_string(),
+            }),
         )
         .await;
         let full_size = full_request.body_size();
@@ -1372,6 +1400,7 @@ mod tests {
             Duration::from_secs(30),
             false,
             solve::SolveRequestBodyMode::Full,
+            None,
         )
         .await;
         let thin_request = solve::Request::new(
@@ -1380,6 +1409,11 @@ mod tests {
             Duration::from_secs(30),
             false,
             solve::SolveRequestBodyMode::Thin,
+            Some(&solve::ReplicaBinding {
+                sequence: 1,
+                order_uid_hash: "0x01".to_string(),
+                price_hash: "0x02".to_string(),
+            }),
         )
         .await;
         let full_size = full_request.body_size();

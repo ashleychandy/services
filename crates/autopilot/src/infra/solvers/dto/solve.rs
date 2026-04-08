@@ -37,6 +37,9 @@ pub struct Request {
     deadline_header: Option<String>,
     tokens_header: Option<String>,
     jit_owners_header: Option<String>,
+    replica_sequence_header: Option<String>,
+    order_uid_hash_header: Option<String>,
+    price_hash_header: Option<String>,
     body_mode_header: &'static str,
 }
 
@@ -46,6 +49,13 @@ pub enum SolveRequestBodyMode {
     Thin,
 }
 
+#[derive(Clone, Debug)]
+pub struct ReplicaBinding {
+    pub sequence: u64,
+    pub order_uid_hash: String,
+    pub price_hash: String,
+}
+
 impl Request {
     pub async fn new(
         auction: &domain::Auction,
@@ -53,6 +63,7 @@ impl Request {
         time_limit: Duration,
         compress: bool,
         body_mode: SolveRequestBodyMode,
+        replica_binding: Option<&ReplicaBinding>,
     ) -> Self {
         let _timer =
             observe::metrics::metrics().on_auction_overhead_start("autopilot", "serialize_request");
@@ -88,21 +99,29 @@ impl Request {
             surplus_capturing_jit_order_owners: auction.surplus_capturing_jit_order_owners.to_vec(),
         };
         let auction_id = auction.id;
-        let (deadline_header, tokens_header, jit_owners_header) = if thin_body {
-            (None, None, None)
-        } else {
-            let deadline = helper.deadline.to_rfc3339();
-            let tokens_header = helper
+        let deadline_header = Some(helper.deadline.to_rfc3339());
+        let tokens_header = Some(
+            helper
                 .tokens
                 .iter()
                 .map(|token| format!("{}:{}", token.address, u8::from(token.trusted)))
-                .join(",");
-            let jit_owners_header = helper
+                .join(","),
+        );
+        let jit_owners_header = Some(
+            helper
                 .surplus_capturing_jit_order_owners
                 .iter()
                 .map(ToString::to_string)
-                .join(",");
-            (Some(deadline), Some(tokens_header), Some(jit_owners_header))
+                .join(","),
+        );
+        let (replica_sequence_header, order_uid_hash_header, price_hash_header) = if thin_body {
+            (
+                replica_binding.map(|binding| binding.sequence.to_string()),
+                replica_binding.map(|binding| binding.order_uid_hash.clone()),
+                replica_binding.map(|binding| binding.price_hash.clone()),
+            )
+        } else {
+            (None, None, None)
         };
         let body_mode_header = if thin_body { "thin" } else { "full" };
 
@@ -149,6 +168,9 @@ impl Request {
             deadline_header,
             tokens_header,
             jit_owners_header,
+            replica_sequence_header,
+            order_uid_hash_header,
+            price_hash_header,
             body_mode_header,
         }
     }
@@ -187,6 +209,21 @@ impl InjectIntoHttpRequest for Request {
         };
         let request = if let Some(jit_owners) = &self.jit_owners_header {
             request.header("X-Auction-Jit-Order-Owners", jit_owners)
+        } else {
+            request
+        };
+        let request = if let Some(sequence) = &self.replica_sequence_header {
+            request.header("X-Auction-Replica-Sequence", sequence)
+        } else {
+            request
+        };
+        let request = if let Some(order_uid_hash) = &self.order_uid_hash_header {
+            request.header("X-Auction-Order-Uid-Hash", order_uid_hash)
+        } else {
+            request
+        };
+        let request = if let Some(price_hash) = &self.price_hash_header {
+            request.header("X-Auction-Price-Hash", price_hash)
         } else {
             request
         };
@@ -368,6 +405,9 @@ mod tests {
             deadline_header: Some("2025-01-01T00:00:00Z".to_string()),
             tokens_header: Some("0x0000000000000000000000000000000000000000:1".to_string()),
             jit_owners_header: Some(String::new()),
+            replica_sequence_header: None,
+            order_uid_hash_header: None,
+            price_hash_header: None,
             body_mode_header: "full",
         }
     }
@@ -386,12 +426,15 @@ mod tests {
             deadline_header: Some("2025-01-01T00:00:00Z".to_string()),
             tokens_header: Some("0x0000000000000000000000000000000000000000:1".to_string()),
             jit_owners_header: Some(String::new()),
+            replica_sequence_header: None,
+            order_uid_hash_header: None,
+            price_hash_header: None,
             body_mode_header: "full",
         }
     }
 
     #[tokio::test]
-    async fn thin_request_embeds_metadata_in_body_and_omits_headers() {
+    async fn thin_request_embeds_metadata_in_body_and_includes_binding_headers() {
         let token = Address::repeat_byte(0x11);
         let price = domain::auction::Price::try_new(eth::Ether::from(eth::U256::from(1)))
             .expect("price should be non-zero");
@@ -403,6 +446,11 @@ mod tests {
             surplus_capturing_jit_order_owners: vec![Address::repeat_byte(0x22)],
         };
         let trusted_tokens = HashSet::from([token]);
+        let replica_binding = ReplicaBinding {
+            sequence: 7,
+            order_uid_hash: "0xaaaa".to_string(),
+            price_hash: "0xbbbb".to_string(),
+        };
 
         let request = Request::new(
             &auction,
@@ -410,6 +458,7 @@ mod tests {
             Duration::from_secs(30),
             false,
             SolveRequestBodyMode::Thin,
+            Some(&replica_binding),
         )
         .await;
 
@@ -427,9 +476,27 @@ mod tests {
             .build()
             .unwrap();
         let headers = built.headers();
-        assert!(headers.get("X-Auction-Deadline").is_none());
-        assert!(headers.get("X-Auction-Tokens").is_none());
-        assert!(headers.get("X-Auction-Jit-Order-Owners").is_none());
+        assert!(headers.get("X-Auction-Deadline").is_some());
+        assert!(headers.get("X-Auction-Tokens").is_some());
+        assert!(headers.get("X-Auction-Jit-Order-Owners").is_some());
+        assert_eq!(
+            headers
+                .get("X-Auction-Replica-Sequence")
+                .and_then(|value| value.to_str().ok()),
+            Some("7")
+        );
+        assert_eq!(
+            headers
+                .get("X-Auction-Order-Uid-Hash")
+                .and_then(|value| value.to_str().ok()),
+            Some("0xaaaa")
+        );
+        assert_eq!(
+            headers
+                .get("X-Auction-Price-Hash")
+                .and_then(|value| value.to_str().ok()),
+            Some("0xbbbb")
+        );
         let body_mode = headers
             .get("X-Auction-Body-Mode")
             .and_then(|value| value.to_str().ok());
@@ -456,6 +523,7 @@ mod tests {
             Duration::from_secs(30),
             false,
             SolveRequestBodyMode::Full,
+            None,
         )
         .await;
 
@@ -472,6 +540,9 @@ mod tests {
         assert!(headers.get("X-Auction-Deadline").is_some());
         assert!(headers.get("X-Auction-Tokens").is_some());
         assert!(headers.get("X-Auction-Jit-Order-Owners").is_some());
+        assert!(headers.get("X-Auction-Replica-Sequence").is_none());
+        assert!(headers.get("X-Auction-Order-Uid-Hash").is_none());
+        assert!(headers.get("X-Auction-Price-Hash").is_none());
         let body_mode = headers
             .get("X-Auction-Body-Mode")
             .and_then(|value| value.to_str().ok());

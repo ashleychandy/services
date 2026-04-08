@@ -125,6 +125,12 @@ enum ReplicaBuildError {
     InvalidRequestAuctionId,
     #[error("delta replica auction id mismatch: replica={replica}, request={request}")]
     AuctionIdMismatch { replica: u64, request: u64 },
+    #[error("thin solve request is missing delta replica binding headers")]
+    MissingReplicaBinding,
+    #[error("delta replica sequence mismatch: replica={replica}, request={request}")]
+    SequenceMismatch { replica: u64, request: u64 },
+    #[error("delta replica checksum mismatch for thin solve request")]
+    ChecksumMismatch,
     #[error("could not parse replicated token price")]
     InvalidReplicatedTokenPrice,
 }
@@ -134,11 +140,14 @@ impl ReplicaBuildError {
         match self {
             // Snapshot not matching request id is often transitional while the
             // replica catches up; allow a shorter bounded retry.
-            Self::AuctionIdMismatch { .. } => ReplicaRetryBackoffTier::Short,
-            // These are deterministic input/data issues for this request.
-            Self::InvalidRequestAuctionId | Self::InvalidReplicatedTokenPrice => {
-                ReplicaRetryBackoffTier::None
+            Self::AuctionIdMismatch { .. } | Self::SequenceMismatch { .. } => {
+                ReplicaRetryBackoffTier::Short
             }
+            Self::ChecksumMismatch => ReplicaRetryBackoffTier::Full,
+            // These are deterministic input/data issues for this request.
+            Self::InvalidRequestAuctionId
+            | Self::InvalidReplicatedTokenPrice
+            | Self::MissingReplicaBinding => ReplicaRetryBackoffTier::None,
         }
     }
 }
@@ -337,6 +346,11 @@ impl Utilities {
             .unwrap_or(ReplicaState::Uninitialized);
         let replica_fresh = delta_sync::replica_is_fresh().await.unwrap_or(false);
         let replica_ready = matches!(replica_state, ReplicaState::Ready) && replica_fresh;
+        let replica_binding = if body_mode == SolveRequestBodyMode::Thin {
+            parse_solve_request_replica_binding_from_headers(headers_of(&request_opt))?
+        } else {
+            None
+        };
 
         let mut buffered_body: Option<body::Bytes> = None;
 
@@ -345,7 +359,13 @@ impl Utilities {
                 let headers = headers_of(&request_opt);
                 parse_solve_request_metadata_from_headers(headers)?
             } {
-                match build_solve_request_from_replica_resilient(&metadata, body_mode).await {
+                match build_solve_request_from_replica_resilient(
+                    &metadata,
+                    replica_binding.as_ref(),
+                    body_mode,
+                )
+                .await
+                {
                     Ok(Some(from_replica)) => {
                         tracing::debug!(
                             auction_id = from_replica.id(),
@@ -354,12 +374,17 @@ impl Utilities {
                         from_replica
                     }
                     Ok(None) => {
+                        if body_mode == SolveRequestBodyMode::Thin {
+                            return Err(anyhow::anyhow!(
+                                "delta replica unavailable for thin solve request"
+                            ));
+                        }
                         let body = read_body_once(&mut request_opt, &mut buffered_body).await?;
                         parse_full_solve_request(body).await?
                     }
                     Err(err) => {
                         if body_mode == SolveRequestBodyMode::Thin {
-                            return Err(err);
+                            return Err(err.into());
                         }
                         let body = read_body_once(&mut request_opt, &mut buffered_body).await?;
                         parse_full_solve_request(body).await?
@@ -368,7 +393,13 @@ impl Utilities {
             } else {
                 let body = read_body_once(&mut request_opt, &mut buffered_body).await?;
                 let metadata = parse_solve_request_metadata(&body)?;
-                match build_solve_request_from_replica_resilient(&metadata, body_mode).await {
+                match build_solve_request_from_replica_resilient(
+                    &metadata,
+                    replica_binding.as_ref(),
+                    body_mode,
+                )
+                .await
+                {
                     Ok(Some(from_replica)) => {
                         tracing::debug!(
                             auction_id = from_replica.id(),
@@ -376,10 +407,17 @@ impl Utilities {
                         );
                         from_replica
                     }
-                    Ok(None) => parse_full_solve_request(body).await?,
+                    Ok(None) => {
+                        if body_mode == SolveRequestBodyMode::Thin {
+                            return Err(anyhow::anyhow!(
+                                "delta replica unavailable for thin solve request"
+                            ));
+                        }
+                        parse_full_solve_request(body).await?
+                    }
                     Err(err) => {
                         if body_mode == SolveRequestBodyMode::Thin {
-                            return Err(err);
+                            return Err(err.into());
                         }
                         parse_full_solve_request(body).await?
                     }
@@ -397,13 +435,18 @@ impl Utilities {
                         } else {
                             let metadata: SolveRequestMetadata = (&from_body).into();
 
-                            match build_solve_request_from_replica_resilient(&metadata, body_mode)
-                                .await
+                            match build_solve_request_from_replica_resilient(
+                                &metadata,
+                                replica_binding.as_ref(),
+                                body_mode,
+                            )
+                            .await
                             {
                                 Ok(Some(from_replica)) => from_replica,
                                 Ok(None) => {
-                                    metrics::get().thin_solve_replica_fallbacks.inc();
-                                    from_body
+                                    return Err(anyhow::anyhow!(
+                                        "delta replica unavailable for thin solve request"
+                                    ));
                                 }
                                 Err(err) => return Err(err),
                             }
@@ -411,7 +454,12 @@ impl Utilities {
                     }
                     Err(parse_err) => {
                         let metadata = parse_solve_request_metadata(&body)?;
-                        match build_solve_request_from_replica_resilient(&metadata, body_mode).await
+                        match build_solve_request_from_replica_resilient(
+                            &metadata,
+                            replica_binding.as_ref(),
+                            body_mode,
+                        )
+                        .await
                         {
                             Ok(Some(from_replica)) => from_replica,
                             Ok(None) => return Err(parse_err),
@@ -761,6 +809,13 @@ struct SolveRequestTokenMetadata {
     trusted: bool,
 }
 
+#[derive(Clone, Debug)]
+struct SolveRequestReplicaBinding {
+    sequence: u64,
+    order_uid_hash: String,
+    price_hash: String,
+}
+
 impl From<&crate::infra::api::routes::solve::dto::SolveRequest> for SolveRequestMetadata {
     fn from(req: &crate::infra::api::routes::solve::dto::SolveRequest) -> Self {
         SolveRequestMetadata {
@@ -855,6 +910,41 @@ fn parse_solve_request_metadata_from_headers(
     }))
 }
 
+fn parse_solve_request_replica_binding_from_headers(
+    headers: &HeaderMap,
+) -> Result<Option<SolveRequestReplicaBinding>> {
+    let sequence_header = headers.get("X-Auction-Replica-Sequence");
+    let order_uid_hash_header = headers.get("X-Auction-Order-Uid-Hash");
+    let price_hash_header = headers.get("X-Auction-Price-Hash");
+
+    if sequence_header.is_none() && order_uid_hash_header.is_none() && price_hash_header.is_none() {
+        return Ok(None);
+    }
+
+    let sequence = sequence_header
+        .context("missing X-Auction-Replica-Sequence header")?
+        .to_str()
+        .context("X-Auction-Replica-Sequence header is not valid ASCII")?
+        .parse()
+        .context("X-Auction-Replica-Sequence header is not a valid integer")?;
+    let order_uid_hash = order_uid_hash_header
+        .context("missing X-Auction-Order-Uid-Hash header")?
+        .to_str()
+        .context("X-Auction-Order-Uid-Hash header is not valid ASCII")?
+        .to_string();
+    let price_hash = price_hash_header
+        .context("missing X-Auction-Price-Hash header")?
+        .to_str()
+        .context("X-Auction-Price-Hash header is not valid ASCII")?
+        .to_string();
+
+    Ok(Some(SolveRequestReplicaBinding {
+        sequence,
+        order_uid_hash,
+        price_hash,
+    }))
+}
+
 fn parse_solve_request_body_mode(headers: &HeaderMap) -> Result<SolveRequestBodyMode> {
     let Some(value) = headers.get("X-Auction-Body-Mode") else {
         return Ok(SolveRequestBodyMode::Full);
@@ -905,6 +995,7 @@ async fn parse_full_solve_request(solve_request: body::Bytes) -> Result<SolveReq
 
 async fn build_solve_request_from_replica(
     metadata: &SolveRequestMetadata,
+    replica_binding: &SolveRequestReplicaBinding,
 ) -> std::result::Result<Option<SolveRequest>, ReplicaBuildError> {
     let Some(snapshot) = delta_sync::snapshot().await else {
         return Ok(None);
@@ -913,10 +1004,30 @@ async fn build_solve_request_from_replica(
     let request_auction_id =
         u64::try_from(metadata.id).map_err(|_| ReplicaBuildError::InvalidRequestAuctionId)?;
     if snapshot.auction_id != request_auction_id {
+        // Auction id mismatch is often transitional and should not count as a
+        // binding failure for the circuit-breaker.
         return Err(ReplicaBuildError::AuctionIdMismatch {
             replica: snapshot.auction_id,
             request: request_auction_id,
         });
+    }
+    if snapshot.sequence != replica_binding.sequence {
+        // Sequence mismatches indicate the replica is stale; record a binding
+        // failure so the circuit-breaker can trip on repeated occurrences.
+        delta_sync::record_binding_failure();
+        metrics::get().thin_solve_replica_fallbacks.inc();
+        return Err(ReplicaBuildError::SequenceMismatch {
+            replica: snapshot.sequence,
+            request: replica_binding.sequence,
+        });
+    }
+    if snapshot.order_uid_hash != replica_binding.order_uid_hash
+        || snapshot.price_hash != replica_binding.price_hash
+    {
+        // Checksum mismatches are also binding failures.
+        delta_sync::record_binding_failure();
+        metrics::get().thin_solve_replica_fallbacks.inc();
+        return Err(ReplicaBuildError::ChecksumMismatch);
     }
 
     let tokens = metadata
@@ -942,6 +1053,9 @@ async fn build_solve_request_from_replica(
         "constructed solve request from delta replica"
     );
 
+    // Success: reset consecutive binding failures counter.
+    delta_sync::record_binding_success();
+
     Ok(Some(SolveRequest::from_replica_parts(
         metadata.id,
         metadata.deadline,
@@ -952,11 +1066,13 @@ async fn build_solve_request_from_replica(
 }
 async fn ensure_replica_then_build(
     metadata: &SolveRequestMetadata,
+    replica_binding: Option<&SolveRequestReplicaBinding>,
     retry_tier: ReplicaRetryBackoffTier,
     bootstrap_context: &'static str,
     not_bootstrapped_msg: &'static str,
     post_bootstrap_failure_msg: &'static str,
 ) -> Result<SolveRequest> {
+    let replica_binding = replica_binding.ok_or(ReplicaBuildError::MissingReplicaBinding)?;
     let base_attempts = delta_sync_resync_retry_attempts();
     let base_delay = delta_sync_resync_retry_delay();
     let retry_config = retry_tier.to_config(base_attempts, base_delay);
@@ -1015,7 +1131,7 @@ async fn ensure_replica_then_build(
                     break;
                 }
 
-                match build_solve_request_from_replica(metadata).await {
+                match build_solve_request_from_replica(metadata, replica_binding).await {
                     Ok(Some(request)) => {
                         tracing::debug!(attempt, "replica build succeeded on retry");
                         return Ok(request);
@@ -1037,6 +1153,9 @@ async fn ensure_replica_then_build(
     }
 
     // Bootstrap fallback
+    // Must mark `Resyncing` before bootstrapping so concurrent `/solve`
+    // requests observe a non-Ready replica during the resnapshot window.
+    delta_sync::mark_replica_resyncing().await;
     let bootstrapped = delta_sync::ensure_replica_snapshot_from_env()
         .await
         .context(bootstrap_context)?;
@@ -1044,7 +1163,7 @@ async fn ensure_replica_then_build(
         anyhow::bail!(not_bootstrapped_msg);
     }
 
-    match build_solve_request_from_replica(metadata).await {
+    match build_solve_request_from_replica(metadata, replica_binding).await {
         Ok(Some(request)) => Ok(request),
         Ok(None) => anyhow::bail!(post_bootstrap_failure_msg),
         Err(err) => Err(err.into()),
@@ -1053,56 +1172,59 @@ async fn ensure_replica_then_build(
 
 async fn build_solve_request_from_replica_resilient(
     metadata: &SolveRequestMetadata,
+    replica_binding: Option<&SolveRequestReplicaBinding>,
     body_mode: SolveRequestBodyMode,
 ) -> Result<Option<SolveRequest>> {
-    let first = build_solve_request_from_replica(metadata).await;
+    // Full-body requests already carry the authoritative auction payload. Keep
+    // them bound to the body instead of silently replacing them with the local
+    // replica snapshot.
+    if body_mode == SolveRequestBodyMode::Full {
+        return Ok(None);
+    }
+
+    // If the binding failure circuit is open, refuse to attempt replica-based
+    // construction for thin requests and surface a binding error immediately.
+    if delta_sync::replica_binding_circuit_open() {
+        return Err(ReplicaBuildError::MissingReplicaBinding.into());
+    }
+
+    let Some(replica_binding) = replica_binding else {
+        return Err(ReplicaBuildError::MissingReplicaBinding.into());
+    };
+
+    let first = build_solve_request_from_replica(metadata, replica_binding).await;
     match first {
         Ok(Some(request)) => Ok(Some(request)),
-        Ok(None) => {
-            // Replica not ready is typically transient (syncing/resyncing), so
-            // allow bounded retries in thin mode.
-            if body_mode != SolveRequestBodyMode::Thin {
-                Ok(None)
-            } else {
-                ensure_replica_then_build(
-                    metadata,
-                    ReplicaRetryBackoffTier::Full,
-                    "could not bootstrap delta replica for thin solve request",
-                    "solve request uses thin body mode but delta replica is unavailable and \
-                     DRIVER_DELTA_SYNC_AUTOPILOT_URL is not configured",
-                    "bootstrap succeeded but delta replica returned no snapshot",
-                )
-                .await
-                .map(Some)
-            }
-        }
+        Ok(None) => ensure_replica_then_build(
+            metadata,
+            Some(replica_binding),
+            ReplicaRetryBackoffTier::Full,
+            "could not bootstrap delta replica for thin solve request",
+            "solve request uses thin body mode but delta replica is unavailable and \
+             DRIVER_DELTA_SYNC_AUTOPILOT_URL is not configured",
+            "bootstrap succeeded but delta replica returned no snapshot",
+        )
+        .await
+        .map(Some),
         Err(err) => {
-            // Keep error-path fallback conservative in thin mode.
-            if body_mode != SolveRequestBodyMode::Thin {
-                tracing::warn!(
-                    ?err,
-                    "delta replica unavailable for solve request; fallback to request body"
-                );
-                Ok(None)
-            } else {
-                let retry_tier = err.retry_tier();
-                tracing::warn!(
-                    ?err,
-                    ?retry_tier,
-                    "delta replica build failed for thin solve request; attempting bootstrap"
-                );
+            let retry_tier = err.retry_tier();
+            tracing::warn!(
+                ?err,
+                ?retry_tier,
+                "delta replica build failed for thin solve request; attempting bootstrap"
+            );
 
-                ensure_replica_then_build(
-                    metadata,
-                    retry_tier,
-                    "could not bootstrap delta replica after thin parse failure",
-                    "solve request uses thin body mode but delta replica build failed and \
-                     bootstrap is not configured",
-                    "bootstrap succeeded but delta replica returned no snapshot",
-                )
-                .await
-                .map(Some)
-            }
+            ensure_replica_then_build(
+                metadata,
+                Some(replica_binding),
+                retry_tier,
+                "could not bootstrap delta replica after thin parse failure",
+                "solve request uses thin body mode but delta replica build failed and bootstrap \
+                 is not configured",
+                "bootstrap succeeded but delta replica returned no snapshot",
+            )
+            .await
+            .map(Some)
         }
     }
 }
@@ -1374,8 +1496,14 @@ mod tests {
             deadline: chrono::Utc::now(),
             surplus_capturing_jit_order_owners: Vec::new(),
         };
+        let replica_snapshot = delta_sync::snapshot().await.expect("replica snapshot");
+        let replica_binding = SolveRequestReplicaBinding {
+            sequence: replica_snapshot.sequence,
+            order_uid_hash: replica_snapshot.order_uid_hash,
+            price_hash: replica_snapshot.price_hash,
+        };
 
-        let err = build_solve_request_from_replica(&metadata)
+        let err = build_solve_request_from_replica(&metadata, &replica_binding)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("auction id mismatch"));
@@ -1393,10 +1521,16 @@ mod tests {
             deadline: chrono::Utc::now() - chrono::Duration::milliseconds(1),
             surplus_capturing_jit_order_owners: vec![],
         };
+        let replica_binding = SolveRequestReplicaBinding {
+            sequence: 1,
+            order_uid_hash: "0x01".to_string(),
+            price_hash: "0x02".to_string(),
+        };
 
         let start = Instant::now();
         let result = ensure_replica_then_build(
             &metadata,
+            Some(&replica_binding),
             ReplicaRetryBackoffTier::Full,
             "test bootstrap context",
             "not bootstrapped",
@@ -1420,10 +1554,16 @@ mod tests {
             deadline: chrono::Utc::now() + chrono::Duration::milliseconds(120),
             surplus_capturing_jit_order_owners: vec![],
         };
+        let replica_binding = SolveRequestReplicaBinding {
+            sequence: 1,
+            order_uid_hash: "0x01".to_string(),
+            price_hash: "0x02".to_string(),
+        };
 
         let start = Instant::now();
         let result = ensure_replica_then_build(
             &metadata,
+            Some(&replica_binding),
             ReplicaRetryBackoffTier::Full,
             "test bootstrap context",
             "not bootstrapped",
@@ -1435,5 +1575,123 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(400));
         assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn full_requests_do_not_rebuild_from_ready_replica() {
+        let _guard = DeltaReplicaTestGuard::acquire().await;
+        set_replica_snapshot_for_tests(Snapshot {
+            version: 1,
+            boot_id: None,
+            auction_id: Some(7),
+            sequence: 3,
+            auction: RawAuctionData {
+                orders: vec![serde_json::json!({
+                    "uid": format!("0x{}", "11".repeat(56)),
+                    "sellToken": "0x0000000000000000000000000000000000000001",
+                    "buyToken": "0x0000000000000000000000000000000000000002",
+                    "sellAmount": "1",
+                    "buyAmount": "1",
+                    "protocolFees": [],
+                    "created": 1,
+                    "validTo": 100,
+                    "kind": "sell",
+                    "receiver": null,
+                    "owner": "0x0000000000000000000000000000000000000003",
+                    "partiallyFillable": false,
+                    "executed": "0",
+                    "preInteractions": [],
+                    "postInteractions": [],
+                    "class": "market",
+                    "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "signingScheme": "eip712",
+                    "signature": "0x00",
+                    "quote": null
+                })],
+                prices: HashMap::new(),
+            },
+        })
+        .await;
+
+        let metadata = SolveRequestMetadata {
+            id: 7,
+            tokens: vec![],
+            deadline: chrono::Utc::now(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        let replica_snapshot = delta_sync::snapshot().await.expect("replica snapshot");
+        let replica_binding = SolveRequestReplicaBinding {
+            sequence: replica_snapshot.sequence,
+            order_uid_hash: replica_snapshot.order_uid_hash,
+            price_hash: replica_snapshot.price_hash,
+        };
+
+        let request = build_solve_request_from_replica_resilient(
+            &metadata,
+            Some(&replica_binding),
+            SolveRequestBodyMode::Full,
+        )
+        .await
+        .unwrap();
+        assert!(request.is_none());
+    }
+
+    #[tokio::test]
+    async fn thin_requests_rebuild_from_ready_replica() {
+        let _guard = DeltaReplicaTestGuard::acquire().await;
+        set_replica_snapshot_for_tests(Snapshot {
+            version: 1,
+            boot_id: None,
+            auction_id: Some(8),
+            sequence: 4,
+            auction: RawAuctionData {
+                orders: vec![serde_json::json!({
+                    "uid": format!("0x{}", "22".repeat(56)),
+                    "sellToken": "0x0000000000000000000000000000000000000001",
+                    "buyToken": "0x0000000000000000000000000000000000000002",
+                    "sellAmount": "1",
+                    "buyAmount": "1",
+                    "protocolFees": [],
+                    "created": 1,
+                    "validTo": 100,
+                    "kind": "sell",
+                    "receiver": null,
+                    "owner": "0x0000000000000000000000000000000000000003",
+                    "partiallyFillable": false,
+                    "executed": "0",
+                    "preInteractions": [],
+                    "postInteractions": [],
+                    "class": "market",
+                    "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "signingScheme": "eip712",
+                    "signature": "0x00",
+                    "quote": null
+                })],
+                prices: HashMap::new(),
+            },
+        })
+        .await;
+
+        let metadata = SolveRequestMetadata {
+            id: 8,
+            tokens: vec![],
+            deadline: chrono::Utc::now(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        let replica_snapshot = delta_sync::snapshot().await.expect("replica snapshot");
+        let replica_binding = SolveRequestReplicaBinding {
+            sequence: replica_snapshot.sequence,
+            order_uid_hash: replica_snapshot.order_uid_hash,
+            price_hash: replica_snapshot.price_hash,
+        };
+
+        let request = build_solve_request_from_replica_resilient(
+            &metadata,
+            Some(&replica_binding),
+            SolveRequestBodyMode::Thin,
+        )
+        .await
+        .unwrap();
+        assert!(request.is_some());
     }
 }

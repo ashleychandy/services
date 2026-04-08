@@ -188,29 +188,19 @@ impl RunLoop {
             self.solve_deadline,
             self.compress_solve_request,
             solve::SolveRequestBodyMode::Full,
+            None,
         )
         .await;
-        let thin_request = if self
+        let thin_request: Option<solve::Request> = None;
+        if self
             .drivers
             .iter()
             .any(|driver| driver.supports_thin_solve_request)
         {
-            let start = std::time::Instant::now();
-            let request = solve::Request::new(
-                auction,
-                &self.trusted_tokens.all(),
-                self.solve_deadline,
-                self.compress_solve_request,
-                solve::SolveRequestBodyMode::Thin,
-            )
-            .await;
-            Metrics::get()
-                .thin_request_serialization_time
-                .observe(start.elapsed().as_secs_f64());
-            Some(request)
-        } else {
-            None
-        };
+            tracing::debug!(
+                "shadow mode does not provide delta replica bindings; using full solve requests"
+            );
+        }
 
         futures::future::join_all(self.drivers.iter().map(|driver| {
             let request = if driver.supports_thin_solve_request {

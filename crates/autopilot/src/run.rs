@@ -504,6 +504,8 @@ pub async fn run(config: Configuration, shutdown_controller: ShutdownController)
     let liveness = Arc::new(Liveness::new(config.max_auction_age));
     let startup = Arc::new(Some(AtomicBool::new(false)));
 
+    infra::api::set_delta_sync_serving_enabled(!config.run_loop.enable_leader_lock);
+
     let (api_shutdown_sender, api_shutdown_receiver) = tokio::sync::oneshot::channel();
     let api_task = tokio::spawn(infra::api::serve(
         config.api_address,
