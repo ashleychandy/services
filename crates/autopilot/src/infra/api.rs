@@ -230,6 +230,7 @@ struct DeltaChecksumResponse {
     sequence: u64,
     order_uid_hash: String,
     price_hash: String,
+    order_content_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -804,6 +805,7 @@ async fn get_delta_checksum(headers: HeaderMap, AxumState(state): AxumState<Stat
         sequence: checksum.sequence,
         order_uid_hash: checksum.order_uid_hash,
         price_hash: checksum.price_hash,
+        order_content_hash: checksum.order_content_hash,
     })
     .into_response()
 }
@@ -2372,6 +2374,7 @@ mod tests {
         assert_eq!(checksum.sequence, 10);
         assert!(!checksum.order_uid_hash.is_empty());
         assert!(!checksum.price_hash.is_empty());
+        assert!(!checksum.order_content_hash.is_empty());
     }
 
     #[test]

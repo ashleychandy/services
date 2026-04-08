@@ -328,6 +328,7 @@ pub struct DeltaChecksum {
     pub sequence: u64,
     pub order_uid_hash: String,
     pub price_hash: String,
+    pub order_content_hash: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -534,6 +535,7 @@ impl SolvableOrdersCache {
             sequence: inner.delta_sequence,
             order_uid_hash: checksum_order_uids(&inner.auction.orders),
             price_hash: checksum_prices(&inner.auction.prices),
+            order_content_hash: checksum_order_contents(&inner.auction.orders),
         })
     }
 
@@ -2249,6 +2251,24 @@ fn checksum_prices(prices: &domain::auction::Prices) -> String {
     for (token, price) in entries {
         hasher.update(token.as_slice());
         hasher.update(price.get().0.to_string().as_bytes());
+    }
+    format!("0x{}", const_hex::encode(hasher.finalize()))
+}
+
+fn checksum_order_contents(orders: &[domain::Order]) -> String {
+    // Serialize domain orders into persistence DTOs (stable field order)
+    // and hash the resulting JSON blobs deterministically.
+    let mut serialized: Vec<Vec<u8>> = orders
+        .iter()
+        .map(|o| crate::infra::persistence::dto::order::from_domain(o.clone()))
+        .map(|dto| serde_json::to_vec(&dto).expect("order DTO serializable"))
+        .collect();
+
+    serialized.sort();
+
+    let mut hasher = Sha256::new();
+    for bytes in serialized {
+        hasher.update(&bytes);
     }
     format!("0x{}", const_hex::encode(hasher.finalize()))
 }

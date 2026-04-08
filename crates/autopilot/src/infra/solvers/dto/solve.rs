@@ -40,6 +40,7 @@ pub struct Request {
     replica_sequence_header: Option<String>,
     order_uid_hash_header: Option<String>,
     price_hash_header: Option<String>,
+    order_content_hash_header: Option<String>,
     body_mode_header: &'static str,
 }
 
@@ -54,6 +55,7 @@ pub struct ReplicaBinding {
     pub sequence: u64,
     pub order_uid_hash: String,
     pub price_hash: String,
+    pub order_content_hash: String,
 }
 
 impl Request {
@@ -126,14 +128,20 @@ impl Request {
         } else {
             None
         };
-        let (replica_sequence_header, order_uid_hash_header, price_hash_header) = if thin_body {
+        let (
+            replica_sequence_header,
+            order_uid_hash_header,
+            price_hash_header,
+            order_content_hash_header,
+        ) = if thin_body {
             (
                 replica_binding.map(|binding| binding.sequence.to_string()),
                 replica_binding.map(|binding| binding.order_uid_hash.clone()),
                 replica_binding.map(|binding| binding.price_hash.clone()),
+                replica_binding.map(|binding| binding.order_content_hash.clone()),
             )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
         let body_mode_header = if thin_body { "thin" } else { "full" };
 
@@ -236,6 +244,11 @@ impl InjectIntoHttpRequest for Request {
         };
         let request = if let Some(price_hash) = &self.price_hash_header {
             request.header("X-Auction-Price-Hash", price_hash)
+        } else {
+            request
+        };
+        let request = if let Some(order_content_hash) = &self.order_content_hash_header {
+            request.header("X-Auction-Order-Content-Hash", order_content_hash)
         } else {
             request
         };
@@ -420,6 +433,7 @@ mod tests {
             replica_sequence_header: None,
             order_uid_hash_header: None,
             price_hash_header: None,
+            order_content_hash_header: None,
             body_mode_header: "full",
         }
     }
@@ -441,6 +455,7 @@ mod tests {
             replica_sequence_header: None,
             order_uid_hash_header: None,
             price_hash_header: None,
+            order_content_hash_header: None,
             body_mode_header: "full",
         }
     }
@@ -462,6 +477,7 @@ mod tests {
             sequence: 7,
             order_uid_hash: "0xaaaa".to_string(),
             price_hash: "0xbbbb".to_string(),
+            order_content_hash: "0xcccc".to_string(),
         };
 
         let request = Request::new(
@@ -510,6 +526,12 @@ mod tests {
                 .get("X-Auction-Price-Hash")
                 .and_then(|value| value.to_str().ok()),
             Some("0xbbbb")
+        );
+        assert_eq!(
+            headers
+                .get("X-Auction-Order-Content-Hash")
+                .and_then(|value| value.to_str().ok()),
+            Some("0xcccc")
         );
         let body_mode = headers
             .get("X-Auction-Body-Mode")

@@ -14,7 +14,7 @@ use {
         infra::{Ethereum, tokens},
     },
     eth_domain_types as eth,
-    serde::Deserialize,
+    serde::{Deserialize, Serialize},
     serde_with::serde_as,
     std::{
         collections::{HashMap, HashSet},
@@ -275,7 +275,7 @@ struct Token {
 }
 
 #[serde_as]
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Order {
     #[serde_as(as = "serde_ext::Hex")]
@@ -311,7 +311,7 @@ pub struct Order {
     quote: Option<Quote>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum Kind {
     Sell,
@@ -319,7 +319,7 @@ enum Kind {
 }
 
 #[serde_as]
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Interaction {
     target: eth::Address,
@@ -329,7 +329,7 @@ struct Interaction {
     call_data: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum SellTokenBalance {
     #[default]
@@ -338,7 +338,7 @@ enum SellTokenBalance {
     External,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum BuyTokenBalance {
     #[default]
@@ -346,7 +346,7 @@ enum BuyTokenBalance {
     Internal,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum SigningScheme {
     Eip712,
@@ -355,16 +355,16 @@ enum SigningScheme {
     Eip1271,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum Class {
     Market,
     Limit,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-enum FeePolicy {
+pub enum FeePolicy {
     #[serde(rename_all = "camelCase")]
     Surplus { factor: f64, max_volume_factor: f64 },
     #[serde(rename_all = "camelCase")]
@@ -378,7 +378,7 @@ enum FeePolicy {
 }
 
 #[serde_as]
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Quote {
     #[serde_as(as = "serde_ext::U256")]

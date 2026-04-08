@@ -154,6 +154,7 @@ pub(crate) struct ReplicaSnapshot {
     pub(crate) sequence: u64,
     pub(crate) order_uid_hash: String,
     pub(crate) price_hash: String,
+    pub(crate) order_content_hash: String,
     pub(crate) orders: Vec<crate::infra::api::routes::solve::dto::solve_request::Order>,
     pub(crate) prices: HashMap<alloy::primitives::Address, String>,
 }
@@ -181,9 +182,11 @@ struct DeltaStreamGonePayload {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeltaChecksumResponse {
+    version: u32,
     sequence: u64,
     order_uid_hash: String,
     price_hash: String,
+    order_content_hash: String,
 }
 
 /// Starts a background delta-sync task if DRIVER_DELTA_SYNC_AUTOPILOT_URL is
@@ -351,6 +354,7 @@ fn snapshot_from_replica(replica: &Replica) -> Option<ReplicaSnapshot> {
         sequence: replica.sequence(),
         order_uid_hash: checksum.order_uid_hash,
         price_hash: checksum.price_hash,
+        order_content_hash: checksum.order_content_hash,
         orders: replica.orders().values().cloned().collect(),
         prices: replica.prices().clone(),
     })
@@ -895,8 +899,24 @@ async fn compare_replica_checksum(
     let response = response.error_for_status()?;
     let remote = response.json::<DeltaChecksumResponse>().await?;
 
+    // Check sequence first: even when the checksum/hash values match, a
+    // differing sequence indicates the local replica is stale (e.g. the
+    // autopilot advanced sequence during a stream stall). Treat any
+    // sequence mismatch as divergence and request a resnapshot.
+    if local_checksum.sequence != remote.sequence {
+        metrics::get().delta_replica_diverged_total.inc();
+        tracing::warn!(
+            local_sequence = local_checksum.sequence,
+            remote_sequence = remote.sequence,
+            "delta replica sequence mismatch; resnapshot required"
+        );
+        return Ok(false);
+    }
+
+    // If sequences match, fall back to the content hashes check.
     if local_checksum.order_uid_hash != remote.order_uid_hash
         || local_checksum.price_hash != remote.price_hash
+        || local_checksum.order_content_hash != remote.order_content_hash
     {
         metrics::get().delta_replica_diverged_total.inc();
         tracing::warn!(

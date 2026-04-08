@@ -814,6 +814,7 @@ struct SolveRequestReplicaBinding {
     sequence: u64,
     order_uid_hash: String,
     price_hash: String,
+    order_content_hash: String,
 }
 
 impl From<&crate::infra::api::routes::solve::dto::SolveRequest> for SolveRequestMetadata {
@@ -916,8 +917,13 @@ fn parse_solve_request_replica_binding_from_headers(
     let sequence_header = headers.get("X-Auction-Replica-Sequence");
     let order_uid_hash_header = headers.get("X-Auction-Order-Uid-Hash");
     let price_hash_header = headers.get("X-Auction-Price-Hash");
+    let order_content_hash_header = headers.get("X-Auction-Order-Content-Hash");
 
-    if sequence_header.is_none() && order_uid_hash_header.is_none() && price_hash_header.is_none() {
+    if sequence_header.is_none()
+        && order_uid_hash_header.is_none()
+        && price_hash_header.is_none()
+        && order_content_hash_header.is_none()
+    {
         return Ok(None);
     }
 
@@ -937,11 +943,16 @@ fn parse_solve_request_replica_binding_from_headers(
         .to_str()
         .context("X-Auction-Price-Hash header is not valid ASCII")?
         .to_string();
+    let order_content_hash = order_content_hash_header
+        .map(|v| v.to_str().ok().map(|s| s.to_string()))
+        .flatten()
+        .unwrap_or_default();
 
     Ok(Some(SolveRequestReplicaBinding {
         sequence,
         order_uid_hash,
         price_hash,
+        order_content_hash,
     }))
 }
 
@@ -1012,21 +1023,24 @@ async fn build_solve_request_from_replica(
         });
     }
     if snapshot.sequence != replica_binding.sequence {
-        // Sequence mismatches indicate the replica is stale; record a binding
-        // failure so the circuit-breaker can trip on repeated occurrences.
-        delta_sync::record_binding_failure();
-        metrics::get().thin_solve_replica_fallbacks.inc();
+        // Sequence mismatches indicate the replica is stale; do not record a
+        // binding failure here — allow the resilient caller to attempt a
+        // bootstrap resnapshot first so transient mismatches can self-heal.
         return Err(ReplicaBuildError::SequenceMismatch {
             replica: snapshot.sequence,
             request: replica_binding.sequence,
         });
     }
+    let content_mismatch = !replica_binding.order_content_hash.is_empty()
+        && snapshot.order_content_hash != replica_binding.order_content_hash;
+
     if snapshot.order_uid_hash != replica_binding.order_uid_hash
         || snapshot.price_hash != replica_binding.price_hash
+        || content_mismatch
     {
-        // Checksum mismatches are also binding failures.
-        delta_sync::record_binding_failure();
-        metrics::get().thin_solve_replica_fallbacks.inc();
+        // Checksum mismatches are handled by the resilient caller which will
+        // attempt a bootstrap resnapshot; do not record a binding failure
+        // here to avoid tripping the circuit on transient divergences.
         return Err(ReplicaBuildError::ChecksumMismatch);
     }
 
@@ -1182,10 +1196,22 @@ async fn build_solve_request_from_replica_resilient(
         return Ok(None);
     }
 
-    // If the binding failure circuit is open, refuse to attempt replica-based
-    // construction for thin requests and surface a binding error immediately.
+    // If the binding failure circuit is open, attempt a bootstrap resnapshot
+    // instead of immediately refusing the request. This avoids persistent
+    // cooldown windows preventing self-healing for transient mismatches.
     if delta_sync::replica_binding_circuit_open() {
-        return Err(ReplicaBuildError::MissingReplicaBinding.into());
+        tracing::warn!("replica binding circuit open; attempting bootstrap for thin request");
+        return ensure_replica_then_build(
+            metadata,
+            replica_binding,
+            ReplicaRetryBackoffTier::Full,
+            "delta replica circuit open; attempting bootstrap for thin solve request",
+            "solve request uses thin body mode but delta replica is unavailable and \
+             DRIVER_DELTA_SYNC_AUTOPILOT_URL is not configured",
+            "bootstrap succeeded but delta replica returned no snapshot",
+        )
+        .await
+        .map(Some);
     }
 
     let Some(replica_binding) = replica_binding else {
@@ -1195,7 +1221,7 @@ async fn build_solve_request_from_replica_resilient(
     let first = build_solve_request_from_replica(metadata, replica_binding).await;
     match first {
         Ok(Some(request)) => Ok(Some(request)),
-        Ok(None) => ensure_replica_then_build(
+        Ok(None) => match ensure_replica_then_build(
             metadata,
             Some(replica_binding),
             ReplicaRetryBackoffTier::Full,
@@ -1205,7 +1231,16 @@ async fn build_solve_request_from_replica_resilient(
             "bootstrap succeeded but delta replica returned no snapshot",
         )
         .await
-        .map(Some),
+        {
+            Ok(request) => Ok(Some(request)),
+            Err(err) => {
+                // Bootstrap failed: record a binding failure now that recovery
+                // was attempted.
+                delta_sync::record_binding_failure();
+                metrics::get().thin_solve_replica_fallbacks.inc();
+                Err(err)
+            }
+        },
         Err(err) => {
             let retry_tier = err.retry_tier();
             tracing::warn!(
@@ -1214,7 +1249,7 @@ async fn build_solve_request_from_replica_resilient(
                 "delta replica build failed for thin solve request; attempting bootstrap"
             );
 
-            ensure_replica_then_build(
+            match ensure_replica_then_build(
                 metadata,
                 Some(replica_binding),
                 retry_tier,
@@ -1224,7 +1259,14 @@ async fn build_solve_request_from_replica_resilient(
                 "bootstrap succeeded but delta replica returned no snapshot",
             )
             .await
-            .map(Some)
+            {
+                Ok(request) => Ok(Some(request)),
+                Err(err) => {
+                    delta_sync::record_binding_failure();
+                    metrics::get().thin_solve_replica_fallbacks.inc();
+                    Err(err)
+                }
+            }
         }
     }
 }
@@ -1501,6 +1543,7 @@ mod tests {
             sequence: replica_snapshot.sequence,
             order_uid_hash: replica_snapshot.order_uid_hash,
             price_hash: replica_snapshot.price_hash,
+            order_content_hash: replica_snapshot.order_content_hash,
         };
 
         let err = build_solve_request_from_replica(&metadata, &replica_binding)
@@ -1525,6 +1568,7 @@ mod tests {
             sequence: 1,
             order_uid_hash: "0x01".to_string(),
             price_hash: "0x02".to_string(),
+            order_content_hash: String::new(),
         };
 
         let start = Instant::now();
@@ -1558,6 +1602,7 @@ mod tests {
             sequence: 1,
             order_uid_hash: "0x01".to_string(),
             price_hash: "0x02".to_string(),
+            order_content_hash: String::new(),
         };
 
         let start = Instant::now();
@@ -1624,6 +1669,7 @@ mod tests {
             sequence: replica_snapshot.sequence,
             order_uid_hash: replica_snapshot.order_uid_hash,
             price_hash: replica_snapshot.price_hash,
+            order_content_hash: replica_snapshot.order_content_hash,
         };
 
         let request = build_solve_request_from_replica_resilient(
@@ -1683,6 +1729,7 @@ mod tests {
             sequence: replica_snapshot.sequence,
             order_uid_hash: replica_snapshot.order_uid_hash,
             price_hash: replica_snapshot.price_hash,
+            order_content_hash: replica_snapshot.order_content_hash,
         };
 
         let request = build_solve_request_from_replica_resilient(

@@ -107,6 +107,7 @@ pub struct Replica {
     sequence: u64,
     auction_id: u64,
     orders: HashMap<String, ReplicaOrder>,
+    orders_raw: HashMap<String, Value>,
     order_uid_bytes: HashMap<String, [u8; 56]>,
     prices: HashMap<Address, String>,
     state: ReplicaState,
@@ -118,6 +119,7 @@ pub struct ReplicaChecksum {
     pub sequence: u64,
     pub order_uid_hash: String,
     pub price_hash: String,
+    pub order_content_hash: String,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -135,6 +137,7 @@ impl Default for Replica {
             sequence: 0,
             auction_id: 0,
             orders: HashMap::new(),
+            orders_raw: HashMap::new(),
             order_uid_bytes: HashMap::new(),
             prices: HashMap::new(),
             state: ReplicaState::Uninitialized,
@@ -171,10 +174,12 @@ impl Replica {
     pub fn checksum(&self) -> Option<ReplicaChecksum> {
         let order_uid_hash = Self::checksum_order_uids(&self.order_uid_bytes);
         let price_hash = Self::checksum_prices(&self.prices).ok()?;
+        let order_content_hash = Self::checksum_order_contents_raw(&self.orders_raw);
         Some(ReplicaChecksum {
             sequence: self.sequence,
             order_uid_hash,
             price_hash,
+            order_content_hash,
         })
     }
 
@@ -189,13 +194,15 @@ impl Replica {
             validate_price_string(*token, price)?;
         }
         let mut new_orders = HashMap::with_capacity(snapshot.auction.orders.len());
+        let mut new_orders_raw = HashMap::with_capacity(snapshot.auction.orders.len());
         let mut new_order_uid_bytes = HashMap::with_capacity(snapshot.auction.orders.len());
         for order in snapshot.auction.orders {
             let uid = order_uid(&order)?;
             let uid_bytes = decode_order_uid_bytes(&uid)?;
-            let order = Self::parse_order(&order)?;
+            let parsed = Self::parse_order(&order)?;
             new_order_uid_bytes.insert(uid.clone(), uid_bytes);
-            new_orders.insert(uid, order);
+            new_orders.insert(uid.clone(), parsed);
+            new_orders_raw.insert(uid, order);
         }
         let new_prices = snapshot.auction.prices;
         let new_sequence = snapshot.sequence;
@@ -205,6 +212,7 @@ impl Replica {
         self.sequence = new_sequence;
         self.auction_id = auction_id;
         self.orders = new_orders;
+        self.orders_raw = new_orders_raw;
         self.order_uid_bytes = new_order_uid_bytes;
         self.prices = new_prices;
         self.state = ReplicaState::Ready;
@@ -255,6 +263,7 @@ impl Replica {
                 uid: String,
                 uid_bytes: [u8; 56],
                 order: ReplicaOrder,
+                raw: Option<Value>,
             },
             RemoveOrder {
                 uid: String,
@@ -274,11 +283,12 @@ impl Replica {
                 Event::OrderAdded { order } | Event::OrderUpdated { order } => {
                     let uid = order_uid(&order)?;
                     let uid_bytes = decode_order_uid_bytes(&uid)?;
-                    let order = Self::parse_order(&order)?;
+                    let parsed = Self::parse_order(&order)?;
                     mutations.push(Mutation::UpsertOrder {
                         uid,
                         uid_bytes,
-                        order,
+                        order: parsed,
+                        raw: Some(order),
                     });
                 }
                 Event::OrderRemoved { uid } => {
@@ -311,12 +321,17 @@ impl Replica {
                     uid,
                     uid_bytes,
                     order,
+                    raw,
                 } => {
                     self.order_uid_bytes.insert(uid.clone(), uid_bytes);
-                    self.orders.insert(uid, order);
+                    self.orders.insert(uid.clone(), order);
+                    if let Some(value) = raw {
+                        self.orders_raw.insert(uid, value);
+                    }
                 }
                 Mutation::RemoveOrder { uid } => {
                     self.order_uid_bytes.remove(&uid);
+                    self.orders_raw.remove(&uid);
                     if self.orders.remove(&uid).is_none() {
                         metrics::get()
                             .delta_replica_unknown_order_removals_total
@@ -385,6 +400,18 @@ impl Replica {
             hasher.update(canonical.as_bytes());
         }
         Ok(format!("0x{}", const_hex::encode(hasher.finalize())))
+    }
+
+    fn checksum_order_contents_raw(orders_raw: &HashMap<String, Value>) -> String {
+        let mut entries = orders_raw.iter().collect::<Vec<_>>();
+        entries.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+
+        let mut hasher = Sha256::new();
+        for (_, order_val) in entries {
+            let bytes = serde_json::to_vec(order_val).expect("order JSON serializable");
+            hasher.update(&bytes);
+        }
+        format!("0x{}", const_hex::encode(hasher.finalize()))
     }
 
     fn parse_order(order: &Value) -> Result<ReplicaOrder, Error> {

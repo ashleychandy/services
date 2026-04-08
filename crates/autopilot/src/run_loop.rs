@@ -661,6 +661,7 @@ impl RunLoop {
                     sequence: checksum.sequence,
                     order_uid_hash: checksum.order_uid_hash,
                     price_hash: checksum.price_hash,
+                    order_content_hash: checksum.order_content_hash,
                 })
         } else {
             None
@@ -1371,6 +1372,7 @@ mod tests {
                 sequence: 1,
                 order_uid_hash: "0x01".to_string(),
                 price_hash: "0x02".to_string(),
+                order_content_hash: "0x03".to_string(),
             }),
         )
         .await;
@@ -1413,6 +1415,7 @@ mod tests {
                 sequence: 1,
                 order_uid_hash: "0x01".to_string(),
                 price_hash: "0x02".to_string(),
+                order_content_hash: "0x03".to_string(),
             }),
         )
         .await;
