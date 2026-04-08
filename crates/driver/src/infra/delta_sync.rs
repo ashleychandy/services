@@ -192,22 +192,34 @@ pub fn reset_delta_replica_for_tests() {
 
 #[cfg(any(test, feature = "test-helpers"))]
 fn reset_delta_replica_in_place(replica: Arc<RwLock<Replica>>) {
-    match tokio::runtime::Handle::current().runtime_flavor() {
-        tokio::runtime::RuntimeFlavor::CurrentThread => {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::CurrentThread => {
+                std::thread::spawn(move || {
+                    let mut lock = replica.blocking_write();
+                    *lock = Replica::default();
+                })
+                .join()
+                .expect("failed to join delta replica reset thread");
+            }
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(move || {
+                    let mut lock = replica.blocking_write();
+                    *lock = Replica::default();
+                });
+            }
+            _ => panic!("unsupported runtime flavor"),
+        },
+        Err(_) => {
+            // No current Tokio runtime: perform the blocking write on a new
+            // thread to avoid attempting to access a non-existent reactor.
             std::thread::spawn(move || {
                 let mut lock = replica.blocking_write();
                 *lock = Replica::default();
             })
             .join()
-            .expect("failed to join delta replica reset thread");
+            .expect("failed to join delta replica reset thread (no runtime)");
         }
-        tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(move || {
-                let mut lock = replica.blocking_write();
-                *lock = Replica::default();
-            });
-        }
-        _ => panic!("unsupported runtime flavor"),
     }
 }
 
