@@ -16,8 +16,14 @@ use {
     serde::{Deserialize, Serialize},
     std::{
         collections::HashMap,
-        sync::{Arc, LazyLock, OnceLock, RwLock as StdRwLock, atomic::AtomicU32},
-        time::{Duration, Instant},
+        sync::{
+            Arc,
+            LazyLock,
+            OnceLock,
+            RwLock as StdRwLock,
+            atomic::{AtomicU32, AtomicU64},
+        },
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
     tokio::sync::{Mutex, RwLock},
 };
@@ -72,17 +78,74 @@ pub static REPLICA_PREPROCESSING_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 static CONSECUTIVE_BINDING_FAILURES: AtomicU32 = AtomicU32::new(0);
 const BINDING_FAILURE_CIRCUIT_BREAKER: u32 = 3;
 
+// Timestamp (epoch seconds) when the circuit breaker most recently opened.
+// 0 means "not set".
+static LAST_BINDING_FAILURE_AT: AtomicU64 = AtomicU64::new(0);
+
+// Cooldown period (seconds) after which the circuit will be allowed to
+// transition back to closed automatically. Can be configured via
+// `DRIVER_DELTA_SYNC_BINDING_FAILURE_COOLDOWN_SECS`.
+static BINDING_FAILURE_COOLDOWN_SECS: OnceLock<u64> = OnceLock::new();
+
+fn binding_failure_cooldown_secs() -> u64 {
+    *BINDING_FAILURE_COOLDOWN_SECS.get_or_init(|| {
+        std::env::var("DRIVER_DELTA_SYNC_BINDING_FAILURE_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60)
+    })
+}
+
 pub fn record_binding_failure() {
-    CONSECUTIVE_BINDING_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Release);
+    use std::sync::atomic::Ordering;
+
+    let prev = CONSECUTIVE_BINDING_FAILURES.fetch_add(1, Ordering::Release);
+    let new = prev.saturating_add(1);
+    if new >= BINDING_FAILURE_CIRCUIT_BREAKER {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        LAST_BINDING_FAILURE_AT.store(now, Ordering::Release);
+    }
 }
 
 pub fn record_binding_success() {
-    CONSECUTIVE_BINDING_FAILURES.store(0, std::sync::atomic::Ordering::Release);
+    use std::sync::atomic::Ordering;
+
+    CONSECUTIVE_BINDING_FAILURES.store(0, Ordering::Release);
+    LAST_BINDING_FAILURE_AT.store(0, Ordering::Release);
 }
 
 pub fn replica_binding_circuit_open() -> bool {
-    CONSECUTIVE_BINDING_FAILURES.load(std::sync::atomic::Ordering::Acquire)
-        >= BINDING_FAILURE_CIRCUIT_BREAKER
+    use std::sync::atomic::Ordering;
+
+    let count = CONSECUTIVE_BINDING_FAILURES.load(Ordering::Acquire);
+    if count < BINDING_FAILURE_CIRCUIT_BREAKER {
+        return false;
+    }
+
+    let last = LAST_BINDING_FAILURE_AT.load(Ordering::Acquire);
+    if last == 0 {
+        // No timestamp set; treat as open until we can set a timestamp.
+        return true;
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cooldown = binding_failure_cooldown_secs();
+
+    if now.saturating_sub(last) >= cooldown {
+        // Cooldown expired: reset the circuit so we can attempt bootstrap
+        // again.
+        CONSECUTIVE_BINDING_FAILURES.store(0, Ordering::Release);
+        LAST_BINDING_FAILURE_AT.store(0, Ordering::Release);
+        return false;
+    }
+
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -163,15 +226,25 @@ pub fn maybe_spawn_from_env() -> Option<tokio::task::JoinHandle<()>> {
 
     let base = delta_sync_base_url_from_env()?;
 
-    let client = reqwest::Client::builder()
+    // Create two separate reqwest clients: one with a short timeout for
+    // snapshot/bootstrap HTTP requests, and one without a global timeout for
+    // the long-lived SSE stream. Reusing a client with a total timeout for
+    // the stream caused healthy SSE connections to be torn down every
+    // timeout interval.
+    let snapshot_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .expect("failed to create reqwest client for delta sync");
+        .expect("failed to create reqwest client for delta sync snapshot");
+
+    let stream_client = reqwest::Client::builder()
+        // Intentionally do not set a global timeout for the SSE stream.
+        .build()
+        .expect("failed to create reqwest client for delta sync stream");
 
     let replica = delta_replica();
 
     Some(tokio::spawn(async move {
-        match run(client, base, replica).await {
+        match run(snapshot_client, stream_client, base, replica).await {
             Ok(()) => tracing::warn!("delta sync task exited without error"),
             Err(err) => tracing::error!(?err, "delta sync task exited"),
         }
@@ -473,7 +546,8 @@ pub fn set_replica_preprocessing_override(value: Option<bool>) {
 }
 
 async fn run(
-    client: reqwest::Client,
+    snapshot_client: reqwest::Client,
+    stream_client: reqwest::Client,
     base_url: Url,
     replica: Arc<RwLock<Replica>>,
 ) -> anyhow::Result<()> {
@@ -483,7 +557,7 @@ async fn run(
             lock.set_state(ReplicaState::Syncing);
         }
         // Fetch snapshot and capture session boot_id for validation of live envelopes.
-        let session_boot_id = match fetch_snapshot(&client, &base_url).await {
+        let session_boot_id = match fetch_snapshot(&snapshot_client, &base_url).await {
             Ok(snapshot) => {
                 let boot_id = snapshot.boot_id.clone();
                 let applied = {
@@ -518,7 +592,7 @@ async fn run(
         let snapshot_started_at = Instant::now();
         loop {
             match follow_stream(
-                &client,
+                &stream_client,
                 &base_url,
                 &replica,
                 snapshot_started_at,

@@ -100,20 +100,32 @@ impl Request {
         };
         let auction_id = auction.id;
         let deadline_header = Some(helper.deadline.to_rfc3339());
-        let tokens_header = Some(
-            helper
-                .tokens
-                .iter()
-                .map(|token| format!("{}:{}", token.address, u8::from(token.trusted)))
-                .join(","),
-        );
-        let jit_owners_header = Some(
-            helper
-                .surplus_capturing_jit_order_owners
-                .iter()
-                .map(ToString::to_string)
-                .join(","),
-        );
+        // Only serialize these headers for thin-body requests. Full requests
+        // already carry the authoritative tokens/orders payload in the body
+        // and don't need the duplicated large headers which can exceed common
+        // header size limits.
+        let tokens_header = if thin_body {
+            Some(
+                helper
+                    .tokens
+                    .iter()
+                    .map(|token| format!("{}:{}", token.address, u8::from(token.trusted)))
+                    .join(","),
+            )
+        } else {
+            None
+        };
+        let jit_owners_header = if thin_body {
+            Some(
+                helper
+                    .surplus_capturing_jit_order_owners
+                    .iter()
+                    .map(ToString::to_string)
+                    .join(","),
+            )
+        } else {
+            None
+        };
         let (replica_sequence_header, order_uid_hash_header, price_hash_header) = if thin_body {
             (
                 replica_binding.map(|binding| binding.sequence.to_string()),
@@ -477,6 +489,8 @@ mod tests {
             .unwrap();
         let headers = built.headers();
         assert!(headers.get("X-Auction-Deadline").is_some());
+        // For thin requests we include tokens and jit-owner metadata as
+        // headers so a solver can reconstruct the request without the body.
         assert!(headers.get("X-Auction-Tokens").is_some());
         assert!(headers.get("X-Auction-Jit-Order-Owners").is_some());
         assert_eq!(
@@ -538,8 +552,10 @@ mod tests {
             .unwrap();
         let headers = built.headers();
         assert!(headers.get("X-Auction-Deadline").is_some());
-        assert!(headers.get("X-Auction-Tokens").is_some());
-        assert!(headers.get("X-Auction-Jit-Order-Owners").is_some());
+        // For full requests the tokens and jit-owner metadata are present
+        // in the body (not duplicated as headers) to avoid oversized headers.
+        assert!(headers.get("X-Auction-Tokens").is_none());
+        assert!(headers.get("X-Auction-Jit-Order-Owners").is_none());
         assert!(headers.get("X-Auction-Replica-Sequence").is_none());
         assert!(headers.get("X-Auction-Order-Uid-Hash").is_none());
         assert!(headers.get("X-Auction-Price-Hash").is_none());
