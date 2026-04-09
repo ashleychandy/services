@@ -1065,10 +1065,8 @@ async fn build_solve_request_from_replica(
             request: request_auction_id,
         });
     }
-    if snapshot.sequence != replica_binding.sequence {
-        // Sequence mismatches indicate the replica is stale; do not record a
-        // binding failure here — allow the resilient caller to attempt a
-        // bootstrap resnapshot first so transient mismatches can self-heal.
+
+    if snapshot.sequence < replica_binding.sequence {
         return Err(ReplicaBuildError::SequenceMismatch {
             replica: snapshot.sequence,
             request: replica_binding.sequence,
@@ -1128,7 +1126,7 @@ mod replica_binding_tests {
         super::*,
         crate::{
             domain::competition::delta_replica::{RawAuctionData, Snapshot as DeltaSnapshot},
-            infra::delta_sync,
+            infra::{delta_sync, delta_sync::DeltaReplicaTestGuard},
         },
         serde_json::json,
         std::collections::HashMap,
@@ -1137,6 +1135,7 @@ mod replica_binding_tests {
     #[tokio::test]
     async fn accepts_when_checksums_match() {
         // Prepare a minimal order JSON matching the solver DTO shape.
+        let _guard = DeltaReplicaTestGuard::acquire().await;
         let uid = format!("0x{}", hex::encode([1u8; 56]));
         let order_val = json!({
             "uid": uid,
@@ -1201,6 +1200,7 @@ mod replica_binding_tests {
 
     #[tokio::test]
     async fn rejects_when_nonempty_content_hash_mismatches() {
+        let _guard = DeltaReplicaTestGuard::acquire().await;
         let uid = format!("0x{}", hex::encode([2u8; 56]));
         let order_val = json!({
             "uid": uid,
@@ -1260,6 +1260,7 @@ mod replica_binding_tests {
 
     #[tokio::test]
     async fn accepts_when_content_hash_header_empty() {
+        let _guard = DeltaReplicaTestGuard::acquire().await;
         let uid = format!("0x{}", hex::encode([3u8; 56]));
         let order_val = json!({
             "uid": uid,
@@ -1319,6 +1320,7 @@ mod replica_binding_tests {
         );
     }
 }
+
 async fn ensure_replica_then_build(
     metadata: &SolveRequestMetadata,
     replica_binding: Option<&SolveRequestReplicaBinding>,
@@ -1825,6 +1827,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("auction id mismatch"));
+    }
+
+    #[tokio::test]
+    async fn accepts_when_sequence_advances_but_checksums_match() {
+        let _guard = DeltaReplicaTestGuard::acquire().await;
+
+        let uid = format!("0x{}", hex::encode([9u8; 56]));
+        let order_val = serde_json::json!({
+            "uid": uid,
+            "sellToken": format!("0x{}", hex::encode([0x01u8; 20])),
+            "buyToken": format!("0x{}", hex::encode([0x02u8; 20])),
+            "sellAmount": "1",
+            "buyAmount": "1",
+            "protocolFees": [],
+            "created": 1,
+            "validTo": 100,
+            "kind": "sell",
+            "receiver": serde_json::Value::Null,
+            "owner": format!("0x{}", hex::encode([0x03u8; 20])),
+            "partiallyFillable": false,
+            "executed": "0",
+            "preInteractions": [],
+            "postInteractions": [],
+            "class": "market",
+            "appData": format!("0x{}", hex::encode([0u8; 32])),
+            "signingScheme": "eip712",
+            "signature": format!("0x{}", hex::encode([0u8; 1])),
+            "quote": serde_json::Value::Null
+        });
+
+        // Set snapshot with sequence 10
+        set_replica_snapshot_for_tests(Snapshot {
+            version: 1,
+            boot_id: None,
+            auction_id: Some(42),
+            sequence: 10,
+            auction: RawAuctionData {
+                orders: vec![order_val.clone()],
+                prices: std::collections::HashMap::new(),
+            },
+        })
+        .await;
+
+        // Read computed snapshot and craft a binding that reports an earlier
+        // sequence (9) but identical checksums. This simulates a thin request
+        // emitted just before a benign sequence-only advancement.
+        let rep = delta_sync::snapshot().await.expect("replica snapshot");
+        let binding = SolveRequestReplicaBinding {
+            sequence: rep.sequence.saturating_sub(1), // 9
+            order_uid_hash: rep.order_uid_hash.clone(),
+            price_hash: rep.price_hash.clone(),
+            order_content_hash: rep.order_content_hash.clone(),
+        };
+
+        let metadata = SolveRequestMetadata {
+            id: 42,
+            tokens: Vec::new(),
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        let res = build_solve_request_from_replica(&metadata, &binding).await;
+        assert!(
+            matches!(res, Ok(Some(_))),
+            "expected replica build to succeed even when sequence advanced"
+        );
     }
 
     #[tokio::test]

@@ -307,6 +307,102 @@ pub(crate) async fn set_replica_snapshot_for_tests(snapshot: Snapshot) {
         .expect("failed to apply test snapshot to replica");
 }
 
+#[cfg(test)]
+mod snapshot_tests {
+    use {
+        super::*,
+        crate::domain::competition::delta_replica::{RawAuctionData, Snapshot as DeltaSnapshot},
+        serde_json::json,
+        std::collections::HashMap,
+    };
+
+    #[tokio::test]
+    async fn snapshot_orders_are_sorted_by_uid() {
+        // Acquire test guard to reset global replica state.
+        let _guard = DeltaReplicaTestGuard::acquire().await;
+
+        let uid1 = format!("0x{}", hex::encode([1u8; 56]));
+        let uid2 = format!("0x{}", hex::encode([2u8; 56]));
+
+        let order_a = json!({
+            "uid": uid2.clone(),
+            "sellToken": format!("0x{}", hex::encode([0x01u8; 20])),
+            "buyToken": format!("0x{}", hex::encode([0x02u8; 20])),
+            "sellAmount": "1",
+            "buyAmount": "1",
+            "protocolFees": [],
+            "created": 1,
+            "validTo": 100,
+            "kind": "sell",
+            "receiver": serde_json::Value::Null,
+            "owner": format!("0x{}", hex::encode([0x03u8; 20])),
+            "partiallyFillable": false,
+            "executed": "0",
+            "preInteractions": [],
+            "postInteractions": [],
+            "class": "market",
+            "appData": format!("0x{}", hex::encode([0u8; 32])),
+            "signingScheme": "eip712",
+            "signature": format!("0x{}", hex::encode([0u8; 1])),
+            "quote": serde_json::Value::Null
+        });
+
+        let order_b = json!({
+            "uid": uid1.clone(),
+            "sellToken": format!("0x{}", hex::encode([0x01u8; 20])),
+            "buyToken": format!("0x{}", hex::encode([0x02u8; 20])),
+            "sellAmount": "1",
+            "buyAmount": "1",
+            "protocolFees": [],
+            "created": 1,
+            "validTo": 100,
+            "kind": "sell",
+            "receiver": serde_json::Value::Null,
+            "owner": format!("0x{}", hex::encode([0x03u8; 20])),
+            "partiallyFillable": false,
+            "executed": "0",
+            "preInteractions": [],
+            "postInteractions": [],
+            "class": "market",
+            "appData": format!("0x{}", hex::encode([0u8; 32])),
+            "signingScheme": "eip712",
+            "signature": format!("0x{}", hex::encode([0u8; 1])),
+            "quote": serde_json::Value::Null
+        });
+
+        let delta_snapshot = DeltaSnapshot {
+            version: 1,
+            boot_id: None,
+            auction_id: Some(0),
+            sequence: 1,
+            auction: RawAuctionData {
+                // Intentionally provide orders in reverse (uid2 then uid1)
+                orders: vec![order_a, order_b],
+                prices: HashMap::new(),
+            },
+        };
+
+        set_replica_snapshot_for_tests(delta_snapshot).await;
+
+        let rep = snapshot().await.expect("replica snapshot");
+
+        let uids: Vec<String> = rep
+            .orders
+            .iter()
+            .map(|order| {
+                let v = serde_json::to_value(order).expect("serialize order");
+                v.get("uid")
+                    .and_then(|s| s.as_str())
+                    .expect("uid string")
+                    .to_string()
+            })
+            .collect();
+
+        // Expect ascending order by UID (uid1 < uid2)
+        assert_eq!(uids, vec![uid1, uid2]);
+    }
+}
+
 #[cfg(any(test, feature = "test-helpers"))]
 pub(crate) async fn set_replica_state_for_tests(state: ReplicaState) {
     let replica = delta_replica();
@@ -354,7 +450,22 @@ fn snapshot_from_replica(replica: &Replica) -> Option<ReplicaSnapshot> {
         order_uid_hash: checksum.order_uid_hash,
         price_hash: checksum.price_hash,
         order_content_hash: checksum.order_content_hash,
-        orders: replica.orders().values().cloned().collect(),
+        // Collect orders deterministically. The replica stores orders in a
+        // HashMap, so iterate and sort by UID to match the autopilot full
+        // request ordering (which also sorts by UID). This ensures the
+        // thin-path reconstructed request preserves the same deterministic
+        // order set and grouping behavior used during preprocessing.
+        orders: {
+            // Sort by the stored UID string keys to avoid accessing private
+            // fields on the DTO `Order` type.
+            let mut entries = replica
+                .orders()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<(String, _)>>();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            entries.into_iter().map(|(_, v)| v).collect()
+        },
         prices: replica.prices().clone(),
     })
 }
@@ -515,7 +626,7 @@ pub async fn ensure_replica_snapshot_from_env() -> anyhow::Result<bool> {
 }
 
 pub fn replica_preprocessing_enabled() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     if let Some(value) = replica_preprocessing_override() {
         return value;
     }
@@ -1492,6 +1603,35 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
         assert!(!shared::env::flag_enabled(Some("0"), false));
         assert!(shared::env::flag_enabled(Some("true"), false));
         assert!(shared::env::flag_enabled(Some("on"), false));
+    }
+
+    // Verify the exported override works when compiled with the
+    // `test-helpers` feature. This guards the regression described in the
+    // Problem statement where e2e/test-helper callers could set the override
+    // without `replica_preprocessing_enabled()` ever consulting it.
+    #[cfg(feature = "test-helpers")]
+    #[tokio::test]
+    async fn replica_preprocessing_override_feature_flag_effective() {
+        // Acquire the global replica test guard to avoid concurrent tests
+        // mutating shared replica/global state while we run.
+        let _guard = DeltaReplicaTestGuard::acquire().await;
+
+        // Ensure we can set the override to true and have the getter reflect it.
+        set_replica_preprocessing_override(Some(true));
+        assert!(
+            replica_preprocessing_enabled(),
+            "override true should enable replica preprocessing"
+        );
+
+        // And clearing it to false flips the getter.
+        set_replica_preprocessing_override(Some(false));
+        assert!(
+            !replica_preprocessing_enabled(),
+            "override false should disable replica preprocessing"
+        );
+
+        set_replica_preprocessing_override(None);
+        let _ = replica_preprocessing_enabled();
     }
 
     #[tokio::test]

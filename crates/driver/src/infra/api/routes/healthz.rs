@@ -30,7 +30,14 @@ mod tests {
 
     #[tokio::test]
     async fn delta_replica_returns_service_unavailable_when_disabled() {
+        #[cfg(any(test, feature = "test-helpers"))]
+        crate::infra::delta_sync::set_driver_delta_sync_enabled_override(Some(false));
+
         let response = delta_replica().await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Restore override to avoid affecting other tests.
+        #[cfg(any(test, feature = "test-helpers"))]
+        crate::infra::delta_sync::set_driver_delta_sync_enabled_override(None);
     }
 }
