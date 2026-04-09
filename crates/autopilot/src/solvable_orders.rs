@@ -378,6 +378,7 @@ struct IndexedAuctionState {
     filtered_in_flight: HashSet<OrderUid>,
     filtered_no_balance: HashSet<OrderUid>,
     filtered_no_price: HashSet<OrderUid>,
+    filtered_dust: HashSet<OrderUid>,
     surplus_capturing_jit_order_owners: Vec<Address>,
 }
 
@@ -1289,6 +1290,12 @@ impl SolvableOrdersCache {
                 .iter()
                 .map(|uid| domain::OrderUid(uid.0)),
         );
+        impacted_uids.extend(
+            indexed_state
+                .filtered_dust
+                .iter()
+                .map(|uid| domain::OrderUid(uid.0)),
+        );
 
         impacted_uids.extend(
             in_flight
@@ -1478,6 +1485,9 @@ impl SolvableOrdersCache {
 
             let (candidate_orders, removed_dust) = filter_dust_orders(candidate_orders, &balances);
             for uid in removed_dust {
+                let was_filtered = indexed_state.filtered_dust.contains(&uid);
+                indexed_state.filtered_dust.insert(uid);
+                register_transition(uid, DustOrder, was_filtered, true);
                 indexed_state
                     .current_orders_by_uid
                     .remove(&domain::OrderUid(uid.0));
@@ -1576,6 +1586,8 @@ impl SolvableOrdersCache {
                 was_no_balance,
                 false,
             );
+            let was_dust = indexed_state.filtered_dust.remove(&order.metadata.uid);
+            register_transition(order.metadata.uid, DustOrder, was_dust, false);
         }
 
         if jit_owners_changed {
@@ -1652,6 +1664,7 @@ impl SolvableOrdersCache {
                 .chain(indexed_state.filtered_in_flight.iter())
                 .chain(indexed_state.filtered_no_balance.iter())
                 .chain(indexed_state.filtered_no_price.iter())
+                .chain(indexed_state.filtered_dust.iter())
                 .collect::<HashSet<_>>();
             debug_assert!(
                 filtered.iter().all(|uid| !indexed_state
@@ -2556,6 +2569,9 @@ fn build_indexed_state(
             }
             OrderFilterReason::MissingNativePrice => {
                 state.filtered_no_price.insert(*uid);
+            }
+            OrderFilterReason::DustOrder => {
+                state.filtered_dust.insert(*uid);
             }
             _ => {}
         }
@@ -5212,7 +5228,9 @@ mod tests {
 
         let state = build_indexed_state(&auction, &invalid_order_uids, filtered_events);
 
-        // DustOrder is not tracked in any specific filtered set
+        // DustOrder is tracked in the dedicated filtered set
+        assert!(state.filtered_dust.contains(&OrderUid::from(order.uid)));
+        // And not present in other filtered sets
         assert!(
             !state
                 .filtered_in_flight

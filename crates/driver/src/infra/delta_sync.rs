@@ -66,7 +66,6 @@ pub fn set_driver_delta_sync_autopilot_url_override(value: Option<Url>) {
         .expect("driver delta sync autopilot url override lock poisoned") = value;
 }
 static REPLICA_PREPROCESSING_ENABLED: OnceLock<bool> = OnceLock::new();
-static DELTA_STREAM_GONE_RETRY_THRESHOLD: OnceLock<u64> = OnceLock::new();
 static DELTA_REPLICA_MAX_STALENESS: OnceLock<Option<Duration>> = OnceLock::new();
 static DELTA_REPLICA_RESNAPSHOT_INTERVAL: OnceLock<Option<Duration>> = OnceLock::new();
 static BOOTSTRAP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -674,8 +673,16 @@ async fn follow_stream(
         .send()
         .await?;
     if response.status() == StatusCode::GONE {
+        // Autopilot uses 410/Gone to indicate the stream cannot be followed
+        // without a fresh snapshot (resync). Historically we attempted a
+        // short retry for small gaps, but retrying with the same
+        // `after_sequence` cannot advance the replica in many server-side
+        // scenarios and can trap the client in a reconnect loop. Prefer to
+        // request a resnapshot immediately so the replica can make progress.
         let payload = response.json::<DeltaStreamGonePayload>().await.ok();
         if let Some(payload) = payload {
+            // Preserve the more specific diagnostic when the server indicates
+            // the requested sequence is older than the oldest available.
             if payload
                 .oldest_available
                 .is_some_and(|oldest| after_sequence < oldest)
@@ -690,19 +697,19 @@ async fn follow_stream(
                 );
                 return Ok(StreamControl::Resnapshot);
             }
-            let lag = payload.latest_sequence.saturating_sub(after_sequence);
-            if lag <= delta_stream_gone_retry_threshold() {
-                replica.write().await.set_state(ReplicaState::Resyncing);
-                tracing::warn!(
-                    after_sequence,
-                    latest_sequence = payload.latest_sequence,
-                    oldest_available = ?payload.oldest_available,
-                    message = payload.message.as_deref().unwrap_or(""),
-                    "delta stream lagged but within retry threshold"
-                );
-                return Ok(StreamControl::RetryStream);
-            }
+            // For all other 410/Gone cases, treat as resnapshot required.
+            replica.write().await.set_state(ReplicaState::Resyncing);
+            tracing::warn!(
+                after_sequence,
+                latest_sequence = payload.latest_sequence,
+                oldest_available = ?payload.oldest_available,
+                message = payload.message.as_deref().unwrap_or(""),
+                "delta stream returned 410 Gone; resnapshot required"
+            );
+            return Ok(StreamControl::Resnapshot);
         }
+        replica.write().await.set_state(ReplicaState::Resyncing);
+        tracing::warn!("delta stream returned 410 Gone without payload; resnapshot required");
         return Ok(StreamControl::Resnapshot);
     }
 
@@ -941,16 +948,6 @@ async fn compare_replica_checksum(
     Ok(true)
 }
 
-fn delta_stream_gone_retry_threshold() -> u64 {
-    *DELTA_STREAM_GONE_RETRY_THRESHOLD.get_or_init(|| {
-        std::env::var("DRIVER_DELTA_SYNC_GONE_LAG_THRESHOLD")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(16)
-    })
-}
-
 fn delta_replica_max_staleness() -> Option<Duration> {
     DELTA_REPLICA_MAX_STALENESS
         .get_or_init(|| {
@@ -1153,6 +1150,64 @@ mod tests {
             vec![("delta".to_string(), stream_payload)],
         )
         .await
+    }
+
+    async fn spawn_delta_test_server_gone(
+        snapshot_json: String,
+        gone_payload: String,
+    ) -> (
+        Url,
+        Arc<std::sync::Mutex<Option<u64>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let observed_after_sequence = Arc::new(std::sync::Mutex::new(None));
+        let state = Arc::new(TestServerState {
+            snapshot_json,
+            observed_after_sequence: Arc::clone(&observed_after_sequence),
+        });
+
+        let app = Router::new()
+            .route(
+                "/delta/snapshot",
+                get({
+                    let state = Arc::clone(&state);
+                    move || {
+                        let state = Arc::clone(&state);
+                        async move {
+                            let value: serde_json::Value =
+                                serde_json::from_str(&state.snapshot_json).unwrap();
+                            Json(value)
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/delta/stream",
+                get({
+                    let state = Arc::clone(&state);
+                    move |Query(query): Query<StreamQuery>| {
+                        let state = Arc::clone(&state);
+                        let gone_payload = gone_payload.clone();
+                        async move {
+                            *state.observed_after_sequence.lock().unwrap() = query.after_sequence;
+                            let value: serde_json::Value =
+                                serde_json::from_str(&gone_payload).unwrap();
+                            (StatusCode::GONE, Json(value)).into_response()
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            Url::parse(&format!("http://{addr}")).unwrap(),
+            observed_after_sequence,
+            handle,
+        )
     }
 
     #[tokio::test]
@@ -1427,6 +1482,55 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
         assert_eq!(view.sequence(), 4);
         assert!(view.orders().contains_key(&uid));
         assert_eq!(*observed_after_sequence.lock().unwrap(), Some(3));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn follow_stream_treats_410_gone_as_resnapshot() {
+        // snapshot sequence is 5, but the stream responds with 410 Gone
+        // indicating the server requires a resnapshot. The client must
+        // return StreamControl::Resnapshot instead of retrying.
+        let snapshot = serde_json::json!({
+            "version": 1,
+            "auctionId": 0,
+            "sequence": 5,
+            "auction": { "orders": [], "prices": {} }
+        });
+
+        // The stream endpoint will return 410 with a JSON body matching
+        // the driver's DeltaStreamGonePayload shape.
+        let gone_payload = serde_json::json!({
+            "message": "resnapshot required",
+            "latestSequence": 7u64,
+            "oldestAvailable": serde_json::Value::Null
+        })
+        .to_string();
+
+        let (base_url, _observed_after_sequence, server) =
+            spawn_delta_test_server_gone(snapshot.to_string(), gone_payload).await;
+
+        let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
+        {
+            let mut lock = replica.write().await;
+            lock.apply_snapshot(Snapshot {
+                version: 1,
+                boot_id: None,
+                auction_id: Some(0),
+                sequence: 5,
+                auction: crate::domain::competition::delta_replica::RawAuctionData {
+                    orders: vec![],
+                    prices: HashMap::new(),
+                },
+            })
+            .unwrap();
+        }
+
+        let client = reqwest::Client::new();
+        let control = follow_stream(&client, &base_url, &replica, Instant::now(), None)
+            .await
+            .unwrap();
+        assert!(matches!(control, StreamControl::Resnapshot));
 
         server.abort();
     }

@@ -191,6 +191,7 @@ impl Request {
             replica_sequence_header,
             order_uid_hash_header,
             price_hash_header,
+            order_content_hash_header,
             body_mode_header,
         }
     }
