@@ -718,6 +718,9 @@ async fn follow_stream(
     let max_staleness = delta_replica_max_staleness();
     let resnapshot_interval = delta_replica_resnapshot_interval();
 
+    let mut safety_sleep = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(safety_sleep);
+
     loop {
         tokio::select! {
             chunk = response.chunk() => {
@@ -757,7 +760,10 @@ async fn follow_stream(
                     None => break,
                 }
             }
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+            _ = &mut safety_sleep => {
+                // Reset the sleep for the next interval as early as possible.
+                safety_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
+
                 if delta_sync_checksum_enabled() {
                     let local_checksum = replica.read().await.checksum();
                     if let Some(local_checksum) = local_checksum {
@@ -918,33 +924,40 @@ async fn compare_replica_checksum(
     let response = response.error_for_status()?;
     let remote = response.json::<DeltaChecksumResponse>().await?;
 
-    // Check sequence first: even when the checksum/hash values match, a
-    // differing sequence indicates the local replica is stale (e.g. the
-    // autopilot advanced sequence during a stream stall). Treat any
-    // sequence mismatch as divergence and request a resnapshot.
-    if local_checksum.sequence != remote.sequence {
+    if local_checksum.sequence > remote.sequence {
         metrics::get().delta_replica_diverged_total.inc();
         tracing::warn!(
             local_sequence = local_checksum.sequence,
             remote_sequence = remote.sequence,
-            "delta replica sequence mismatch; resnapshot required"
+            "delta replica sequence mismatch: remote behind local; resnapshot required"
         );
         return Ok(false);
     }
 
-    // If sequences match, fall back to the content hashes check.
-    if local_checksum.order_uid_hash != remote.order_uid_hash
-        || local_checksum.price_hash != remote.price_hash
-        || local_checksum.order_content_hash != remote.order_content_hash
-    {
-        metrics::get().delta_replica_diverged_total.inc();
-        tracing::warn!(
-            local_sequence = local_checksum.sequence,
-            remote_sequence = remote.sequence,
-            "delta replica checksum mismatch"
-        );
-        return Ok(false);
+    if local_checksum.sequence == remote.sequence {
+        // If sequences match, fall back to the content hashes check.
+        if local_checksum.order_uid_hash != remote.order_uid_hash
+            || local_checksum.price_hash != remote.price_hash
+            || local_checksum.order_content_hash != remote.order_content_hash
+        {
+            metrics::get().delta_replica_diverged_total.inc();
+            tracing::warn!(
+                local_sequence = local_checksum.sequence,
+                remote_sequence = remote.sequence,
+                "delta replica checksum mismatch"
+            );
+            return Ok(false);
+        }
+        return Ok(true);
     }
+
+    // remote.sequence > local_checksum.sequence: remote is ahead — allow the
+    // stream to catch up rather than forcing a resnapshot.
+    tracing::debug!(
+        local_sequence = local_checksum.sequence,
+        remote_sequence = remote.sequence,
+        "remote checksum sequence ahead of local; will catch up via stream"
+    );
     Ok(true)
 }
 
@@ -1398,6 +1411,78 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
 
         let view = replica.read().await;
         assert_eq!(view.sequence(), 1);
+    }
+
+    #[tokio::test]
+    async fn compare_checksum_remote_ahead_allows_stream() {
+        use axum::{Json, Router, response::IntoResponse, routing::get};
+
+        // Server returns a checksum with sequence = 2
+        let app = Router::new().route(
+            "/delta/checksum",
+            get(|| async move {
+                let payload = serde_json::json!({
+                    "version": 1u32,
+                    "sequence": 2u64,
+                    "orderUidHash": "a",
+                    "priceHash": "b",
+                    "orderContentHash": "c",
+                });
+                (axum::http::StatusCode::OK, Json(payload)).into_response()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let base = Url::parse(&format!("http://{addr}")).unwrap();
+
+        let local = ReplicaChecksum {
+            sequence: 1,
+            order_uid_hash: "x".to_string(),
+            price_hash: "y".to_string(),
+            order_content_hash: "z".to_string(),
+        };
+
+        let ok = compare_replica_checksum(&base, local).await.unwrap();
+        assert!(ok, "remote ahead should not be treated as divergence");
+    }
+
+    #[tokio::test]
+    async fn compare_checksum_local_ahead_triggers_resnapshot() {
+        use axum::{Json, Router, response::IntoResponse, routing::get};
+
+        // Server returns a checksum with sequence = 1
+        let app = Router::new().route(
+            "/delta/checksum",
+            get(|| async move {
+                let payload = serde_json::json!({
+                    "version": 1u32,
+                    "sequence": 1u64,
+                    "orderUidHash": "a",
+                    "priceHash": "b",
+                    "orderContentHash": "c",
+                });
+                (axum::http::StatusCode::OK, Json(payload)).into_response()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let base = Url::parse(&format!("http://{addr}")).unwrap();
+
+        let local = ReplicaChecksum {
+            sequence: 2,
+            order_uid_hash: "x".to_string(),
+            price_hash: "y".to_string(),
+            order_content_hash: "z".to_string(),
+        };
+
+        let ok = compare_replica_checksum(&base, local).await.unwrap();
+        assert!(!ok, "local ahead should be treated as divergence");
     }
 
     #[test]

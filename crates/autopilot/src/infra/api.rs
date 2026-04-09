@@ -698,64 +698,67 @@ async fn stream_delta_events(
     tokio::spawn(async move {
         let _active_stream = active_stream;
         let mut stream = Box::pin(stream);
+
+        let mut leader_check = tokio::time::interval(Duration::from_secs(1));
+
         loop {
             tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                                if !delta_sync_serving_enabled() {
-                                    let latest_sequence = cache.delta_sequence().await.unwrap_or(replay_to_sequence);
-                                    let resync_payload = serde_json::json!({
-                                        "message": "delta stream lost leader authority",
-                                        "latestSequence": latest_sequence,
-                                        "skipped": 0
-                                    })
-                                    .to_string();
-                                    if let Err(_) = control_sender_clone.send(Ok(sse::Event::default()
-                                        .event("resync_required")
-                                        .data(resync_payload))) {
-                                        tracing::debug!("resync control event dropped: channel closed");
-                                    }
-                                    tracing::warn!("delta stream lost leader authority");
-                                    break;
-                                }
-                            }
-                            _ = forward_sender.closed() => {
-                                break;
-                            }
-                            item = stream.next() => {
-                                let Some(item) = item else {
-                                    break;
-                                };
-                                match forward_sender.try_send(item) {
-                                    Ok(()) => {}
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                metrics.stream_lagged.inc();
-                let latest_sequence =
-                    cache.delta_sequence().await.unwrap_or(replay_to_sequence);
-                let resync_payload = serde_json::json!({
-                    "message": "delta stream dropped slow consumer",
-                    "latestSequence": latest_sequence,
-                    "skipped": 0
-                })
-                .to_string();
-
-                // Send critical resync event over the unbounded control channel so
-                // it won't be dropped due to the bounded consumer buffer.
-                // control_sender_clone is injected into the spawn closure.
-                if let Err(_) = control_sender_clone.send(Ok(sse::Event::default()
-                    .event("resync_required")
-                    .data(resync_payload))) {
-                    tracing::debug!("resync control event dropped: channel closed");
-                }
-
-                tracing::warn!("delta stream dropped slow consumer");
-                break;
-            }
-                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                        break;
-                                    }
-                                }
-                            }
+                _ = leader_check.tick() => {
+                    if !delta_sync_serving_enabled() {
+                        let latest_sequence = cache.delta_sequence().await.unwrap_or(replay_to_sequence);
+                        let resync_payload = serde_json::json!({
+                            "message": "delta stream lost leader authority",
+                            "latestSequence": latest_sequence,
+                            "skipped": 0
+                        })
+                        .to_string();
+                        if let Err(_) = control_sender_clone.send(Ok(sse::Event::default()
+                            .event("resync_required")
+                            .data(resync_payload))) {
+                            tracing::debug!("resync control event dropped: channel closed");
                         }
+                        tracing::warn!("delta stream lost leader authority");
+                        break;
+                    }
+                }
+                _ = forward_sender.closed() => {
+                    break;
+                }
+                item = stream.next() => {
+                    let Some(item) = item else {
+                        break;
+                    };
+                    match forward_sender.try_send(item) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            metrics.stream_lagged.inc();
+                            let latest_sequence =
+                                cache.delta_sequence().await.unwrap_or(replay_to_sequence);
+                            let resync_payload = serde_json::json!({
+                                "message": "delta stream dropped slow consumer",
+                                "latestSequence": latest_sequence,
+                                "skipped": 0
+                            })
+                            .to_string();
+
+                            // Send critical resync event over the unbounded control channel so
+                            // it won't be dropped due to the bounded consumer buffer.
+                            // control_sender_clone is injected into the spawn closure.
+                            if let Err(_) = control_sender_clone.send(Ok(sse::Event::default()
+                                .event("resync_required")
+                                .data(resync_payload))) {
+                                tracing::debug!("resync control event dropped: channel closed");
+                            }
+
+                            tracing::warn!("delta stream dropped slow consumer");
+                            break;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            break;
+                        }
+                    }
+                }
+            }
         }
     });
 
