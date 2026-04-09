@@ -70,6 +70,49 @@ enum SolveRequestBodyMode {
     Thin,
 }
 
+#[cfg(test)]
+mod bootstrap_deadline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bootstrap_skips_when_deadline_passed() {
+        // Acquire global replica test guard to isolate global replica state
+        let _guard = crate::infra::delta_sync::DeltaReplicaTestGuard::acquire().await;
+
+        let metadata = SolveRequestMetadata {
+            id: 1,
+            tokens: Vec::new(),
+            deadline: chrono::Utc::now() - chrono::Duration::milliseconds(1),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        let binding = SolveRequestReplicaBinding {
+            sequence: 0,
+            order_uid_hash: String::new(),
+            price_hash: String::new(),
+            order_content_hash: String::new(),
+        };
+
+        let res = ensure_replica_then_build(
+            &metadata,
+            Some(&binding),
+            ReplicaRetryBackoffTier::None,
+            "bootstrap context",
+            "not-bootstrapped-msg",
+            "post-boot-failure-msg",
+        )
+        .await;
+
+        assert!(res.is_err(), "expected error when deadline already passed");
+        let err = res.err().unwrap();
+        assert!(
+            err.to_string().contains("not-bootstrapped"),
+            "unexpected error: {}",
+            err
+        );
+    }
+}
+
 /// Retry configuration for replica synchronization attempts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RetryConfig {
@@ -1078,6 +1121,204 @@ async fn build_solve_request_from_replica(
         snapshot.orders,
     )))
 }
+
+#[cfg(test)]
+mod replica_binding_tests {
+    use {
+        super::*,
+        crate::{
+            domain::competition::delta_replica::{RawAuctionData, Snapshot as DeltaSnapshot},
+            infra::delta_sync,
+        },
+        serde_json::json,
+        std::collections::HashMap,
+    };
+
+    #[tokio::test]
+    async fn accepts_when_checksums_match() {
+        // Prepare a minimal order JSON matching the solver DTO shape.
+        let uid = format!("0x{}", hex::encode([1u8; 56]));
+        let order_val = json!({
+            "uid": uid,
+            "sellToken": format!("0x{}", hex::encode([0x01u8; 20])),
+            "buyToken": format!("0x{}", hex::encode([0x02u8; 20])),
+            "sellAmount": "1",
+            "buyAmount": "1",
+            "protocolFees": [],
+            "created": 1,
+            "validTo": 100,
+            "kind": "sell",
+            "receiver": serde_json::Value::Null,
+            "owner": format!("0x{}", hex::encode([0x03u8; 20])),
+            "partiallyFillable": false,
+            "executed": "0",
+            "preInteractions": [],
+            "postInteractions": [],
+            "class": "market",
+            "appData": format!("0x{}", hex::encode([0u8; 32])),
+            "signingScheme": "eip712",
+            "signature": format!("0x{}", hex::encode([0u8; 1])),
+            "quote": serde_json::Value::Null
+        });
+
+        let snapshot = DeltaSnapshot {
+            version: 1,
+            boot_id: None,
+            auction_id: Some(1),
+            sequence: 7,
+            auction: RawAuctionData {
+                orders: vec![order_val],
+                prices: HashMap::new(),
+            },
+        };
+
+        // Set the global replica to this snapshot for tests.
+        delta_sync::set_replica_snapshot_for_tests(snapshot).await;
+
+        // Read back the computed replica snapshot (includes checksums).
+        let rep = delta_sync::snapshot().await.expect("replica snapshot");
+
+        let metadata = SolveRequestMetadata {
+            id: 1,
+            tokens: Vec::new(),
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        let binding = SolveRequestReplicaBinding {
+            sequence: rep.sequence,
+            order_uid_hash: rep.order_uid_hash.clone(),
+            price_hash: rep.price_hash.clone(),
+            order_content_hash: rep.order_content_hash.clone(),
+        };
+
+        let res = build_solve_request_from_replica(&metadata, &binding).await;
+        assert!(
+            matches!(res, Ok(Some(_))),
+            "expected replica build to succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_when_nonempty_content_hash_mismatches() {
+        let uid = format!("0x{}", hex::encode([2u8; 56]));
+        let order_val = json!({
+            "uid": uid,
+            "sellToken": format!("0x{}", hex::encode([0x04u8; 20])),
+            "buyToken": format!("0x{}", hex::encode([0x05u8; 20])),
+            "sellAmount": "1",
+            "buyAmount": "1",
+            "protocolFees": [],
+            "created": 1,
+            "validTo": 100,
+            "kind": "sell",
+            "receiver": serde_json::Value::Null,
+            "owner": format!("0x{}", hex::encode([0x06u8; 20])),
+            "partiallyFillable": false,
+            "executed": "0",
+            "preInteractions": [],
+            "postInteractions": [],
+            "class": "market",
+            "appData": format!("0x{}", hex::encode([0u8; 32])),
+            "signingScheme": "eip712",
+            "signature": format!("0x{}", hex::encode([0u8; 1])),
+            "quote": serde_json::Value::Null
+        });
+
+        let snapshot = DeltaSnapshot {
+            version: 1,
+            boot_id: None,
+            auction_id: Some(2),
+            sequence: 11,
+            auction: RawAuctionData {
+                orders: vec![order_val],
+                prices: HashMap::new(),
+            },
+        };
+
+        delta_sync::set_replica_snapshot_for_tests(snapshot).await;
+        let rep = delta_sync::snapshot().await.expect("replica snapshot");
+
+        let metadata = SolveRequestMetadata {
+            id: 2,
+            tokens: Vec::new(),
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        // Provide a non-empty but incorrect content hash
+        let binding = SolveRequestReplicaBinding {
+            sequence: rep.sequence,
+            order_uid_hash: rep.order_uid_hash.clone(),
+            price_hash: rep.price_hash.clone(),
+            order_content_hash: "0xdeadbeef".to_string(),
+        };
+
+        let res = build_solve_request_from_replica(&metadata, &binding).await;
+        assert!(matches!(res, Err(ReplicaBuildError::ChecksumMismatch)));
+    }
+
+    #[tokio::test]
+    async fn accepts_when_content_hash_header_empty() {
+        let uid = format!("0x{}", hex::encode([3u8; 56]));
+        let order_val = json!({
+            "uid": uid,
+            "sellToken": format!("0x{}", hex::encode([0x07u8; 20])),
+            "buyToken": format!("0x{}", hex::encode([0x08u8; 20])),
+            "sellAmount": "1",
+            "buyAmount": "1",
+            "protocolFees": [],
+            "created": 1,
+            "validTo": 100,
+            "kind": "sell",
+            "receiver": serde_json::Value::Null,
+            "owner": format!("0x{}", hex::encode([0x09u8; 20])),
+            "partiallyFillable": false,
+            "executed": "0",
+            "preInteractions": [],
+            "postInteractions": [],
+            "class": "market",
+            "appData": format!("0x{}", hex::encode([0u8; 32])),
+            "signingScheme": "eip712",
+            "signature": format!("0x{}", hex::encode([0u8; 1])),
+            "quote": serde_json::Value::Null
+        });
+
+        let snapshot = DeltaSnapshot {
+            version: 1,
+            boot_id: None,
+            auction_id: Some(3),
+            sequence: 13,
+            auction: RawAuctionData {
+                orders: vec![order_val],
+                prices: HashMap::new(),
+            },
+        };
+
+        delta_sync::set_replica_snapshot_for_tests(snapshot).await;
+        let rep = delta_sync::snapshot().await.expect("replica snapshot");
+
+        let metadata = SolveRequestMetadata {
+            id: 3,
+            tokens: Vec::new(),
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        let binding = SolveRequestReplicaBinding {
+            sequence: rep.sequence,
+            order_uid_hash: rep.order_uid_hash.clone(),
+            price_hash: rep.price_hash.clone(),
+            order_content_hash: String::new(), // empty header should not trigger mismatch
+        };
+
+        let res = build_solve_request_from_replica(&metadata, &binding).await;
+        assert!(
+            matches!(res, Ok(Some(_))),
+            "expected replica build to succeed with empty content hash header"
+        );
+    }
+}
 async fn ensure_replica_then_build(
     metadata: &SolveRequestMetadata,
     replica_binding: Option<&SolveRequestReplicaBinding>,
@@ -1167,12 +1408,46 @@ async fn ensure_replica_then_build(
     }
 
     // Bootstrap fallback
-    // Must mark `Resyncing` before bootstrapping so concurrent `/solve`
-    // requests observe a non-Ready replica during the resnapshot window.
+    // Respect the auction deadline: if there is no remaining time budget
+    // then avoid calling the potentially long-running bootstrap path and
+    // fail fast instead. Otherwise bound the bootstrap call with the
+    // remaining time so we don't block beyond the auction deadline.
+
+    // Reserve a small buffer before the auction deadline to avoid racing
+    // the final moment; this mirrors the earlier retry logic.
+    let bootstrap_deadline = metadata
+        .deadline
+        .checked_sub_signed(chrono::Duration::milliseconds(50))
+        .unwrap_or(metadata.deadline);
+
+    let now = chrono::Utc::now();
+    if now >= bootstrap_deadline {
+        tracing::warn!("deadline passed, skipping bootstrap and failing fast");
+        anyhow::bail!(not_bootstrapped_msg);
+    }
+
+    let remaining = (bootstrap_deadline - now)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+
+    // Mark replica resyncing only when we are actually going to attempt
+    // bootstrap. This avoids flipping global replica state if we decide to
+    // fail fast due to time budget exhaustion.
     delta_sync::mark_replica_resyncing().await;
-    let bootstrapped = delta_sync::ensure_replica_snapshot_from_env()
-        .await
-        .context(bootstrap_context)?;
+
+    // Bound the bootstrap operation by the remaining time budget so we
+    // don't spend tens of seconds in snapshot bootstrap when the auction
+    // deadline is near.
+    let boot_result =
+        tokio::time::timeout(remaining, delta_sync::ensure_replica_snapshot_from_env()).await;
+    let bootstrapped = match boot_result {
+        Ok(res) => res.context(bootstrap_context)?,
+        Err(_) => {
+            tracing::warn!(remaining_ms = ?remaining.as_millis(), "bootstrap timed out due to auction deadline");
+            anyhow::bail!(not_bootstrapped_msg);
+        }
+    };
+
     if !bootstrapped {
         anyhow::bail!(not_bootstrapped_msg);
     }

@@ -408,7 +408,14 @@ impl Replica {
 
         let mut hasher = Sha256::new();
         for (_, order_val) in entries {
-            let bytes = serde_json::to_vec(order_val).expect("order JSON serializable");
+            // Prefer serializing the order as the DTO used for solve requests
+            // to ensure a stable, deterministic field ordering. If the raw
+            // value doesn't deserialize into the DTO, fall back to
+            // serializing the `Value` directly.
+            let bytes = match serde_json::from_value::<ReplicaOrder>(order_val.clone()) {
+                Ok(order_dto) => serde_json::to_vec(&order_dto).expect("order DTO serializable"),
+                Err(_) => serde_json::to_vec(order_val).expect("order JSON serializable"),
+            };
             hasher.update(&bytes);
         }
         format!("0x{}", const_hex::encode(hasher.finalize()))

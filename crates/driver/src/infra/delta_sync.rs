@@ -716,14 +716,26 @@ async fn follow_stream(
             chunk = response.chunk() => {
                 match chunk? {
                     Some(bytes) => {
-                        // Only allocate if \r actually exists (optimization for well-behaved SSE servers)
-                        let text = if bytes.contains(&b'\r') {
-                            String::from_utf8_lossy(&bytes).replace("\r\n", "\n")
-                        } else {
-                            String::from_utf8_lossy(&bytes).into_owned()
-                        };
+                        // Append raw chunk text first. We intentionally avoid doing
+                        // per-chunk CRLF normalization because a CRLF boundary may
+                        // be split across two chunks. Normalize CRLF on the
+                        // accumulated `buffer` after appending the chunk so that
+                        // cross-chunk "\r\n\r\n" boundaries become "\n\n".
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
 
                         buffer.push_str(&text);
+
+                        // If any CR characters are present in the buffer, normalize
+                        // CRLF -> LF across the whole buffer. Also remove any
+                        // stray CRs that may remain (handles odd splits).
+                        if buffer.contains('\r') {
+                            if buffer.contains("\r\n") {
+                                buffer = buffer.replace("\r\n", "\n");
+                            }
+                            if buffer.contains('\r') {
+                                buffer = buffer.replace('\r', "");
+                            }
+                        }
 
                         while let Some(idx) = buffer.find("\n\n") {
                             let block = buffer[..idx].to_string();
