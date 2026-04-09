@@ -1732,6 +1732,7 @@ mod tests {
         assert!(authorize_delta_sync(&headers).is_ok());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn delta_sync_disabled_disables_routes() {
         let _guard = DeltaSyncEnabledGuard::set(false);
@@ -1757,6 +1758,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn delta_snapshot_http_response_is_consistent_with_history() {
         let _guard = DeltaSyncEnabledGuard::set(true);
@@ -1823,6 +1825,7 @@ mod tests {
         assert_eq!(snapshot["auction"], serde_json::to_value(expected).unwrap());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     #[ignore = "requires database-backed update pipeline"]
     async fn update_drives_snapshot_and_stream_end_to_end() {
@@ -1893,6 +1896,7 @@ mod tests {
         assert!(replay_has_order);
     }
 
+    #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slow_consumer_gets_resync_required_event() {
         let _guard_enabled = DeltaSyncEnabledGuard::set(true);
@@ -1931,6 +1935,20 @@ mod tests {
             .await
             .unwrap();
 
+        // Wait for the server side to register its delta stream subscriber to
+        // avoid races where publishes happen before any receiver exists.
+        let start = Instant::now();
+        let subscribe_timeout = Duration::from_secs(2);
+        while cache.delta_receiver_count() == 0 {
+            if start.elapsed() > subscribe_timeout {
+                panic!("delta stream subscriber never registered");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Now start reading the response body but deliberately spawn the
+        // consumer after the server-side subscriber exists so that the bounded
+        // buffer can overflow when we publish rapidly.
         let collected = Arc::new(tokio::sync::Mutex::new(String::new()));
         let collected_writer = Arc::clone(&collected);
 
@@ -1952,17 +1970,6 @@ mod tests {
                 }
             }
         });
-
-        // Wait for the server side to register its delta stream subscriber to
-        // avoid races where publishes happen before any receiver exists.
-        let start = Instant::now();
-        let subscribe_timeout = Duration::from_secs(2);
-        while cache.delta_receiver_count() == 0 {
-            if start.elapsed() > subscribe_timeout {
-                panic!("delta stream subscriber never registered");
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
 
         // Publish events rapidly to overwhelm the buffer (size = 1).
         for sequence in 1..=10u64 {
@@ -2216,6 +2223,7 @@ mod tests {
         assert_eq!(oldest_available, None);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn get_delta_snapshot_when_cache_has_data() {
         let _guard = DeltaSyncEnabledGuard::set(true);
@@ -2267,6 +2275,7 @@ mod tests {
         assert_eq!(snapshot.auction.orders.len(), 1);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn get_delta_snapshot_requires_auth_when_api_key_configured() {
         let _guard_enabled = DeltaSyncEnabledGuard::set(true);
@@ -2307,6 +2316,7 @@ mod tests {
         assert_eq!(response_with_key.status(), StatusCode::NO_CONTENT);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn get_delta_checksum_returns_204_when_no_snapshot() {
         let _guard = DeltaSyncEnabledGuard::set(true);
@@ -2332,6 +2342,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn get_delta_checksum_returns_correct_hash_when_snapshot_exists() {
         let _guard = DeltaSyncEnabledGuard::set(true);
@@ -2399,6 +2410,7 @@ mod tests {
         assert_eq!(drained.payloads.len(), 0);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn replay_envelopes_with_snapshot_sequence_field_populated() {
         let _guard_enabled = DeltaSyncEnabledGuard::set(true);

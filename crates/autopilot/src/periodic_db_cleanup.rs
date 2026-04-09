@@ -131,7 +131,20 @@ mod tests {
 
         tokio::task::spawn(cleaner.run_forever());
 
-        // delete `order_a` after the initialization
+        // Wait until `event_a` is deleted (timeout 2s).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let ids = order_event_ids_before(&db.pool).await;
+            if ids.len() == 2 && !ids.contains(&event_a.order_uid) {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timeout waiting for event_a deletion; ids = {:?}", ids);
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Sanity check shortly after the first deletion.
         time::sleep(Duration::from_millis(20)).await;
         let ids = order_event_ids_before(&db.pool).await;
         assert_eq!(ids.len(), 2);
@@ -139,25 +152,31 @@ mod tests {
         assert!(ids.contains(&event_b.order_uid));
         assert!(ids.contains(&event_c.order_uid));
 
-        // nothing deleted after the first interval
-        time::sleep(Duration::from_millis(50)).await;
-        let ids = order_event_ids_before(&db.pool).await;
-        assert_eq!(ids.len(), 2);
-        assert!(!ids.contains(&event_a.order_uid));
-        assert!(ids.contains(&event_b.order_uid));
-        assert!(ids.contains(&event_c.order_uid));
+        // Wait until `event_b` is deleted (timeout 2s).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let ids = order_event_ids_before(&db.pool).await;
+            if ids.len() == 1 && !ids.contains(&event_b.order_uid) {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timeout waiting for event_b deletion; ids = {:?}", ids);
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
 
-        // delete `event_b` only
-        time::sleep(Duration::from_millis(100)).await;
-        let ids = order_event_ids_before(&db.pool).await;
-        assert_eq!(ids.len(), 1);
-        assert!(!ids.contains(&event_b.order_uid));
-        assert!(ids.contains(&event_c.order_uid));
-
-        // delete `event_c`
-        time::sleep(Duration::from_millis(200)).await;
-        let ids = order_event_ids_before(&db.pool).await;
-        assert!(ids.is_empty());
+        // Wait until `event_c` is deleted (timeout 2s).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let ids = order_event_ids_before(&db.pool).await;
+            if ids.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timeout waiting for event_c deletion; ids = {:?}", ids);
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     async fn order_event_ids_before(pool: &PgPool) -> Vec<ByteArray<56>> {

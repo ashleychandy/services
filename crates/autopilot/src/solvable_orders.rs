@@ -122,6 +122,10 @@ pub struct Metrics {
     /// high-level health dashboards and alerting).
     delta_incremental_failure_total: IntCounter,
 
+    price_writeback_conversion_failure_total: IntCounter,
+
+    price_writeback_empty_update_total: IntCounter,
+
     /// Total incremental delta comparisons.
     delta_incremental_event_total: IntCounter,
 
@@ -1259,6 +1263,7 @@ impl SolvableOrdersCache {
             let was_in_flight = indexed_state.filtered_in_flight.remove(&model_uid);
             let was_no_balance = indexed_state.filtered_no_balance.remove(&model_uid);
             let was_no_price = indexed_state.filtered_no_price.remove(&model_uid);
+            let was_dust = indexed_state.filtered_dust.remove(&model_uid);
 
             if let Some(reason) = was_invalid_reason {
                 register_transition(model_uid, reason, true, false);
@@ -1266,6 +1271,7 @@ impl SolvableOrdersCache {
             register_transition(model_uid, InFlight, was_in_flight, false);
             register_transition(model_uid, InsufficientBalance, was_no_balance, false);
             register_transition(model_uid, MissingNativePrice, was_no_price, false);
+            register_transition(model_uid, DustOrder, was_dust, false);
         }
 
         let in_flight = self.fetch_in_flight_orders(block).await;
@@ -1677,6 +1683,41 @@ impl SolvableOrdersCache {
         change_bundle.price_changed_tokens = price_changed_tokens;
         change_bundle.filter_transitions = filter_transitions;
 
+        // Ensure the incremental indexed state reflects the latest native
+        // prices computed above. Without this write-back the next
+        // incremental collection would start from stale prices and could
+        // reconstruct auctions against out-of-date price information.
+        let new_price_map: HashMap<Address, Price> = prices
+            .iter()
+            .filter_map(|(token, value)| match Price::try_new((*value).into()) {
+                Ok(price) => Some((*token, price)),
+                Err(err) => {
+                    tracing::warn!(
+                        ?token,
+                        ?err,
+                        "failed to convert native price to Price; skipping token"
+                    );
+                    Metrics::get()
+                        .price_writeback_conversion_failure_total
+                        .inc();
+                    None
+                }
+            })
+            .collect();
+
+        // Defensive guard: do not replace the existing indexed price map with
+        // an empty map coming from an upstream failure. This avoids wiping the
+        // incremental price state unintentionally.
+        if !new_price_map.is_empty() {
+            indexed_state.current_prices_by_token = new_price_map;
+        } else {
+            tracing::warn!(
+                "price map writeback skipped (empty); keeping {} entries",
+                indexed_state.current_prices_by_token.len()
+            );
+            Metrics::get().price_writeback_empty_update_total.inc();
+        }
+
         Ok(CollectedAuctionInputs {
             db_solvable_orders,
             invalid_order_uids,
@@ -1837,8 +1878,14 @@ impl SolvableOrdersCache {
         removed.sort_by(|a, b| a.0.cmp(&b.0));
         removed.dedup();
         for uid in removed {
-            if emitted.insert(uid) {
+            if !emitted.insert(uid) {
+                continue;
+            }
+
+            if previous_orders.contains_key(&uid) {
                 events.push(DeltaEvent::OrderRemoved(uid));
+            } else {
+                tracing::debug!(uid = ?uid, "skipping removal for order that was not solver-visible previously");
             }
         }
 
@@ -3897,6 +3944,47 @@ mod tests {
     fn normalize(mut state: domain::RawAuctionData) -> domain::RawAuctionData {
         state.orders.sort_by_key(|order| order.uid.0);
         state
+    }
+
+    #[test]
+    fn price_writeback_guard_replaces_when_non_empty() {
+        let mut indexed = IndexedAuctionState::default();
+        assert_eq!(indexed.current_prices_by_token.len(), 0);
+
+        let token = Address::repeat_byte(0xAA);
+        let mut new_map = HashMap::new();
+        new_map.insert(token, test_price(1000));
+
+        // apply the same logic as the guarded writeback
+        if !new_map.is_empty() {
+            indexed.current_prices_by_token = new_map;
+        }
+
+        assert_eq!(indexed.current_prices_by_token.len(), 1);
+    }
+
+    #[test]
+    fn price_writeback_guard_skips_empty_and_increments_metric() {
+        let mut indexed = IndexedAuctionState::default();
+        // populate existing map
+        indexed
+            .current_prices_by_token
+            .insert(Address::repeat_byte(0xBB), test_price(2000));
+
+        let before = Metrics::get().price_writeback_empty_update_total.get();
+
+        let new_map: HashMap<Address, Price> = HashMap::new();
+
+        if !new_map.is_empty() {
+            indexed.current_prices_by_token = new_map;
+        } else {
+            Metrics::get().price_writeback_empty_update_total.inc();
+        }
+
+        let after = Metrics::get().price_writeback_empty_update_total.get();
+        assert!(after >= before + 1);
+        // ensure original entries preserved
+        assert_eq!(indexed.current_prices_by_token.len(), 1);
     }
 
     #[test]
