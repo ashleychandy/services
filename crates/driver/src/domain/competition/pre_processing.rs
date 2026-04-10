@@ -1466,10 +1466,11 @@ async fn build_solve_request_from_replica_resilient(
     replica_binding: Option<&SolveRequestReplicaBinding>,
     body_mode: SolveRequestBodyMode,
 ) -> Result<Option<SolveRequest>> {
-    // Full-body requests already carry the authoritative auction payload. Keep
-    // them bound to the body instead of silently replacing them with the local
-    // replica snapshot.
-    if body_mode == SolveRequestBodyMode::Full {
+    // Full-body requests already carry the authoritative auction payload.
+    // By default keep them bound to the body instead of silently replacing
+    // them with the local replica snapshot. This can be enabled via
+    // DRIVER_DELTA_SYNC_REPLICA_BIND_FULL_BODY for rollout testing.
+    if body_mode == SolveRequestBodyMode::Full && !delta_sync::replica_full_body_binding_enabled() {
         return Ok(None);
     }
 
@@ -2023,6 +2024,97 @@ mod tests {
         .await
         .unwrap();
         assert!(request.is_none());
+    }
+
+    #[tokio::test]
+    async fn full_requests_rebuild_from_ready_replica_when_flag_enabled() {
+        let _guard = DeltaReplicaTestGuard::acquire().await;
+        // Enable full-body replica binding for this test
+        crate::infra::delta_sync::set_replica_full_body_binding_override(Some(true));
+
+        set_replica_snapshot_for_tests(Snapshot {
+            version: 1,
+            boot_id: None,
+            auction_id: Some(77),
+            sequence: 5,
+            auction: RawAuctionData {
+                orders: vec![serde_json::json!({
+                    "uid": format!("0x{}", "77".repeat(56)),
+                    "sellToken": "0x0000000000000000000000000000000000000001",
+                    "buyToken": "0x0000000000000000000000000000000000000002",
+                    "sellAmount": "1",
+                    "buyAmount": "1",
+                    "protocolFees": [],
+                    "created": 1,
+                    "validTo": 100,
+                    "kind": "sell",
+                    "receiver": null,
+                    "owner": "0x0000000000000000000000000000000000000003",
+                    "partiallyFillable": false,
+                    "executed": "0",
+                    "preInteractions": [],
+                    "postInteractions": [],
+                    "class": "market",
+                    "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "signingScheme": "eip712",
+                    "signature": "0x00",
+                    "quote": null
+                })],
+                prices: HashMap::new(),
+            },
+        })
+        .await;
+
+        let metadata = SolveRequestMetadata {
+            id: 77,
+            tokens: vec![],
+            deadline: chrono::Utc::now(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+        let replica_snapshot = delta_sync::snapshot().await.expect("replica snapshot");
+        let replica_binding = SolveRequestReplicaBinding {
+            sequence: replica_snapshot.sequence,
+            order_uid_hash: replica_snapshot.order_uid_hash,
+            price_hash: replica_snapshot.price_hash,
+            order_content_hash: replica_snapshot.order_content_hash,
+        };
+
+        let request = build_solve_request_from_replica_resilient(
+            &metadata,
+            Some(&replica_binding),
+            SolveRequestBodyMode::Full,
+        )
+        .await
+        .unwrap();
+
+        // With the override enabled, a full-body request should be rebuilt
+        // from the replica and contain the expected auction id and order uid.
+        let req = request.expect("expected replica-built solve request");
+        assert_eq!(req.id(), 77);
+
+        // Inspect serialized JSON to assert the UID matches the snapshot entry.
+        let json = serde_json::to_value(&req).expect("serialize request to json");
+        let orders = json
+            .get("orders")
+            .and_then(|v| v.as_array())
+            .expect("orders array");
+        let uid_str = orders[0]
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .expect("uid string");
+        let expected_hex = "77".repeat(56);
+        assert_eq!(uid_str.trim_start_matches("0x"), expected_hex);
+
+        // Reset override and assert the default-off path returns None again.
+        crate::infra::delta_sync::set_replica_full_body_binding_override(None);
+        let request_after_reset = build_solve_request_from_replica_resilient(
+            &metadata,
+            Some(&replica_binding),
+            SolveRequestBodyMode::Full,
+        )
+        .await
+        .unwrap();
+        assert!(request_after_reset.is_none());
     }
 
     #[tokio::test]

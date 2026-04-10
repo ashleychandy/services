@@ -122,8 +122,10 @@ pub struct Metrics {
     /// high-level health dashboards and alerting).
     delta_incremental_failure_total: IntCounter,
 
+    /// Counter for failures during price-writeback conversion.
     price_writeback_conversion_failure_total: IntCounter,
 
+    /// Counter for empty updates during price-writeback.
     price_writeback_empty_update_total: IntCounter,
 
     /// Total incremental delta comparisons.
@@ -371,6 +373,8 @@ struct Inner {
     auction_sequence: u64,
     delta_sequence: u64,
     delta_history: VecDeque<DeltaEnvelope>,
+
+    pending_events: VecDeque<Vec<DeltaEvent>>,
     indexed_state: Arc<IndexedAuctionState>,
 }
 
@@ -567,6 +571,7 @@ impl SolvableOrdersCache {
             auction_sequence,
             delta_sequence,
             delta_history,
+            pending_events: VecDeque::new(),
             indexed_state,
         });
     }
@@ -603,7 +608,43 @@ impl SolvableOrdersCache {
             if let Some(envelope) = apply_auction_id_change(inner, auction_id, &self.delta_config) {
                 // Send while holding cache lock to keep replay + live ordering
                 // consistent (same pattern as update()).
-                send_or_warn!(self.delta_sender, envelope, "delta broadcast");
+                send_or_warn!(self.delta_sender, envelope.clone(), "delta broadcast");
+
+                // Flush any pending per-auction events that were queued while
+                // waiting for the authoritative auction id. Create real
+                // DeltaEnvelope instances with proper sequence numbers and
+                // broadcast them in order while holding the cache lock so
+                // ordering remains consistent.
+                while let Some(events) = inner.pending_events.pop_front() {
+                    // Advance global monotonic sequence and per-auction
+                    // sequence counters.
+                    let next_seq = inner.delta_sequence.checked_add(1).unwrap_or_else(|| {
+                        Metrics::get().delta_incremental_failure_total.inc();
+                        tracing::error!("delta sequence overflow while flushing pending events");
+                        inner.delta_sequence
+                    });
+
+                    let next_auction_seq = inner.auction_sequence.saturating_add(1);
+
+                    let pending_envelope = DeltaEnvelope {
+                        auction_id: inner.auction_id,
+                        auction_sequence: next_auction_seq,
+                        from_sequence: inner.delta_sequence,
+                        to_sequence: next_seq,
+                        published_at: chrono::Utc::now(),
+                        created_at_instant: Instant::now(),
+                        events,
+                    };
+
+                    inner.delta_sequence = next_seq;
+                    inner.auction_sequence = next_auction_seq;
+                    inner.delta_history.push_back(pending_envelope.clone());
+                    let max_age = chrono::Duration::from_std(self.delta_config.history_max_age)
+                        .unwrap_or_else(|_| chrono::Duration::seconds(60));
+                    prune_delta_history(&mut inner.delta_history, max_age, &self.delta_config);
+
+                    send_or_warn!(self.delta_sender, pending_envelope, "delta broadcast");
+                }
             }
         }
     }
@@ -1014,21 +1055,11 @@ impl SolvableOrdersCache {
 
         let should_recompute = projection_result.should_recompute_events();
         let auction_for_cache = projection_result.auction();
-        let envelope = DeltaEnvelope {
-            auction_id: current_auction_id,
-            auction_sequence: next_auction_sequence,
-            from_sequence: next_sequence.saturating_sub(1),
-            to_sequence: next_sequence,
-            published_at: chrono::Utc::now(),
-            created_at_instant: Instant::now(),
-            events,
-        };
-        delta_history.push_back(envelope.clone());
-        let max_age = chrono::Duration::from_std(self.delta_config.history_max_age)
-            .unwrap_or_else(|_| chrono::Duration::seconds(60));
-        prune_delta_history(&mut delta_history, max_age, &self.delta_config);
 
-        let indexed_state = if should_recompute {
+        // Precompute the indexed_state from the (new) auction so we can move
+        // the `auction_for_cache` value into the cache without later borrow/move
+        // conflicts.
+        let computed_indexed_state = if should_recompute {
             Arc::new(build_indexed_state(
                 &auction_for_cache,
                 &inputs.invalid_order_uids,
@@ -1045,19 +1076,76 @@ impl SolvableOrdersCache {
             }
         };
 
-        *cache = Some(Inner {
-            auction: auction_for_cache,
-            solvable_orders: inputs.db_solvable_orders,
-            auction_id: current_auction_id,
-            auction_sequence: next_auction_sequence,
-            delta_sequence: next_sequence,
-            delta_history,
-            indexed_state,
-        });
-        // Replay history is updated under the cache lock; subscribers build replay
-        // while holding the same lock, so sending while locked keeps replay +
-        // live ordering consistent.
-        send_or_warn!(self.delta_sender, envelope, "delta broadcast");
+        // Determine whether we are currently between auctions. If the cached
+        // auction differs from the newly computed auction, we must withhold
+        // broadcasting per-auction delta envelopes until the authoritative
+        // `AuctionChanged` envelope (and auction id assignment) occurs. In
+        // that case we append the computed `events` to `pending_events` and
+        // avoid mutating the global `delta_sequence` until the transition.
+        let is_transition_pending = cache
+            .as_ref()
+            .map(|inner| {
+                let auction_content_changed = inner.auction.orders != auction_for_cache.orders
+                    || inner.auction.prices != auction_for_cache.prices
+                    || inner.auction.surplus_capturing_jit_order_owners
+                        != auction_for_cache.surplus_capturing_jit_order_owners;
+
+                !inner.pending_events.is_empty() || auction_content_changed
+            })
+            .unwrap_or(false);
+
+        if is_transition_pending {
+            // Queue events for flushing after `set_auction_id()` is invoked.
+            let mut pending = cache
+                .as_ref()
+                .map(|inner| inner.pending_events.clone())
+                .unwrap_or_default();
+            pending.push_back(events);
+
+            // Preserve the current delta_sequence/auction_sequence and history
+            // until the authoritative auction id is assigned.
+            *cache = Some(Inner {
+                auction: auction_for_cache,
+                solvable_orders: inputs.db_solvable_orders,
+                auction_id: current_auction_id,
+                auction_sequence: previous_auction_sequence.unwrap_or_default(),
+                delta_sequence: previous_delta_sequence.unwrap_or_default(),
+                delta_history,
+                pending_events: pending,
+                indexed_state: computed_indexed_state.clone(),
+            });
+        } else {
+            let envelope = DeltaEnvelope {
+                auction_id: current_auction_id,
+                auction_sequence: next_auction_sequence,
+                from_sequence: next_sequence.saturating_sub(1),
+                to_sequence: next_sequence,
+                published_at: chrono::Utc::now(),
+                created_at_instant: Instant::now(),
+                events,
+            };
+            delta_history.push_back(envelope.clone());
+            let max_age = chrono::Duration::from_std(self.delta_config.history_max_age)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+            prune_delta_history(&mut delta_history, max_age, &self.delta_config);
+
+            let indexed_state = computed_indexed_state.clone();
+
+            *cache = Some(Inner {
+                auction: auction_for_cache,
+                solvable_orders: inputs.db_solvable_orders,
+                auction_id: current_auction_id,
+                auction_sequence: next_auction_sequence,
+                delta_sequence: next_sequence,
+                delta_history,
+                pending_events: VecDeque::new(),
+                indexed_state,
+            });
+            // Replay history is updated under the cache lock; subscribers build replay
+            // while holding the same lock, so sending while locked keeps replay +
+            // live ordering consistent.
+            send_or_warn!(self.delta_sender, envelope, "delta broadcast");
+        }
 
         tracing::debug!(%block, "updated current auction cache");
         Metrics::get()
@@ -4793,6 +4881,7 @@ mod tests {
             auction_sequence: 7,
             delta_sequence: 9,
             delta_history: VecDeque::new(),
+            pending_events: VecDeque::new(),
             indexed_state: Arc::new(IndexedAuctionState::default()),
         };
 
@@ -4827,6 +4916,7 @@ mod tests {
             auction_sequence: 2,
             delta_sequence: 3,
             delta_history: VecDeque::new(),
+            pending_events: VecDeque::new(),
             indexed_state: Arc::new(IndexedAuctionState::default()),
         };
 
@@ -4856,6 +4946,7 @@ mod tests {
             auction_sequence: 0,
             delta_sequence: u64::MAX,
             delta_history: VecDeque::new(),
+            pending_events: VecDeque::new(),
             indexed_state: Arc::new(IndexedAuctionState::default()),
         };
 
@@ -4908,6 +4999,7 @@ mod tests {
             auction_sequence: 2,
             delta_sequence: 2,
             delta_history: VecDeque::from([envelope.clone()]),
+            pending_events: VecDeque::new(),
             indexed_state: Arc::new(IndexedAuctionState::default()),
         };
 
@@ -4945,6 +5037,7 @@ mod tests {
             auction_sequence: 0,
             delta_sequence: 4,
             delta_history: VecDeque::from([envelope.clone()]),
+            pending_events: VecDeque::new(),
             indexed_state: Arc::new(IndexedAuctionState::default()),
         };
 
@@ -4953,6 +5046,63 @@ mod tests {
         assert!(matches!(
             replay.envelopes[0].events.first(),
             Some(DeltaEvent::AuctionChanged { new_auction_id: 8 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_auction_id_flushes_pending_events_in_order() {
+        let cache = test_cache().await;
+
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        // Initialize cache state: auction_id=1, auction_sequence=0, delta_sequence=10
+        cache
+            .set_state_for_tests(auction.clone(), 1, 0, 10, VecDeque::new())
+            .await;
+
+        // Add two pending event groups while holding the cache lock
+        {
+            let mut lock = cache.cache.lock().await;
+            if let Some(inner) = lock.as_mut() {
+                inner
+                    .pending_events
+                    .push_back(vec![DeltaEvent::OrderAdded(test_order(1, 10))]);
+                inner
+                    .pending_events
+                    .push_back(vec![DeltaEvent::OrderUpdated(test_order(2, 20))]);
+            }
+        }
+
+        let mut rx = cache.subscribe_deltas();
+
+        // Transition auction id to 2 and flush pending events
+        cache.set_auction_id(2).await;
+
+        // First envelope should be AuctionChanged for auction_id=2
+        let env1 = rx.recv().await.expect("expected first envelope");
+        assert!(matches!(
+            env1.events.first(),
+            Some(DeltaEvent::AuctionChanged { new_auction_id: 2 })
+        ));
+
+        // Next envelopes should be the pending events in order and carry auction_id=2
+        let env2 = rx.recv().await.expect("expected second envelope");
+        assert_eq!(env2.auction_id, 2);
+        assert!(matches!(
+            env2.events.first(),
+            Some(DeltaEvent::OrderAdded(_))
+        ));
+
+        let env3 = rx.recv().await.expect("expected third envelope");
+        assert_eq!(env3.auction_id, 2);
+        assert!(matches!(
+            env3.events.first(),
+            Some(DeltaEvent::OrderUpdated(_))
         ));
     }
 

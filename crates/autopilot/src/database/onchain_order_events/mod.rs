@@ -565,18 +565,13 @@ async fn get_quote(
         verification: Default::default(),
     };
 
-    get_quote_and_check_fee(
-        quoter,
-        &parameters.clone(),
-        Some(*quote_id),
-        Some(order_data.fee_amount),
-    )
-    .await
-    .map_err(|err| match err {
-        ValidationError::Partial(_) => OnchainOrderPlacementError::PreValidationError,
-        ValidationError::NonZeroFee => OnchainOrderPlacementError::NonZeroFee,
-        _ => OnchainOrderPlacementError::Other,
-    })
+    get_quote_and_check_fee(quoter, &parameters.clone(), Some(*quote_id), None)
+        .await
+        .map_err(|err| match err {
+            ValidationError::Partial(_) => OnchainOrderPlacementError::PreValidationError,
+            ValidationError::NonZeroFee => OnchainOrderPlacementError::NonZeroFee,
+            _ => OnchainOrderPlacementError::Other,
+        })
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -797,7 +792,7 @@ mod test {
                 signing_scheme_into,
             },
             fee::FeeParameters,
-            order_quoting::{MockOrderQuoting, Quote, QuoteData},
+            order_quoting::{Quote, QuoteData},
         },
         sqlx::PgPool,
     };
@@ -1184,12 +1179,14 @@ mod test {
 
         let log_1 = Log {
             block_number: Some(1),
+            transaction_hash: Some(TxHash::default()),
             log_index: Some(0),
             ..Default::default()
         };
         let event_data_1 = ContractEvent::OrderPlacement(order_placement.clone());
         let log_2 = Log {
             block_number: Some(3),
+            transaction_hash: Some(TxHash::default()),
             log_index: Some(0),
             ..Default::default()
         };
@@ -1199,7 +1196,9 @@ mod test {
         order_placement_2.data = vec![].into();
         let event_data_2 = ContractEvent::OrderPlacement(order_placement_2);
         let domain_separator = DomainSeparator([7u8; 32]);
-        let mut order_quoter = MockOrderQuoting::new();
+        // Use a simple deterministic quoter for this test instead of the mock.
+        // The mock can lead to synchronization surprises when used from
+        // asynchronous tasks; a concrete quoter here keeps behavior stable.
         let quote = Quote {
             id: Some(0i64),
             data: QuoteData {
@@ -1218,10 +1217,33 @@ mod test {
             buy_amount,
             fee_amount,
         };
-        let cloned_quote = quote.clone();
-        order_quoter
-            .expect_find_quote()
-            .returning(move |_, _| Ok(cloned_quote.clone()));
+
+        struct TestQuoter(Quote);
+        #[async_trait::async_trait]
+        impl shared::order_quoting::OrderQuoting for TestQuoter {
+            async fn calculate_quote(
+                &self,
+                _parameters: shared::order_quoting::QuoteParameters,
+            ) -> Result<Quote, shared::order_quoting::CalculateQuoteError> {
+                Err(shared::order_quoting::CalculateQuoteError::Other(
+                    anyhow::anyhow!("not implemented"),
+                ))
+            }
+
+            async fn store_quote(&self, quote: Quote) -> Result<Quote> {
+                Ok(quote)
+            }
+
+            async fn find_quote(
+                &self,
+                _id: Option<i64>,
+                _parameters: shared::order_quoting::QuoteSearchParameters,
+            ) -> Result<Quote, shared::order_quoting::FindQuoteError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let order_quoter = Arc::new(TestQuoter(quote.clone()));
         let mut custom_onchain_order_parser = MockOnchainOrderParsing::<u8, u8>::new();
         custom_onchain_order_parser
             .expect_parse_custom_event_data()
@@ -1253,7 +1275,7 @@ mod test {
                 .await
                 .unwrap(),
             web3,
-            quoter: Arc::new(order_quoter),
+            quoter: order_quoter,
             custom_onchain_data_parser: Box::new(custom_onchain_order_parser),
             domain_separator,
             settlement_contract: Address::ZERO,

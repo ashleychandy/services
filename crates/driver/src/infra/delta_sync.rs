@@ -1,6 +1,3 @@
-#[cfg(any(test, feature = "test-helpers"))]
-use std::sync::atomic::{AtomicU8, Ordering};
-
 use {
     crate::{
         domain::competition::delta_replica::{
@@ -21,7 +18,7 @@ use {
             LazyLock,
             OnceLock,
             RwLock as StdRwLock,
-            atomic::{AtomicU32, AtomicU64},
+            atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
         },
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
@@ -65,7 +62,10 @@ pub fn set_driver_delta_sync_autopilot_url_override(value: Option<Url>) {
         .lock()
         .expect("driver delta sync autopilot url override lock poisoned") = value;
 }
-static REPLICA_PREPROCESSING_ENABLED: OnceLock<bool> = OnceLock::new();
+// 0 = unset, 1 = enabled, 2 = disabled
+static REPLICA_PREPROCESSING_STATE: AtomicU8 = AtomicU8::new(0);
+// 0 = unset, 1 = enabled, 2 = disabled
+static REPLICA_FULL_BODY_BINDING_STATE: AtomicU8 = AtomicU8::new(0);
 static DELTA_REPLICA_MAX_STALENESS: OnceLock<Option<Duration>> = OnceLock::new();
 static DELTA_REPLICA_RESNAPSHOT_INTERVAL: OnceLock<Option<Duration>> = OnceLock::new();
 static BOOTSTRAP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -538,8 +538,27 @@ pub async fn replica_health() -> Option<ReplicaHealth> {
     drop(replica);
 
     if let (Some(base_url), Some(local_checksum)) = (base_url, local_checksum) {
-        if let Err(err) = compare_replica_checksum(&base_url, local_checksum).await {
-            tracing::warn!(?err, "delta replica checksum comparison failed");
+        // Clone the checksum so we can pass an owned value into the remote
+        // comparison while still retaining the original for logging.
+        let local_checksum_clone = local_checksum.clone();
+        match compare_replica_checksum(&base_url, local_checksum_clone).await {
+            Ok(true) => {
+                // Replica checksum matches remote; proceed to report health.
+            }
+            Ok(false) => {
+                // Replica diverged from remote checksum: treat as unhealthy so
+                // the health endpoint can report an explicit failure.
+                tracing::warn!(
+                    local_sequence = local_checksum.sequence,
+                    "delta replica checksum mismatch; reporting unhealthy"
+                );
+                return None;
+            }
+            Err(err) => {
+                // On transient errors, keep reporting the replica as available
+                // but surface a warning to logs for investigation.
+                tracing::warn!(?err, "delta replica checksum comparison failed");
+            }
         }
     }
 
@@ -626,18 +645,59 @@ pub async fn ensure_replica_snapshot_from_env() -> anyhow::Result<bool> {
 }
 
 pub fn replica_preprocessing_enabled() -> bool {
+    // Test override (highest precedence)
     #[cfg(any(test, feature = "test-helpers"))]
     if let Some(value) = replica_preprocessing_override() {
         return value;
     }
-    *REPLICA_PREPROCESSING_ENABLED.get_or_init(|| {
-        shared::env::flag_enabled(
-            std::env::var("DRIVER_DELTA_SYNC_USE_REPLICA")
-                .ok()
-                .as_deref(),
-            false,
-        )
-    })
+
+    // Runtime override/state: if set, use it; otherwise read env var and cache
+    // the resolved value in the atomic state for subsequent fast reads.
+    let state = REPLICA_PREPROCESSING_STATE.load(Ordering::Relaxed);
+    if state != 0 {
+        return state == 1;
+    }
+
+    let enabled = shared::env::flag_enabled(
+        std::env::var("DRIVER_DELTA_SYNC_USE_REPLICA")
+            .ok()
+            .as_deref(),
+        false,
+    );
+    let new_state = if enabled { 1 } else { 2 };
+    let _ = REPLICA_PREPROCESSING_STATE.compare_exchange(
+        0,
+        new_state,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    enabled
+}
+
+/// Return whether full-body requests should be allowed to bind to the delta
+/// replica (opt-in via env or test override). Default: false.
+pub fn replica_full_body_binding_enabled() -> bool {
+    let state = REPLICA_FULL_BODY_BINDING_STATE.load(Ordering::Relaxed);
+    if state != 0 {
+        return state == 1;
+    }
+
+    // No override: consult env var. Use compare_exchange to avoid a benign
+    // race where multiple threads compute and store the same result.
+    let enabled = shared::env::flag_enabled(
+        std::env::var("DRIVER_DELTA_SYNC_REPLICA_BIND_FULL_BODY")
+            .ok()
+            .as_deref(),
+        false,
+    );
+    let new_state = if enabled { 1 } else { 2 };
+    let _ = REPLICA_FULL_BODY_BINDING_STATE.compare_exchange(
+        0,
+        new_state,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    enabled
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -657,6 +717,17 @@ pub fn set_replica_preprocessing_override(value: Option<bool>) {
         None => 0,
     };
     REPLICA_PREPROCESSING_OVERRIDE.store(encoded, Ordering::SeqCst);
+}
+
+/// Test override (and runtime state) setter for full-body replica binding.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn set_replica_full_body_binding_override(value: Option<bool>) {
+    let encoded = match value {
+        Some(true) => 1,
+        Some(false) => 2,
+        None => 0,
+    };
+    REPLICA_FULL_BODY_BINDING_STATE.store(encoded, Ordering::SeqCst);
 }
 
 async fn run(
@@ -1922,6 +1993,63 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
         assert_eq!(health.order_count, 1);
         assert!(health.last_update.is_some());
         assert!(health.last_update_age_seconds.is_some());
+    }
+
+    #[tokio::test]
+    async fn replica_health_returns_none_on_checksum_mismatch() {
+        // Ensure clean global replica state for the test.
+        let _guard = DeltaReplicaTestGuard::acquire().await;
+
+        // Start a small HTTP server that returns a checksum differing from
+        // the local replica's checksum.
+        use axum::{Json, Router, response::IntoResponse, routing::get};
+
+        let app = Router::new().route(
+            "/delta/checksum",
+            get(|| async move {
+                let payload = serde_json::json!({
+                    "version": 1u32,
+                    "sequence": 1u64,
+                    "orderUidHash": "mismatch",
+                    "priceHash": "mismatch",
+                    "orderContentHash": "mismatch",
+                });
+                (axum::http::StatusCode::OK, Json(payload)).into_response()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Point the delta sync base URL override at the test server.
+        set_driver_delta_sync_autopilot_url_override(Some(
+            Url::parse(&format!("http://{addr}")).unwrap(),
+        ));
+
+        // Apply a local snapshot so the replica has a checksum to compare.
+        set_replica_snapshot_for_tests(Snapshot {
+            version: 1,
+            boot_id: None,
+            auction_id: Some(0),
+            sequence: 1,
+            auction: crate::domain::competition::delta_replica::RawAuctionData {
+                orders: vec![valid_order(&valid_uid(1))],
+                prices: HashMap::new(),
+            },
+        })
+        .await;
+
+        // When the remote checksum differs, replica_health should report None
+        // so the HTTP health route can return SERVICE_UNAVAILABLE.
+        let health = replica_health().await;
+        assert!(
+            health.is_none(),
+            "expected replica_health() to return None on checksum mismatch"
+        );
+
+        // Clean up server
+        server.abort();
     }
 
     #[tokio::test]
