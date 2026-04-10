@@ -794,6 +794,68 @@ mod tests {
     }
 
     #[test]
+    fn removing_unknown_order_is_idempotent() {
+        let mut replica = Replica::default();
+        let uid_known = uid_from_u16(1);
+        let uid_unknown = uid_from_u16(2);
+
+        replica
+            .apply_snapshot(Snapshot {
+                version: 1,
+                boot_id: None,
+                auction_id: Some(0),
+                sequence: 5,
+                auction: RawAuctionData {
+                    orders: vec![valid_order(&uid_known)],
+                    prices: HashMap::new(),
+                },
+            })
+            .unwrap();
+
+        // Remove an order that doesn't exist in the replica; this should
+        // not error and should advance the sequence while keeping existing
+        // known orders intact.
+        replica
+            .apply_delta(envelope(
+                5,
+                6,
+                vec![Event::OrderRemoved {
+                    uid: uid_unknown.clone(),
+                }],
+            ))
+            .unwrap();
+
+        assert_eq!(replica.sequence(), 6);
+        assert_eq!(replica.orders().len(), 1);
+        assert!(replica.orders().contains_key(&uid_known));
+        assert!(!replica.orders().contains_key(&uid_unknown));
+    }
+
+    #[test]
+    fn updating_unknown_order_inserts() {
+        let mut replica = Replica::default();
+        let uid_unknown = uid_from_u16(2);
+
+        // Start from an empty snapshot
+        replica.apply_snapshot(snapshot(5, vec![])).unwrap();
+
+        // An OrderUpdated for an unknown UID should upsert the order into the replica
+        replica
+            .apply_delta(envelope(
+                5,
+                6,
+                vec![Event::OrderUpdated {
+                    order: valid_order(&uid_unknown),
+                }],
+            ))
+            .unwrap();
+
+        assert_eq!(replica.sequence(), 6);
+        assert!(replica.orders().contains_key(&uid_unknown));
+        assert_eq!(replica.orders().len(), 1);
+    }
+
+    #[test]
     fn overlapping_envelope_is_rejected() {
         let mut replica = Replica::default();
         replica.apply_snapshot(snapshot(8, vec![])).unwrap();

@@ -207,7 +207,7 @@ impl From<auction::Error> for Error {
 }
 
 #[serde_as]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SolveRequest {
     #[serde_as(as = "serde_with::DisplayFromStr")]
@@ -240,6 +240,13 @@ impl SolveRequest {
         &self.surplus_capturing_jit_order_owners
     }
 
+    #[cfg(test)]
+    pub(crate) fn order_uids(&self) -> impl Iterator<Item = &[u8; order::UID_LEN]> + '_ {
+        // Test-only accessor to inspect the request rebuilt from replica state
+        // without requiring serialization support on the whole DTO.
+        self.orders.iter().map(|order| &order.uid)
+    }
+
     pub fn from_replica_parts(
         id: i64,
         deadline: chrono::DateTime<chrono::Utc>,
@@ -265,7 +272,7 @@ impl SolveRequest {
 }
 
 #[serde_as]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Token {
     pub address: eth::Address,

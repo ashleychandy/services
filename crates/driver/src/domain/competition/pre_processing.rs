@@ -1625,6 +1625,7 @@ mod tests {
             infra::delta_sync::{
                 DeltaReplicaTestGuard,
                 set_driver_delta_sync_autopilot_url_override,
+                set_driver_delta_sync_enabled_override,
                 set_replica_snapshot_for_tests,
                 set_replica_state_for_tests,
             },
@@ -2175,5 +2176,164 @@ mod tests {
         .await
         .unwrap();
         assert!(request.is_some());
+    }
+
+    #[tokio::test]
+    async fn thin_request_bootstraps_on_binding_mismatch() {
+        let _guard = DeltaReplicaTestGuard::acquire().await;
+
+        // Create a snapshot payload that the bootstrap endpoint will return.
+        let uid = format!("0x{}", "99".repeat(56));
+        let order_val = serde_json::json!({
+            "uid": uid,
+            "sellToken": format!("0x{}", hex::encode([0x01u8; 20])),
+            "buyToken": format!("0x{}", hex::encode([0x02u8; 20])),
+            "sellAmount": "1",
+            "buyAmount": "1",
+            "protocolFees": [],
+            "created": 1,
+            "validTo": 100,
+            "kind": "sell",
+            "receiver": serde_json::Value::Null,
+            "owner": format!("0x{}", hex::encode([0x03u8; 20])),
+            "partiallyFillable": false,
+            "executed": "0",
+            "preInteractions": [],
+            "postInteractions": [],
+            "class": "market",
+            "appData": format!("0x{}", hex::encode([0u8; 32])),
+            "signingScheme": "eip712",
+            "signature": format!("0x{}", hex::encode([0u8; 1])),
+            "quote": serde_json::Value::Null
+        });
+
+        let snapshot_json = serde_json::json!({
+            "version": 1,
+            "auctionId": 100,
+            "sequence": 5,
+            "auction": {
+                "orders": [order_val.clone()],
+                "prices": {}
+            }
+        })
+        .to_string();
+
+        // Start a minimal HTTP server that serves the snapshot at /delta/snapshot.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let snapshot_payload = snapshot_json.clone();
+        let app =
+            axum::Router::new().route(
+                "/delta/snapshot",
+                axum::routing::get(move || {
+                    let payload = snapshot_payload.clone();
+                    async move {
+                        axum::Json(serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+                    }
+                }),
+            );
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Guard to ensure the test HTTP server is aborted even if the test
+        // panics. Aborting the JoinHandle is synchronous and safe inside
+        // `Drop` so this avoids leaving the server running across tests.
+        struct ServerGuard(Option<tokio::task::JoinHandle<()>>);
+        impl ServerGuard {
+            fn new(h: tokio::task::JoinHandle<()>) -> Self {
+                Self(Some(h))
+            }
+        }
+        impl Drop for ServerGuard {
+            fn drop(&mut self) {
+                if let Some(h) = self.0.take() {
+                    h.abort();
+                }
+            }
+        }
+        let _server_guard = ServerGuard::new(server);
+
+        // Apply the server snapshot locally to compute the expected binding.
+        set_replica_snapshot_for_tests(Snapshot {
+            version: 1,
+            boot_id: None,
+            auction_id: Some(100),
+            sequence: 5,
+            auction: RawAuctionData {
+                orders: vec![order_val.clone()],
+                prices: HashMap::new(),
+            },
+        })
+        .await;
+
+        let rep = crate::infra::delta_sync::snapshot()
+            .await
+            .expect("replica snapshot");
+        let binding = SolveRequestReplicaBinding {
+            sequence: rep.sequence,
+            order_uid_hash: rep.order_uid_hash.clone(),
+            price_hash: rep.price_hash.clone(),
+            order_content_hash: rep.order_content_hash.clone(),
+        };
+
+        // Mutate the local replica to a stale state so the binding no longer matches.
+        set_replica_snapshot_for_tests(Snapshot {
+            version: 1,
+            boot_id: None,
+            auction_id: Some(1),
+            sequence: 1,
+            auction: RawAuctionData {
+                orders: vec![],
+                prices: HashMap::new(),
+            },
+        })
+        .await;
+
+        // Configure bootstrap endpoint override to point at our test server.
+        set_driver_delta_sync_enabled_override(Some(true));
+        set_driver_delta_sync_autopilot_url_override(Some(
+            reqwest::Url::parse(&format!("http://{}", addr)).unwrap(),
+        ));
+
+        // Guard to ensure we reset the global overrides even on panic.
+        struct OverridesGuard;
+        impl Drop for OverridesGuard {
+            fn drop(&mut self) {
+                set_driver_delta_sync_autopilot_url_override(None);
+                set_driver_delta_sync_enabled_override(None);
+            }
+        }
+        let _overrides_guard = OverridesGuard;
+
+        let metadata = SolveRequestMetadata {
+            id: 100,
+            tokens: Vec::new(),
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        // Now call the resilient builder: it should detect the binding mismatch,
+        // perform a bootstrap from the test server, and succeed.
+        let res = build_solve_request_from_replica_resilient(
+            &metadata,
+            Some(&binding),
+            SolveRequestBodyMode::Thin,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            res.is_some(),
+            "expected bootstrap to succeed and return a request"
+        );
+
+        // Verify the rebuilt request contains the bootstrapped order.
+        let count = res.as_ref().unwrap().order_uids().count();
+        assert_eq!(
+            count, 1,
+            "rebuilt request should contain the bootstrapped order"
+        );
     }
 }

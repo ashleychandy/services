@@ -368,6 +368,8 @@ pub struct DeltaReplay {
 ///   the authoritative ordering counter used for replay and gap detection.
 struct Inner {
     auction: domain::RawAuctionData,
+
+    committed_auction: domain::RawAuctionData,
     solvable_orders: boundary::SolvableOrders,
     auction_id: u64,
     auction_sequence: u64,
@@ -516,7 +518,8 @@ impl SolvableOrdersCache {
                 auction_sequence: inner.auction_sequence,
                 sequence: inner.delta_sequence,
                 oldest_available,
-                auction: inner.auction.clone(),
+
+                auction: inner.committed_auction.clone(),
             }
         })
     }
@@ -542,9 +545,10 @@ impl SolvableOrdersCache {
         let inner = lock.as_ref()?;
         Some(DeltaChecksum {
             sequence: inner.delta_sequence,
-            order_uid_hash: checksum_order_uids(&inner.auction.orders),
-            price_hash: checksum_prices(&inner.auction.prices),
-            order_content_hash: checksum_order_contents(&inner.auction.orders),
+
+            order_uid_hash: checksum_order_uids(&inner.committed_auction.orders),
+            price_hash: checksum_prices(&inner.committed_auction.prices),
+            order_content_hash: checksum_order_contents(&inner.committed_auction.orders),
         })
     }
 
@@ -560,6 +564,7 @@ impl SolvableOrdersCache {
         let indexed_state = Arc::new(build_indexed_state(&auction, &HashMap::new(), &Vec::new()));
         let mut lock = self.cache.lock().await;
         *lock = Some(Inner {
+            committed_auction: auction.clone(),
             auction,
             solvable_orders: boundary::SolvableOrders {
                 orders: HashMap::new(),
@@ -597,12 +602,8 @@ impl SolvableOrdersCache {
         self.delta_sender.receiver_count()
     }
 
-    /// Updates the auction ID and emits an AuctionChanged delta event if
-    /// changed.
-    ///
-    /// This must only be called from the run loop, which serializes calls
-    /// externally. The cache lock alone is sufficient here.
     pub async fn set_auction_id(&self, auction_id: u64) {
+        let _update_guard = self.update_lock.lock().await;
         let mut lock = self.cache.lock().await;
         if let Some(inner) = lock.as_mut() {
             if let Some(envelope) = apply_auction_id_change(inner, auction_id, &self.delta_config) {
@@ -645,6 +646,8 @@ impl SolvableOrdersCache {
 
                     send_or_warn!(self.delta_sender, pending_envelope, "delta broadcast");
                 }
+
+                inner.committed_auction = inner.auction.clone();
             }
         }
     }
@@ -1082,15 +1085,13 @@ impl SolvableOrdersCache {
         // `AuctionChanged` envelope (and auction id assignment) occurs. In
         // that case we append the computed `events` to `pending_events` and
         // avoid mutating the global `delta_sequence` until the transition.
+        let committed_auction = cache.as_ref().map(|inner| inner.committed_auction.clone());
         let is_transition_pending = cache
             .as_ref()
             .map(|inner| {
-                let auction_content_changed = inner.auction.orders != auction_for_cache.orders
-                    || inner.auction.prices != auction_for_cache.prices
-                    || inner.auction.surplus_capturing_jit_order_owners
-                        != auction_for_cache.surplus_capturing_jit_order_owners;
-
-                !inner.pending_events.is_empty() || auction_content_changed
+                // Gate on the full auction surface so block changes are held
+                // behind the same auction boundary as order/price changes.
+                !inner.pending_events.is_empty() || inner.auction != auction_for_cache
             })
             .unwrap_or(false);
 
@@ -1106,6 +1107,8 @@ impl SolvableOrdersCache {
             // until the authoritative auction id is assigned.
             *cache = Some(Inner {
                 auction: auction_for_cache,
+                committed_auction: committed_auction
+                    .expect("transition-pending cache state must already exist"),
                 solvable_orders: inputs.db_solvable_orders,
                 auction_id: current_auction_id,
                 auction_sequence: previous_auction_sequence.unwrap_or_default(),
@@ -1132,6 +1135,7 @@ impl SolvableOrdersCache {
             let indexed_state = computed_indexed_state.clone();
 
             *cache = Some(Inner {
+                committed_auction: auction_for_cache.clone(),
                 auction: auction_for_cache,
                 solvable_orders: inputs.db_solvable_orders,
                 auction_id: current_auction_id,
@@ -3220,31 +3224,36 @@ mod tests {
 
         // ---- Second update: same order, different block number ----
         cache.update(2, false).await.expect("second update failed");
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "block-only change must stay pending until the auction boundary is published"
+        );
+
+        cache.set_auction_id(1).await;
+
+        let transition = receiver
+            .try_recv()
+            .expect("auction transition envelope should have been sent");
+        assert!(matches!(
+            transition.events.first(),
+            Some(DeltaEvent::AuctionChanged { new_auction_id: 1 })
+        ));
 
         let envelope2 = receiver
             .try_recv()
-            .expect("second envelope should have been sent");
-        assert_eq!(envelope2.from_sequence, 1);
-        assert_eq!(envelope2.to_sequence, 2);
-        // The order is unchanged so the incremental diff must not emit any order
-        // events.  If it does, the diff logic has a bug.
-        assert!(
-            !envelope2.events.iter().any(|e| matches!(
-                e,
-                DeltaEvent::OrderAdded(_)
-                    | DeltaEvent::OrderRemoved(_)
-                    | DeltaEvent::OrderUpdated(_)
-            )),
-            "second update with unchanged order must emit no order events; got: {:?}",
-            envelope2.events
-        );
-        // Block number changed from 1 to 2, so BlockChanged must be present.
+            .expect("pending block envelope should have been flushed");
+        assert_eq!(envelope2.auction_id, 1);
+        assert_eq!(envelope2.from_sequence, 2);
+        assert_eq!(envelope2.to_sequence, 3);
         assert!(
             envelope2
                 .events
                 .iter()
                 .any(|e| matches!(e, DeltaEvent::BlockChanged { block: 2 })),
-            "second update must emit BlockChanged {{ block: 2 }}; got: {:?}",
+            "block-only change must flush after AuctionChanged under the new auction id; got: {:?}",
             envelope2.events
         );
 
@@ -3252,7 +3261,7 @@ mod tests {
             .delta_sequence()
             .await
             .expect("sequence missing after second update");
-        assert_eq!(seq2, 2);
+        assert_eq!(seq2, 3);
         assert!(seq2 > seq1, "sequence must be strictly increasing");
 
         // The snapshot must reflect the final sequence.
@@ -4864,13 +4873,15 @@ mod tests {
 
     #[test]
     fn apply_auction_id_change_keeps_sequence_monotonic() {
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
         let mut inner = Inner {
-            auction: domain::RawAuctionData {
-                block: 1,
-                orders: Vec::new(),
-                prices: HashMap::new(),
-                surplus_capturing_jit_order_owners: Vec::new(),
-            },
+            auction: auction.clone(),
+            committed_auction: auction,
             solvable_orders: boundary::SolvableOrders {
                 orders: HashMap::new(),
                 quotes: HashMap::new(),
@@ -4899,13 +4910,15 @@ mod tests {
 
     #[test]
     fn apply_auction_id_change_returns_none_when_unchanged() {
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
         let mut inner = Inner {
-            auction: domain::RawAuctionData {
-                block: 1,
-                orders: Vec::new(),
-                prices: HashMap::new(),
-                surplus_capturing_jit_order_owners: Vec::new(),
-            },
+            auction: auction.clone(),
+            committed_auction: auction,
             solvable_orders: boundary::SolvableOrders {
                 orders: HashMap::new(),
                 quotes: HashMap::new(),
@@ -4929,13 +4942,15 @@ mod tests {
 
     #[test]
     fn apply_auction_id_change_returns_none_on_sequence_overflow() {
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
         let mut inner = Inner {
-            auction: domain::RawAuctionData {
-                block: 1,
-                orders: Vec::new(),
-                prices: HashMap::new(),
-                surplus_capturing_jit_order_owners: Vec::new(),
-            },
+            auction: auction.clone(),
+            committed_auction: auction,
             solvable_orders: boundary::SolvableOrders {
                 orders: HashMap::new(),
                 quotes: HashMap::new(),
@@ -4982,13 +4997,15 @@ mod tests {
             created_at_instant: Instant::now(),
             events: vec![DeltaEvent::OrderAdded(test_order(1, 10))],
         };
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: vec![test_order(1, 10)],
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
         let inner = Inner {
-            auction: domain::RawAuctionData {
-                block: 1,
-                orders: vec![test_order(1, 10)],
-                prices: HashMap::new(),
-                surplus_capturing_jit_order_owners: Vec::new(),
-            },
+            auction: auction.clone(),
+            committed_auction: auction,
             solvable_orders: boundary::SolvableOrders {
                 orders: HashMap::new(),
                 quotes: HashMap::new(),
@@ -5020,13 +5037,15 @@ mod tests {
             created_at_instant: Instant::now(),
             events: vec![DeltaEvent::AuctionChanged { new_auction_id: 8 }],
         };
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
         let inner = Inner {
-            auction: domain::RawAuctionData {
-                block: 1,
-                orders: Vec::new(),
-                prices: HashMap::new(),
-                surplus_capturing_jit_order_owners: Vec::new(),
-            },
+            auction: auction.clone(),
+            committed_auction: auction,
             solvable_orders: boundary::SolvableOrders {
                 orders: HashMap::new(),
                 quotes: HashMap::new(),
@@ -5104,6 +5123,87 @@ mod tests {
             env3.events.first(),
             Some(DeltaEvent::OrderUpdated(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_checksum_remain_committed_during_pending_window() {
+        let cache = test_cache().await;
+
+        let old_auction = domain::RawAuctionData {
+            block: 1,
+            orders: vec![test_order(1, 10)],
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        // initialize committed state
+        cache
+            .set_state_for_tests(old_auction.clone(), 1, 1, 1, VecDeque::new())
+            .await;
+
+        // create a candidate/new auction (simulating update() having swapped candidate)
+        let new_auction = domain::RawAuctionData {
+            block: 2,
+            orders: vec![test_order(2, 20)],
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        // Mutate cache under lock to simulate transition-pending state
+        {
+            let mut lock = cache.cache.lock().await;
+            if let Some(inner) = lock.as_mut() {
+                inner.auction = new_auction.clone();
+                inner
+                    .pending_events
+                    .push_back(vec![DeltaEvent::BlockChanged { block: 2 }]);
+                // committed_auction and delta_sequence intentionally unchanged
+            }
+        }
+
+        // current_auction should reflect the candidate
+        let current = cache
+            .current_auction()
+            .await
+            .expect("current auction present");
+        assert_eq!(current.block, 2);
+
+        // delta_snapshot must still reflect committed auction and sequence
+        let snapshot = cache.delta_snapshot().await.expect("snapshot present");
+        assert_eq!(snapshot.auction.block, 1);
+        assert_eq!(snapshot.sequence, 1);
+
+        // delta_checksum must be computed from committed auction
+        let checksum = cache.delta_checksum().await.expect("checksum present");
+        assert_eq!(checksum.sequence, 1);
+        assert_eq!(
+            checksum.order_uid_hash,
+            checksum_order_uids(&old_auction.orders)
+        );
+
+        // Now flush pending events and advance the committed state by
+        // publishing the auction boundary. This should make snapshots and
+        // checksums reflect the candidate auction.
+        cache.set_auction_id(2).await;
+
+        let snapshot2 = cache
+            .delta_snapshot()
+            .await
+            .expect("snapshot present after flush");
+        assert_eq!(snapshot2.auction.block, 2);
+        // The auction-change envelope increments the global delta sequence
+        // once, and flushing the pending event increments it again.
+        assert_eq!(snapshot2.sequence, 3);
+
+        let checksum2 = cache
+            .delta_checksum()
+            .await
+            .expect("checksum present after flush");
+        assert_eq!(checksum2.sequence, 3);
+        assert_eq!(
+            checksum2.order_uid_hash,
+            checksum_order_uids(&new_auction.orders)
+        );
     }
 
     #[test]

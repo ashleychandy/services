@@ -1762,6 +1762,7 @@ mod tests {
     #[tokio::test]
     async fn delta_snapshot_http_response_is_consistent_with_history() {
         let _guard = DeltaSyncEnabledGuard::set(true);
+        let _guard_key = ApiKeyOverrideGuard::set(None);
         let cache = test_cache().await;
 
         let token = Address::repeat_byte(0x11);
@@ -1897,9 +1898,209 @@ mod tests {
     }
 
     #[serial_test::serial]
+    #[tokio::test]
+    #[ignore = "requires database-backed update pipeline"]
+    async fn snapshot_and_checksum_stay_committed_while_candidate_pending() {
+        let _guard_enabled = DeltaSyncEnabledGuard::set(true);
+        let _guard_key = ApiKeyOverrideGuard::set(None);
+        let (cache, postgres) = db_cache().await;
+
+        // Establish a committed empty baseline at sequence=1 using the real
+        // update path before staging a new candidate auction.
+        cache.update(1, false).await.unwrap();
+
+        let state = State {
+            estimator: Arc::new(StubNativePriceEstimator::default()),
+            allowed_timeout: MIN_TIMEOUT..=MIN_TIMEOUT,
+            solvable_orders_cache: Arc::clone(&cache),
+        };
+        let app = build_router(state);
+
+        let baseline_snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/delta/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(baseline_snapshot.status(), StatusCode::OK);
+        let baseline_snapshot: DeltaSnapshotResponse = serde_json::from_slice(
+            &body::to_bytes(baseline_snapshot.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(baseline_snapshot.sequence, 1);
+        assert!(baseline_snapshot.auction.orders.is_empty());
+
+        let baseline_checksum = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/delta/checksum")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(baseline_checksum.status(), StatusCode::OK);
+        let baseline_checksum: DeltaChecksumResponse = serde_json::from_slice(
+            &body::to_bytes(baseline_checksum.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(baseline_checksum.sequence, 1);
+
+        let uid: database::OrderUid = ByteArray([0x21; 56]);
+        let app_data: database::AppId = ByteArray([0x22; 32]);
+        let now = Utc::now();
+
+        let mut conn = postgres.pool.acquire().await.unwrap();
+        database::app_data::insert(&mut conn, &app_data, b"{}")
+            .await
+            .unwrap();
+        database::orders::insert_order(
+            &mut conn,
+            &database::orders::Order {
+                uid,
+                owner: ByteArray([0x33; 20]),
+                creation_timestamp: now,
+                sell_token: ByteArray([0x44; 20]),
+                buy_token: ByteArray([0x55; 20]),
+                receiver: None,
+                sell_amount: BigDecimal::from(1000u64),
+                buy_amount: BigDecimal::from(900u64),
+                valid_to: now.timestamp() + 600,
+                app_data,
+                fee_amount: BigDecimal::from(0u64),
+                kind: database::orders::OrderKind::Sell,
+                partially_fillable: false,
+                signature: vec![0u8; 65],
+                signing_scheme: database::orders::SigningScheme::Eip712,
+                settlement_contract: ByteArray([0x66; 20]),
+                sell_token_balance: database::orders::SellTokenSource::Erc20,
+                buy_token_balance: database::orders::BuyTokenDestination::Erc20,
+                cancellation_timestamp: None,
+                class: database::orders::OrderClass::Limit,
+            },
+        )
+        .await
+        .unwrap();
+        drop(conn);
+
+        // This stages a newer candidate auction but must not advance the
+        // externally visible snapshot/checksum until the auction boundary is
+        // flushed.
+        cache.update(2, false).await.unwrap();
+
+        let pending_snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/delta/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending_snapshot.status(), StatusCode::OK);
+        let pending_snapshot: DeltaSnapshotResponse = serde_json::from_slice(
+            &body::to_bytes(pending_snapshot.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pending_snapshot.sequence, baseline_snapshot.sequence);
+        assert_eq!(pending_snapshot.auction_id, baseline_snapshot.auction_id);
+        assert!(pending_snapshot.auction.orders.is_empty());
+
+        let pending_checksum = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/delta/checksum")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending_checksum.status(), StatusCode::OK);
+        let pending_checksum: DeltaChecksumResponse = serde_json::from_slice(
+            &body::to_bytes(pending_checksum.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pending_checksum.sequence, baseline_checksum.sequence);
+        assert_eq!(
+            pending_checksum.order_uid_hash,
+            baseline_checksum.order_uid_hash
+        );
+        assert_eq!(pending_checksum.price_hash, baseline_checksum.price_hash);
+        assert_eq!(
+            pending_checksum.order_content_hash,
+            baseline_checksum.order_content_hash
+        );
+
+        cache.set_auction_id(2).await;
+
+        let committed_snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/delta/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed_snapshot.status(), StatusCode::OK);
+        let committed_snapshot: DeltaSnapshotResponse = serde_json::from_slice(
+            &body::to_bytes(committed_snapshot.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(committed_snapshot.auction_id, 2);
+        assert_eq!(committed_snapshot.sequence, 3);
+        assert_eq!(committed_snapshot.auction.orders.len(), 1);
+
+        let committed_checksum = app
+            .oneshot(
+                Request::builder()
+                    .uri("/delta/checksum")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed_checksum.status(), StatusCode::OK);
+        let committed_checksum: DeltaChecksumResponse = serde_json::from_slice(
+            &body::to_bytes(committed_checksum.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(committed_checksum.sequence, 3);
+        assert_ne!(
+            committed_checksum.order_uid_hash,
+            baseline_checksum.order_uid_hash
+        );
+        assert_ne!(
+            committed_checksum.order_content_hash,
+            baseline_checksum.order_content_hash
+        );
+    }
+
+    #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slow_consumer_gets_resync_required_event() {
         let _guard_enabled = DeltaSyncEnabledGuard::set(true);
+        let _guard_key = ApiKeyOverrideGuard::set(None);
         let _guard_buffer = DeltaStreamBufferGuard::set(1);
         let cache = test_cache().await;
         cache
@@ -2227,6 +2428,7 @@ mod tests {
     #[tokio::test]
     async fn get_delta_snapshot_when_cache_has_data() {
         let _guard = DeltaSyncEnabledGuard::set(true);
+        let _guard_key = ApiKeyOverrideGuard::set(None);
         let cache = test_cache().await;
 
         let auction = domain::RawAuctionData {
@@ -2320,6 +2522,7 @@ mod tests {
     #[tokio::test]
     async fn get_delta_checksum_returns_204_when_no_snapshot() {
         let _guard = DeltaSyncEnabledGuard::set(true);
+        let _guard_key = ApiKeyOverrideGuard::set(None);
         let cache = test_cache().await;
 
         let state = State {
@@ -2346,6 +2549,7 @@ mod tests {
     #[tokio::test]
     async fn get_delta_checksum_returns_correct_hash_when_snapshot_exists() {
         let _guard = DeltaSyncEnabledGuard::set(true);
+        let _guard_key = ApiKeyOverrideGuard::set(None);
         let cache = test_cache().await;
 
         let auction = domain::RawAuctionData {
