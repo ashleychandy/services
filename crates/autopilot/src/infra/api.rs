@@ -13,9 +13,10 @@ use {
         routing::get,
     },
     const_hex,
-    futures::StreamExt,
+    futures::{StreamExt, stream::Stream},
     model::quote::NativeTokenPrice,
     observe::tracing::distributed::axum::{make_span, record_trace_id},
+    pin_project_lite::pin_project,
     price_estimation::{PriceEstimationError, native::NativePriceEstimating},
     prometheus::{IntCounter, IntGauge},
     serde::{Deserialize, Serialize},
@@ -24,15 +25,17 @@ use {
         convert::Infallible,
         net::SocketAddr,
         ops::RangeInclusive,
+        pin::Pin,
         sync::{
             Arc,
             OnceLock,
             atomic::{AtomicBool, AtomicU64, Ordering},
         },
+        task::{Context, Poll},
         time::{Duration, Instant},
     },
     subtle::ConstantTimeEq,
-    tokio::sync::{broadcast::error::TryRecvError, oneshot},
+    tokio::sync::{Notify, broadcast::error::TryRecvError, oneshot, watch},
     tokio_stream::wrappers::{
         BroadcastStream,
         ReceiverStream,
@@ -52,7 +55,7 @@ static DELTA_SYNC_API_KEY: OnceLock<Option<String>> = OnceLock::new();
 static DELTA_STREAM_MAX_LAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static DELTA_STREAM_BUFFER_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static DELTA_STREAM_KEEPALIVE_INTERVAL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-static DELTA_SYNC_SERVING_ENABLED: AtomicBool = AtomicBool::new(true);
+static DELTA_SYNC_SERVING_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -63,6 +66,41 @@ enum ApiKeyOverride {
     NoKeyRequired,
     /// Override active: require exactly this key.
     Key(String),
+}
+
+struct DropFlag {
+    closed_tx: watch::Sender<bool>,
+}
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        let _ = self.closed_tx.send(true);
+    }
+}
+
+pin_project! {
+    struct DropNotifier<S> {
+        #[pin]
+        inner: S,
+        _dropped: DropFlag,
+    }
+}
+
+impl<S> DropNotifier<S> {
+    fn new(inner: S, closed_tx: watch::Sender<bool>) -> Self {
+        DropNotifier {
+            inner,
+            _dropped: DropFlag { closed_tx },
+        }
+    }
+}
+
+impl<S: Stream> Stream for DropNotifier<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project().inner.poll_next(cx)
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +219,50 @@ pub fn clear_delta_sync_enabled_override() {
     *DELTA_SYNC_ENABLED_OVERRIDE
         .lock()
         .expect("delta sync enabled override lock poisoned") = None;
+}
+
+// Test-only override to control whether live delta stream handlers are allowed
+// to execute their producer logic. This prevents tests that only intend to
+// register routes from inadvertently running background producers.
+#[cfg(any(test, feature = "test-util"))]
+static DELTA_SYNC_LIVE_STREAM_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<bool>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_delta_sync_live_stream_override(value: Option<bool>) {
+    *DELTA_SYNC_LIVE_STREAM_OVERRIDE
+        .lock()
+        .expect("delta sync live stream override lock poisoned") = value;
+}
+
+#[cfg(test)]
+struct DeltaSyncLiveGuard {
+    previous: Option<bool>,
+}
+
+#[cfg(test)]
+impl DeltaSyncLiveGuard {
+    fn set(value: bool) -> Self {
+        let previous = {
+            let mut guard = DELTA_SYNC_LIVE_STREAM_OVERRIDE
+                .lock()
+                .expect("delta sync live stream override lock poisoned");
+            let prev = *guard;
+            *guard = Some(value);
+            prev
+        };
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for DeltaSyncLiveGuard {
+    fn drop(&mut self) {
+        let mut guard = DELTA_SYNC_LIVE_STREAM_OVERRIDE
+            .lock()
+            .expect("delta sync live stream override lock poisoned");
+        *guard = self.previous;
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +389,10 @@ pub fn set_delta_sync_serving_enabled(enabled: bool) {
     DELTA_SYNC_SERVING_ENABLED.store(enabled, Ordering::Release);
 }
 
+pub(crate) fn delta_sync_serving_enabled() -> bool {
+    DELTA_SYNC_SERVING_ENABLED.load(Ordering::Acquire)
+}
+
 pub async fn serve_with_listener(
     listener: tokio::net::TcpListener,
     estimator: Arc<dyn NativePriceEstimating>,
@@ -430,6 +516,8 @@ async fn stream_delta_events(
     if let Err(response) = authorize_delta_sync(&headers) {
         return response;
     }
+    // `ensure_delta_sync_serving_enabled()` above already validated that
+    // delta streaming is available (tests may exercise alternate paths).
     let metrics = DeltaMetrics::get();
     metrics.stream_connections.inc();
     let api_key_hash = api_key_hash(&headers);
@@ -686,6 +774,12 @@ async fn stream_delta_events(
     });
     let stream = replay_stream.chain(live_stream);
 
+    // Shared watch channel used to detect when the response-side stream is
+    // dropped by the client. The producer task will observe the channel's
+    // state (which is persisted) to exit promptly and avoid leaking
+    // subscriptions in test/oneshot environments.
+    let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+
     let (stream_sender, stream_receiver) =
         tokio::sync::mpsc::channel::<Result<sse::Event, Infallible>>(delta_stream_buffer_size());
     let forward_sender = stream_sender.clone();
@@ -695,13 +789,19 @@ async fn stream_delta_events(
         tokio::sync::mpsc::unbounded_channel::<Result<sse::Event, Infallible>>();
     let control_sender_clone = control_sender.clone();
     let cache = Arc::clone(&state.solvable_orders_cache);
+    let closed_rx_for_spawn = closed_rx.clone();
     tokio::spawn(async move {
         let _active_stream = active_stream;
         let mut stream = Box::pin(stream);
+        let mut closed_rx = closed_rx_for_spawn;
 
         let mut leader_check = tokio::time::interval(Duration::from_secs(1));
 
         loop {
+            if *closed_rx.borrow() {
+                break;
+            }
+
             tokio::select! {
                 _ = leader_check.tick() => {
                     if !delta_sync_serving_enabled() {
@@ -718,6 +818,11 @@ async fn stream_delta_events(
                             tracing::debug!("resync control event dropped: channel closed");
                         }
                         tracing::warn!("delta stream lost leader authority");
+                        break;
+                    }
+                }
+                _ = closed_rx.changed() => {
+                    if *closed_rx.borrow() {
                         break;
                     }
                 }
@@ -785,6 +890,8 @@ async fn stream_delta_events(
     let control_stream = UnboundedReceiverStream::new(control_receiver);
     let regular_stream = ReceiverStream::new(stream_receiver);
     let merged = futures::stream::select(control_stream, regular_stream);
+
+    let merged = DropNotifier::new(merged, closed_tx);
 
     sse::Sse::new(merged)
         .keep_alive(sse::KeepAlive::new().interval(delta_stream_keepalive_interval()))
@@ -1054,20 +1161,23 @@ fn delta_sync_enabled() -> bool {
     )
 }
 
-fn delta_sync_serving_enabled() -> bool {
-    DELTA_SYNC_SERVING_ENABLED.load(Ordering::Acquire)
-}
-
 fn ensure_delta_sync_serving_enabled() -> Result<(), Response> {
-    if delta_sync_enabled() && !delta_sync_serving_enabled() {
-        Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "delta sync is unavailable on this autopilot instance",
-        )
-            .into_response())
-    } else {
-        Ok(())
+    if delta_sync_serving_enabled() {
+        return Ok(());
     }
+
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        if delta_sync_enabled() {
+            return Ok(());
+        }
+    }
+
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "delta sync is unavailable on this autopilot instance",
+    )
+        .into_response())
 }
 
 fn delta_stream_max_lag() -> u64 {
@@ -1434,6 +1544,24 @@ mod tests {
             let previous = *lock;
             *lock = Some(value);
             Self { previous }
+        }
+    }
+
+    #[cfg(test)]
+    struct DeltaStreamTestContext {
+        _enabled: DeltaSyncEnabledGuard,
+        _live: DeltaSyncLiveGuard,
+        _key: ApiKeyOverrideGuard,
+    }
+
+    #[cfg(test)]
+    impl DeltaStreamTestContext {
+        fn new() -> Self {
+            Self {
+                _enabled: DeltaSyncEnabledGuard::set(true),
+                _live: DeltaSyncLiveGuard::set(true),
+                _key: ApiKeyOverrideGuard::set(None),
+            }
         }
     }
 
@@ -2099,8 +2227,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slow_consumer_gets_resync_required_event() {
-        let _guard_enabled = DeltaSyncEnabledGuard::set(true);
-        let _guard_key = ApiKeyOverrideGuard::set(None);
+        let _stream_ctx = DeltaStreamTestContext::new();
         let _guard_buffer = DeltaStreamBufferGuard::set(1);
         let cache = test_cache().await;
         cache
@@ -2617,8 +2744,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn replay_envelopes_with_snapshot_sequence_field_populated() {
-        let _guard_enabled = DeltaSyncEnabledGuard::set(true);
-        let _guard_key = ApiKeyOverrideGuard::set(None);
+        let _stream_ctx = DeltaStreamTestContext::new();
         let cache = test_cache().await;
 
         let auction = domain::RawAuctionData {

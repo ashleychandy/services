@@ -565,13 +565,18 @@ async fn get_quote(
         verification: Default::default(),
     };
 
-    get_quote_and_check_fee(quoter, &parameters.clone(), Some(*quote_id), None)
-        .await
-        .map_err(|err| match err {
-            ValidationError::Partial(_) => OnchainOrderPlacementError::PreValidationError,
-            ValidationError::NonZeroFee => OnchainOrderPlacementError::NonZeroFee,
-            _ => OnchainOrderPlacementError::Other,
-        })
+    get_quote_and_check_fee(
+        quoter,
+        &parameters.clone(),
+        Some(*quote_id),
+        Some(order_data.fee_amount),
+    )
+    .await
+    .map_err(|err| match err {
+        ValidationError::Partial(_) => OnchainOrderPlacementError::PreValidationError,
+        ValidationError::NonZeroFee => OnchainOrderPlacementError::NonZeroFee,
+        _ => OnchainOrderPlacementError::Other,
+    })
 }
 
 #[expect(clippy::too_many_arguments)]

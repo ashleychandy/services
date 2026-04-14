@@ -259,43 +259,57 @@ pub(crate) async fn snapshot() -> Option<ReplicaSnapshot> {
     snapshot_from_replica(&replica)
 }
 
-/// Reset the global delta replica (intended for test isolation).
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn reset_delta_replica_for_tests() {
-    reset_delta_replica_in_place(delta_replica());
+    let mut guard = match DELTA_REPLICA.write() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    };
+    *guard = Arc::new(RwLock::new(Replica::default()));
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
-fn reset_delta_replica_in_place(replica: Arc<RwLock<Replica>>) {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => match handle.runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::CurrentThread => {
-                std::thread::spawn(move || {
-                    let mut lock = replica.blocking_write();
-                    *lock = Replica::default();
-                })
-                .join()
-                .expect("failed to join delta replica reset thread");
+pub async fn reset_delta_replica_for_tests_async() {
+    if let Ok(guard) = DELTA_REPLICA.read() {
+        // Clone the Arc and release the read guard quickly so we don't hold
+        // the std::sync::RwLock across await points (which would block
+        // writers). The spin loop below will attempt to reset the inner
+        // tokio lock in-place; if contended, we fall back to replacing the
+        // global Arc.
+        let replica_arc = guard.clone();
+        drop(guard);
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            if let Ok(mut inner) = replica_arc.try_write() {
+                *inner = Replica::default();
+                return;
             }
-            tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(move || {
-                    let mut lock = replica.blocking_write();
-                    *lock = Replica::default();
-                });
-            }
-            _ => panic!("unsupported runtime flavor"),
-        },
-        Err(_) => {
-            // No current Tokio runtime: perform the blocking write on a new
-            // thread to avoid attempting to access a non-existent reactor.
-            std::thread::spawn(move || {
-                let mut lock = replica.blocking_write();
-                *lock = Replica::default();
-            })
-            .join()
-            .expect("failed to join delta replica reset thread (no runtime)");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+
+        if let Ok(mut global_guard) = DELTA_REPLICA.try_write() {
+            *global_guard = Arc::new(RwLock::new(Replica::default()));
+            return;
+        }
+
+        let new_arc = Arc::new(RwLock::new(Replica::default()));
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut guard = match DELTA_REPLICA.write() {
+                Ok(g) => g,
+                Err(poison) => poison.into_inner(),
+            };
+            *guard = new_arc;
+        })
+        .await;
+        return;
     }
+
+    let mut guard = match DELTA_REPLICA.write() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    };
+    *guard = Arc::new(RwLock::new(Replica::default()));
 }
 
 #[cfg(test)]
@@ -413,29 +427,67 @@ pub(crate) async fn set_replica_state_for_tests(state: ReplicaState) {
 
 /// Global test guard to serialize replica usage across tests.
 ///
-/// The guard resets the shared replica in place on acquisition and drop, so
-/// any existing `Arc` clones observe the reset state.
+/// The guard resets the global replica when acquired and again on drop.
+
 #[cfg(any(test, feature = "test-helpers"))]
 pub struct DeltaReplicaTestGuard {
-    _lock: tokio::sync::OwnedMutexGuard<()>,
+    _lock: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
 impl DeltaReplicaTestGuard {
-    /// Acquires the test guard and resets the global replica.
-    ///
-    /// IMPORTANT: Call this BEFORE capturing `delta_replica()` in your test.
     pub async fn acquire() -> Self {
+        // Acquire the serialization mutex for test reset coordination.
         let lock = Arc::clone(&DELTA_REPLICA_TEST_MUTEX).lock_owned().await;
-        reset_delta_replica_for_tests();
-        Self { _lock: lock }
+
+        // Perform a synchronous reset on a blocking thread. Prefer an
+        // in-place reset of any preexisting `Arc<RwLock<Replica>>` clones by
+        // acquiring the inner tokio RwLock in blocking mode. This is safe
+        // because we're executing on a dedicated blocking thread.
+        let handle = tokio::task::spawn_blocking(|| {
+            // Try to obtain a read guard on the global StdRwLock to access
+            // the inner Arc without blocking writers.
+            let guard = match DELTA_REPLICA.read() {
+                Ok(g) => g,
+                Err(poison) => poison.into_inner(),
+            };
+            let replica_arc = guard.clone();
+
+            // Acquire the inner tokio RwLock in blocking mode and reset in-place.
+            let mut inner = replica_arc.blocking_write();
+            *inner = Replica::default();
+        });
+        let _ = handle.await.expect("replica reset thread panicked");
+
+        Self { _lock: Some(lock) }
     }
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
 impl Drop for DeltaReplicaTestGuard {
     fn drop(&mut self) {
-        reset_delta_replica_for_tests();
+        // Perform a best-effort immediate reset while holding the test
+        // mutex. Spawn a background std thread to do the synchronous work
+        // so we avoid blocking async runtime threads if Drop runs inside a
+        // runtime worker.
+        if let Some(lock) = self._lock.take() {
+            let handle = std::thread::spawn(move || {
+                // Replace the global Arc so future callers observe a fresh
+                // replica. This uses the std write lock which is allowed to
+                // block the spawned thread.
+                let mut guard = match DELTA_REPLICA.write() {
+                    Ok(g) => g,
+                    Err(poison) => poison.into_inner(),
+                };
+                *guard = Arc::new(RwLock::new(Replica::default()));
+
+                // Drop the held test mutex guard, releasing the mutex.
+                drop(lock);
+            });
+            let _ = handle
+                .join()
+                .expect("DeltaReplicaTestGuard drop thread panicked");
+        }
     }
 }
 

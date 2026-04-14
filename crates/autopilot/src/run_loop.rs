@@ -107,6 +107,13 @@ pub struct RunLoop {
 const MAX_INTERVAL: Duration = Duration::from_secs(30);
 const FOLLOWER_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+fn sync_serving_flag(last: &mut bool, is_leader: bool) {
+    if *last != is_leader {
+        crate::infra::api::set_delta_sync_serving_enabled(is_leader);
+        *last = is_leader;
+    }
+}
+
 impl RunLoop {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -159,9 +166,21 @@ impl RunLoop {
             None
         };
         let mut leader_lock_tracker = LeaderLockTracker::new(leader);
+
+        let mut last_serving_flag = crate::infra::api::delta_sync_serving_enabled();
         while !control.should_shutdown() {
-            leader_lock_tracker.try_acquire().await;
-            crate::infra::api::set_delta_sync_serving_enabled(leader_lock_tracker.is_leader());
+            let is_follower = !leader_lock_tracker.is_leader();
+            if is_follower {
+                leader_lock_tracker.try_acquire().await;
+            }
+
+            let stepped_up_this_iteration = is_follower && leader_lock_tracker.is_leader();
+
+            if stepped_up_this_iteration {
+                leader_lock_tracker.verify_or_refresh().await;
+            }
+
+            sync_serving_flag(&mut last_serving_flag, leader_lock_tracker.is_leader());
 
             if !leader_lock_tracker.is_leader() {
                 // Follower: wait for a block notification (or timeout) before
@@ -175,6 +194,7 @@ impl RunLoop {
                 let prev_block = last_block.clone();
 
                 let update_result = self_arc.update_caches(&mut last_block, false).await;
+
                 Self::maybe_mark_startup_probe_ready(&self_arc.probes, &update_result);
                 let new_block = match update_result {
                     Ok(b) => b,
@@ -214,15 +234,19 @@ impl RunLoop {
                 }
             }
 
-            // Re-confirm leadership after waiting
-            leader_lock_tracker.try_acquire().await;
-            crate::infra::api::set_delta_sync_serving_enabled(leader_lock_tracker.is_leader());
-            if !leader_lock_tracker.is_leader() {
+            if !stepped_up_this_iteration {
+                leader_lock_tracker.verify_or_refresh().await;
+            }
+            let is_leader_now = leader_lock_tracker.is_leader();
+            sync_serving_flag(&mut last_serving_flag, is_leader_now);
+            if !is_leader_now {
                 // Lost leadership after waiting, skip this cycle
                 continue;
             }
 
             let update_result = self_arc.update_caches(&mut last_block, true).await;
+            // For the leader path, only mark startup probe on successful cache
+            // update to avoid masking genuine startup failures.
             Self::maybe_mark_startup_probe_ready(&self_arc.probes, &update_result);
             let start_block = match update_result {
                 Ok(block) => block,
@@ -244,10 +268,15 @@ impl RunLoop {
                 self_arc
                     .single_run(auction)
                     .instrument(tracing::info_span!("auction", auction_id))
-                    .await
+                    .await;
             }
+
+            // No-op: we performed a verify/refresh before leader work to avoid
+            // races where leadership dies mid-iteration. Additional refreshes
+            // here would be redundant.
         }
-        crate::infra::api::set_delta_sync_serving_enabled(false);
+        // Ensure the public serving flag is disabled on shutdown/exit.
+        sync_serving_flag(&mut last_serving_flag, false);
         leader_lock_tracker.release().await;
     }
 

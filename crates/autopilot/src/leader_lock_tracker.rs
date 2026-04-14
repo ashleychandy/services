@@ -18,8 +18,16 @@ pub enum LeaderLockTracker {
         /// Whether the instance was the leader since the last call to
         /// try_acquire()
         was_leader: bool,
+
+        transition: LeaderTransitionState,
         leader_lock: LeaderLock,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaderTransitionState {
+    Stable,
+    JustSteppedUp,
 }
 
 impl LeaderLockTracker {
@@ -28,6 +36,7 @@ impl LeaderLockTracker {
             Some(leader_lock) => Self::Enabled {
                 is_leader: false,
                 was_leader: false,
+                transition: LeaderTransitionState::Stable,
                 leader_lock,
             },
             None => Self::Disabled,
@@ -41,11 +50,14 @@ impl LeaderLockTracker {
         let Self::Enabled {
             is_leader,
             was_leader,
+            transition,
             leader_lock,
         } = self
         else {
             return;
         };
+
+        let prev_is_leader = *is_leader;
 
         *was_leader = *is_leader;
 
@@ -55,10 +67,55 @@ impl LeaderLockTracker {
             false
         });
 
-        if self.just_stepped_up() {
-            tracing::info!("Stepped up as a leader");
-            Metrics::leader_step_up();
+        if *is_leader && !prev_is_leader {
+            *transition = LeaderTransitionState::JustSteppedUp;
+        } else {
+            *transition = LeaderTransitionState::Stable;
         }
+    }
+
+    pub async fn verify_or_refresh(&mut self) {
+        let Self::Enabled {
+            is_leader,
+            was_leader,
+            transition,
+            leader_lock,
+        } = self
+        else {
+            return;
+        };
+        let prev_is_leader = *is_leader;
+
+        if *transition == LeaderTransitionState::JustSteppedUp {
+            *transition = LeaderTransitionState::Stable;
+            *was_leader = *is_leader;
+            if *is_leader {
+                tracing::info!("Stepped up as the leader");
+                Metrics::leader_step_up();
+            }
+            return;
+        }
+
+        if !prev_is_leader {
+            return;
+        }
+
+        let alive = leader_lock.is_session_alive().await;
+        if !alive {
+            *is_leader = leader_lock.try_acquire().await.unwrap_or_else(|err| {
+                tracing::error!(?err, "failed to refresh leader lock");
+                Metrics::leader_lock_error();
+                false
+            });
+        }
+
+        // Detect leadership loss during refresh.
+        if !*is_leader {
+            tracing::info!("Lost leadership during session verification");
+            Metrics::leader_step_down();
+        }
+
+        *was_leader = prev_is_leader;
     }
 
     /// Releases the leader lock if it was held

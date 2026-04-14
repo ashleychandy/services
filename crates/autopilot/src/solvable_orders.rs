@@ -604,6 +604,8 @@ impl SolvableOrdersCache {
 
     pub async fn set_auction_id(&self, auction_id: u64) {
         let _update_guard = self.update_lock.lock().await;
+
+        self.assert_update_lock_held();
         let mut lock = self.cache.lock().await;
         if let Some(inner) = lock.as_mut() {
             if let Some(envelope) = apply_auction_id_change(inner, auction_id, &self.delta_config) {
@@ -2261,20 +2263,16 @@ fn prune_delta_history(
     }
 }
 
-/// Update the cached `auction_id` and emit an `AuctionChanged` delta envelope
-/// when the auction changes.
-///
-/// The function uses `auction_sequence = 0` as a sentinel value to mark the
-/// auction boundary. Consumers should treat the envelope with
-/// `auction_sequence == 0` as an advisory transition marker. The first real
-/// per-auction update after this transition will emit `auction_sequence = 1`.
-/// `delta_sequence` remains monotonic across auction transitions and is the
-/// authoritative counter for replay/gap detection.
 fn apply_auction_id_change(
     inner: &mut Inner,
     auction_id: u64,
     config: &DeltaSyncConfig,
 ) -> Option<DeltaEnvelope> {
+    debug_assert_ne!(
+        auction_id, 0,
+        "auction_id must be non-zero; 0 is used as the initial unset/sentinel value"
+    );
+
     if inner.auction_id == auction_id {
         return None;
     }

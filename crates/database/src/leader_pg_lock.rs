@@ -83,6 +83,14 @@ SELECT pg_try_advisory_lock(hashtextextended($1, 0));
         Ok(self.lock_guard.is_some())
     }
 
+    pub async fn is_session_alive(&mut self) -> bool {
+        if let Some(lock) = self.lock_guard.as_mut() {
+            lock.ping().await
+        } else {
+            false
+        }
+    }
+
     pub async fn release(&mut self) {
         if let Some(lock) = self.lock_guard.take() {
             lock.unlock().await;

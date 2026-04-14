@@ -1243,6 +1243,7 @@ dependencies = [
  "number",
  "observe",
  "order-validation",
+ "pin-project-lite",
  "price-estimation",
  "prometheus",
  "prometheus-metric-storage",
