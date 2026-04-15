@@ -466,12 +466,8 @@ impl DeltaReplicaTestGuard {
 #[cfg(any(test, feature = "test-helpers"))]
 impl Drop for DeltaReplicaTestGuard {
     fn drop(&mut self) {
-        // Perform a best-effort immediate reset while holding the test
-        // mutex. Spawn a background std thread to do the synchronous work
-        // so we avoid blocking async runtime threads if Drop runs inside a
-        // runtime worker.
         if let Some(lock) = self._lock.take() {
-            let handle = std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 // Replace the global Arc so future callers observe a fresh
                 // replica. This uses the std write lock which is allowed to
                 // block the spawned thread.
@@ -484,9 +480,6 @@ impl Drop for DeltaReplicaTestGuard {
                 // Drop the held test mutex guard, releasing the mutex.
                 drop(lock);
             });
-            let _ = handle
-                .join()
-                .expect("DeltaReplicaTestGuard drop thread panicked");
         }
     }
 }

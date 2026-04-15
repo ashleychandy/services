@@ -391,9 +391,13 @@ impl RunLoop {
             .ok()?;
         Metrics::auction(id);
 
-        self.solvable_orders_cache
+        if let Err(err) = self
+            .solvable_orders_cache
             .set_auction_id(u64::try_from(id).unwrap_or_default())
-            .await;
+            .await
+        {
+            tracing::error!(?err, "failed to set auction id");
+        }
 
         // always update the auction because the tests use this as a readiness probe
         self.persistence.replace_current_auction_in_db(id, &auction);

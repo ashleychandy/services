@@ -53,7 +53,11 @@ static DELTA_SYNC_API_KEY: OnceLock<Option<String>> = OnceLock::new();
 // environment can acquire a global lock; cache the computed values on first
 // access to avoid repeated env lookups per connection.
 static DELTA_STREAM_MAX_LAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-static DELTA_STREAM_BUFFER_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+// Cache the computed buffer size but keep it mutable so tests can still
+// inject an override at runtime without fighting a OnceLock that was
+// already initialised by other startup code.
+static DELTA_STREAM_BUFFER_SIZE: std::sync::LazyLock<std::sync::Mutex<Option<usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 static DELTA_STREAM_KEEPALIVE_INTERVAL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 static DELTA_SYNC_SERVING_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -180,15 +184,13 @@ mod invariant_tests {
             .collect();
         sequences.sort_unstable();
 
-        for window in sequences.windows(2) {
-            assert_eq!(
-                window[1],
-                window[0] + 1,
-                "sequence gap detected: {} -> {}",
-                window[0],
-                window[1]
-            );
-        }
+        // Expect the drained sequences to be exactly 5..=8 when the
+        // checkpoint/baseline is 4 and the sender produced 5..=8.
+        let expected: Vec<u64> = (5u64..=8).collect();
+        assert_eq!(
+            sequences, expected,
+            "replay+drain produced unexpected sequences"
+        );
     }
 }
 
@@ -1203,13 +1205,25 @@ fn delta_stream_buffer_size() -> usize {
         }
     }
 
-    *DELTA_STREAM_BUFFER_SIZE.get_or_init(|| {
-        std::env::var("AUTOPILOT_DELTA_SYNC_STREAM_BUFFER")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(128)
-    })
+    // First check whether we've cached a computed value; if not, compute
+    // from the environment and store it. Using a Mutex<Option<usize>> lets
+    // tests set the override at any time and still have precedence above the
+    // cached value because the override branch above runs first in tests.
+    let mut guard = DELTA_STREAM_BUFFER_SIZE
+        .lock()
+        .expect("delta stream buffer size mutex poisoned");
+    if let Some(value) = *guard {
+        return value;
+    }
+
+    let computed = std::env::var("AUTOPILOT_DELTA_SYNC_STREAM_BUFFER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(128);
+
+    *guard = Some(computed);
+    computed
 }
 
 fn delta_stream_keepalive_interval() -> Duration {
@@ -1228,14 +1242,34 @@ fn authorize_delta_sync(headers: &HeaderMap) -> Result<(), Response> {
         return Ok(());
     };
 
-    let provided = headers
+    // Perform a constant-time comparison that does not leak whether the
+    // header was present. To avoid a timing difference between a missing
+    // header and a present-but-wrong header, build a padded/truncated
+    // view of the provided header with the same length as the expected
+    // key and compare using `ct_eq`. Also verify lengths via a
+    // constant-time comparison of the length encoded as bytes.
+    let expected_bytes = expected.as_bytes();
+    let provided_str = headers
         .get("X-Delta-Sync-Api-Key")
-        .and_then(|value| value.to_str().ok());
-    if provided
-        .map(|value| value.as_bytes().ct_eq(expected.as_bytes()))
-        .map(bool::from)
-        .unwrap_or(false)
-    {
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let provided_bytes = provided_str.as_bytes();
+
+    // Build a same-length buffer and copy up to expected length.
+    let mut padded = vec![0u8; expected_bytes.len()];
+    let copy_len = std::cmp::min(provided_bytes.len(), expected_bytes.len());
+    padded[..copy_len].copy_from_slice(&provided_bytes[..copy_len]);
+
+    let content_eq = padded.ct_eq(expected_bytes);
+
+    // Constant-time length equality via byte-wise comparison of u64 LE
+    // encodings. This avoids leaking length differences via a quick
+    // integer comparison.
+    let provided_len_bytes = (provided_bytes.len() as u64).to_le_bytes();
+    let expected_len_bytes = (expected_bytes.len() as u64).to_le_bytes();
+    let length_eq = provided_len_bytes.ct_eq(&expected_len_bytes);
+
+    if bool::from(content_eq) & bool::from(length_eq) {
         Ok(())
     } else {
         Err((StatusCode::UNAUTHORIZED, "Unauthorized").into_response())

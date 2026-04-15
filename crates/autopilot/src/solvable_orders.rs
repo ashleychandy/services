@@ -207,6 +207,17 @@ pub struct SolvableOrdersCache {
     delta_config: DeltaSyncConfig,
 }
 
+#[must_use = "holding the UpdateGuard ensures the update lock remains held"]
+pub struct UpdateGuard<'a> {
+    inner: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl<'a> Drop for UpdateGuard<'a> {
+    fn drop(&mut self) {
+        // `inner` is dropped automatically here; no debug-side effects.
+    }
+}
+
 type Balances = HashMap<Query, U256>;
 
 /// Configuration for delta sync behavior.
@@ -489,12 +500,25 @@ impl SolvableOrdersCache {
     }
 
     /// Debug-only guard to catch cache mutation without the update lock.
-    fn assert_update_lock_held(&self) {
+
+    fn assert_update_lock_held(&self, _guard: &UpdateGuard<'_>) {
         #[cfg(debug_assertions)]
-        if let Ok(guard) = self.update_lock.try_lock() {
-            // If try_lock succeeds, the update lock was not held by the caller.
-            drop(guard);
-            debug_assert!(false, "update_lock must be held when mutating cache");
+        {
+            if let Ok(g) = self.update_lock.try_lock() {
+                drop(g);
+                debug_assert!(false, "update_lock must be held when mutating cache");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_update_lock_held_unchecked(&self) {
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(g) = self.update_lock.try_lock() {
+                drop(g);
+                debug_assert!(false, "update_lock must be held when mutating cache");
+            }
         }
     }
 
@@ -602,12 +626,27 @@ impl SolvableOrdersCache {
         self.delta_sender.receiver_count()
     }
 
-    pub async fn set_auction_id(&self, auction_id: u64) {
-        let _update_guard = self.update_lock.lock().await;
+    pub async fn set_auction_id(&self, auction_id: u64) -> Result<()> {
+        let _update_guard = self.acquire_update_guard().await;
 
-        self.assert_update_lock_held();
+        self.assert_update_lock_held(&_update_guard);
         let mut lock = self.cache.lock().await;
         if let Some(inner) = lock.as_mut() {
+            let pending = inner.pending_events.len().try_into().unwrap_or(u64::MAX);
+            // 1 for the auction change envelope itself
+            let required = pending.saturating_add(1);
+            let available = u64::MAX.saturating_sub(inner.delta_sequence);
+            if available < required {
+                Metrics::get().delta_incremental_failure_total.inc();
+                tracing::error!(
+                    available,
+                    required,
+                    "delta sequence would overflow while flushing pending events; refusing to set \
+                     auction id"
+                );
+                return Err(anyhow::anyhow!("delta sequence overflow"));
+            }
+
             if let Some(envelope) = apply_auction_id_change(inner, auction_id, &self.delta_config) {
                 // Send while holding cache lock to keep replay + live ordering
                 // consistent (same pattern as update()).
@@ -620,12 +659,12 @@ impl SolvableOrdersCache {
                 // ordering remains consistent.
                 while let Some(events) = inner.pending_events.pop_front() {
                     // Advance global monotonic sequence and per-auction
-                    // sequence counters.
-                    let next_seq = inner.delta_sequence.checked_add(1).unwrap_or_else(|| {
-                        Metrics::get().delta_incremental_failure_total.inc();
-                        tracing::error!("delta sequence overflow while flushing pending events");
-                        inner.delta_sequence
-                    });
+                    // sequence counters. This cannot overflow because of the
+                    // pre-check above.
+                    let next_seq = inner
+                        .delta_sequence
+                        .checked_add(1)
+                        .expect("pre-checked available delta sequence space");
 
                     let next_auction_seq = inner.auction_sequence.saturating_add(1);
 
@@ -652,6 +691,8 @@ impl SolvableOrdersCache {
                 inner.committed_auction = inner.auction.clone();
             }
         }
+
+        Ok(())
     }
 
     pub async fn delta_replay_with_checkpoint(
@@ -662,12 +703,18 @@ impl SolvableOrdersCache {
         Self::build_delta_replay(after_sequence, lock.as_ref())
     }
 
+    pub async fn acquire_update_guard(&self) -> UpdateGuard<'_> {
+        let guard = self.update_lock.lock().await;
+
+        return UpdateGuard { inner: guard };
+    }
+
     pub async fn subscribe_deltas_with_replay(
         &self,
         after_sequence: u64,
     ) -> Result<(broadcast::Receiver<DeltaEnvelope>, DeltaReplay), DeltaAfterError> {
         let lock = self.cache.lock().await;
-        let receiver = self.delta_sender.subscribe();
+        let mut receiver = self.delta_sender.subscribe();
         let replay = Self::build_delta_replay(after_sequence, lock.as_ref())?;
         Ok((receiver, replay))
     }
@@ -678,19 +725,52 @@ impl SolvableOrdersCache {
     ) -> Result<(broadcast::Receiver<DeltaEnvelope>, DeltaReplay), DeltaSubscribeError> {
         let lock = self.cache.lock().await;
 
-        let receiver = self.delta_sender.subscribe();
-
         let latest = lock.as_ref().map(|inner| inner.delta_sequence).unwrap_or(0);
         if after_sequence.is_none() && latest > 0 {
             return Err(DeltaSubscribeError::MissingAfterSequence { latest });
         }
 
-        let replay = Self::build_delta_replay(after_sequence.unwrap_or_default(), lock.as_ref())
-            .map_err(DeltaSubscribeError::DeltaAfter)?;
+        let mut replay =
+            Self::build_delta_replay(after_sequence.unwrap_or_default(), lock.as_ref())
+                .map_err(DeltaSubscribeError::DeltaAfter)?;
 
-        // Release the cache lock before returning so publishers can proceed and
-        // new envelopes will be buffered by the receiver.
+        // Release the cache lock before subscribing so publishers can proceed.
         drop(lock);
+
+        let mut receiver = self.delta_sender.subscribe();
+
+        loop {
+            match receiver.try_recv() {
+                Ok(envelope) => {
+                    if envelope.to_sequence > replay.checkpoint_sequence {
+                        replay.envelopes.push(envelope);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_skipped)) => {
+                    // We couldn't drain the receiver because it already fell
+                    // behind; surface a resync hint to the caller with the
+                    // latest snapshot info.
+                    let snapshot = self.delta_snapshot().await;
+                    if let Some(s) = snapshot {
+                        return Err(DeltaSubscribeError::DeltaAfter(
+                            DeltaAfterError::ResyncRequired {
+                                oldest_available: s.oldest_available,
+                                latest: s.sequence,
+                            },
+                        ));
+                    } else {
+                        return Err(DeltaSubscribeError::DeltaAfter(
+                            DeltaAfterError::ResyncRequired {
+                                oldest_available: 0,
+                                latest: 0,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
 
         Ok((receiver, replay))
     }
@@ -783,8 +863,8 @@ impl SolvableOrdersCache {
 
     #[instrument(skip_all)]
     pub async fn update(&self, block: u64, store_events: bool) -> Result<()> {
-        let _update_guard = self.update_lock.lock().await;
-        self.assert_update_lock_held();
+        let _update_guard = self.acquire_update_guard().await;
+        self.assert_update_lock_held(&_update_guard);
         let start = Instant::now();
 
         let _timer = observe::metrics::metrics()
@@ -1093,7 +1173,10 @@ impl SolvableOrdersCache {
             .map(|inner| {
                 // Gate on the full auction surface so block changes are held
                 // behind the same auction boundary as order/price changes.
-                !inner.pending_events.is_empty() || inner.auction != auction_for_cache
+
+                !inner.pending_events.is_empty()
+                    || inner.auction != auction_for_cache
+                    || inner.committed_auction != auction_for_cache
             })
             .unwrap_or(false);
 
@@ -1663,31 +1746,29 @@ impl SolvableOrdersCache {
 
         let mut alive_uids = HashSet::new();
         for order in alive_orders {
-            let uid = domain::OrderUid(order.metadata.uid.0);
-            alive_uids.insert(uid);
+            let model_uid = order.metadata.uid;
+            let domain_uid = domain::OrderUid(model_uid.0);
+
+            alive_uids.insert(domain_uid);
             let quote = db_solvable_orders
                 .quotes
-                .get(&uid)
+                .get(&domain_uid)
                 .map(|quote| quote.as_ref().clone());
             let domain_order =
                 self.protocol_fees
                     .apply(order, quote, &surplus_capturing_jit_order_owners);
             indexed_state
                 .current_orders_by_uid
-                .insert(uid, domain_order);
-            let was_no_price = indexed_state.filtered_no_price.remove(&order.metadata.uid);
-            register_transition(order.metadata.uid, MissingNativePrice, was_no_price, false);
-            let was_no_balance = indexed_state
-                .filtered_no_balance
-                .remove(&order.metadata.uid);
-            register_transition(
-                order.metadata.uid,
-                InsufficientBalance,
-                was_no_balance,
-                false,
-            );
-            let was_dust = indexed_state.filtered_dust.remove(&order.metadata.uid);
-            register_transition(order.metadata.uid, DustOrder, was_dust, false);
+                .insert(domain_uid, domain_order);
+
+            let was_no_price = indexed_state.filtered_no_price.remove(&model_uid);
+            register_transition(model_uid, MissingNativePrice, was_no_price, false);
+
+            let was_no_balance = indexed_state.filtered_no_balance.remove(&model_uid);
+            register_transition(model_uid, InsufficientBalance, was_no_balance, false);
+
+            let was_dust = indexed_state.filtered_dust.remove(&model_uid);
+            register_transition(model_uid, DustOrder, was_dust, false);
         }
 
         if jit_owners_changed {
@@ -2236,7 +2317,16 @@ fn prune_delta_history(
     max_age: chrono::Duration,
     config: &DeltaSyncConfig,
 ) {
-    let max_age_std = max_age.to_std().unwrap_or_else(|_| Duration::from_secs(0));
+    let max_age_std = match max_age.to_std() {
+        Ok(d) => d,
+        Err(_) => {
+            tracing::warn!(
+                ?max_age,
+                "invalid max_age for delta history pruning; skipping age-based pruning"
+            );
+            return;
+        }
+    };
     let min_retained = config.history_min_retained;
 
     // How many elements may be removed by age while still retaining the minimum
@@ -2539,7 +2629,12 @@ pub(crate) fn apply_delta_events_to_auction(
 
     for event in events {
         match event {
-            DeltaEvent::AuctionChanged { .. } => {}
+            DeltaEvent::AuctionChanged { .. } => {
+                orders.clear();
+                prices.clear();
+                block = 0;
+                surplus_capturing_jit_order_owners.clear();
+            }
             DeltaEvent::BlockChanged { block: b } => {
                 block = *b;
             }
@@ -4969,19 +5064,19 @@ mod tests {
         assert_eq!(inner.auction_id, 1);
     }
 
-    #[cfg(debug_assertions)]
-    #[tokio::test]
-    #[should_panic(expected = "update_lock must be held when mutating cache")]
-    async fn assert_update_lock_held_panics_without_lock() {
-        let cache = test_cache().await;
-        cache.assert_update_lock_held();
-    }
-
     #[tokio::test]
     async fn assert_update_lock_held_allows_guarded_access() {
         let cache = test_cache().await;
-        let _guard = cache.update_lock.lock().await;
-        cache.assert_update_lock_held();
+        let _guard = cache.acquire_update_guard().await;
+        cache.assert_update_lock_held(&_guard);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "update_lock must be held when mutating cache")]
+    async fn assert_update_lock_held_panics_without_guard() {
+        let cache = test_cache().await;
+        cache.assert_update_lock_held_unchecked();
     }
 
     #[test]
@@ -5121,6 +5216,43 @@ mod tests {
             env3.events.first(),
             Some(DeltaEvent::OrderUpdated(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn set_auction_id_errors_when_sequence_overflow_would_occur() {
+        let cache = test_cache().await;
+
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        // Initialize cache with delta_sequence near the max and a pending
+        // event so flushing would require two increments and thus overflow.
+        cache
+            .set_state_for_tests(auction.clone(), 1, 0, u64::MAX - 1, VecDeque::new())
+            .await;
+
+        // Add a pending envelope while holding the cache lock.
+        {
+            let mut lock = cache.cache.lock().await;
+            if let Some(inner) = lock.as_mut() {
+                inner
+                    .pending_events
+                    .push_back(vec![DeltaEvent::OrderAdded(test_order(1, 10))]);
+            }
+        }
+
+        // Attempting to set auction id should return an error instead of
+        // silently producing duplicate sequence numbers.
+        let res = cache.set_auction_id(2).await;
+        assert!(res.is_err(), "expected overflow to be reported as an error");
+
+        // Ensure sequence was not advanced.
+        let snapshot = cache.delta_snapshot().await.expect("snapshot present");
+        assert_eq!(snapshot.sequence, u64::MAX - 1);
     }
 
     #[tokio::test]
