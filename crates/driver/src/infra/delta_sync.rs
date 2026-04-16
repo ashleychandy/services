@@ -988,8 +988,6 @@ async fn follow_stream(
                 }
             }
             _ = &mut safety_sleep => {
-                // Reset the sleep for the next interval as early as possible.
-                safety_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
 
                 if delta_sync_checksum_enabled() {
                     let local_checksum = replica.read().await.checksum();
@@ -1027,6 +1025,9 @@ async fn follow_stream(
                         return Ok(StreamControl::Resnapshot);
                     }
                 }
+
+
+                safety_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
             }
         }
     }

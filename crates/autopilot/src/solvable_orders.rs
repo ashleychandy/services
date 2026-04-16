@@ -725,6 +725,8 @@ impl SolvableOrdersCache {
     ) -> Result<(broadcast::Receiver<DeltaEnvelope>, DeltaReplay), DeltaSubscribeError> {
         let lock = self.cache.lock().await;
 
+        let mut receiver = self.delta_sender.subscribe();
+
         let latest = lock.as_ref().map(|inner| inner.delta_sequence).unwrap_or(0);
         if after_sequence.is_none() && latest > 0 {
             return Err(DeltaSubscribeError::MissingAfterSequence { latest });
@@ -734,10 +736,7 @@ impl SolvableOrdersCache {
             Self::build_delta_replay(after_sequence.unwrap_or_default(), lock.as_ref())
                 .map_err(DeltaSubscribeError::DeltaAfter)?;
 
-        // Release the cache lock before subscribing so publishers can proceed.
         drop(lock);
-
-        let mut receiver = self.delta_sender.subscribe();
 
         loop {
             match receiver.try_recv() {
@@ -1383,17 +1382,14 @@ impl SolvableOrdersCache {
         let final_orders = tracing::info_span!("assemble_orders").in_scope(|| {
             orders
                 .into_iter()
-                .filter_map(|order| {
+                .map(|order| {
                     let uid = domain::OrderUid(order.metadata.uid.0);
                     let quote = db_solvable_orders
                         .quotes
                         .get(&uid)
                         .map(|quote| quote.as_ref().clone());
-                    Some(self.protocol_fees.apply(
-                        order,
-                        quote,
-                        &surplus_capturing_jit_order_owners,
-                    ))
+                    self.protocol_fees
+                        .apply(order, quote, &surplus_capturing_jit_order_owners)
                 })
                 .collect::<Vec<_>>()
         });
@@ -2632,7 +2628,6 @@ pub(crate) fn apply_delta_events_to_auction(
             DeltaEvent::AuctionChanged { .. } => {
                 orders.clear();
                 prices.clear();
-                block = 0;
                 surplus_capturing_jit_order_owners.clear();
             }
             DeltaEvent::BlockChanged { block: b } => {

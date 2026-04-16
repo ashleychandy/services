@@ -368,12 +368,12 @@ impl Replica {
     }
 
     fn checksum_order_uids(order_uid_bytes: &HashMap<String, [u8; 56]>) -> String {
-        let mut entries = order_uid_bytes.iter().collect::<Vec<_>>();
-        entries.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        let mut uids: Vec<[u8; 56]> = order_uid_bytes.values().cloned().collect();
+        uids.sort_unstable();
 
         let mut hasher = Sha256::new();
-        for (_, uid_bytes) in entries {
-            hasher.update(uid_bytes);
+        for uid_bytes in uids {
+            hasher.update(&uid_bytes);
         }
         format!("0x{}", const_hex::encode(hasher.finalize()))
     }

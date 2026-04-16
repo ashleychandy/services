@@ -1255,12 +1255,10 @@ fn authorize_delta_sync(headers: &HeaderMap) -> Result<(), Response> {
         .unwrap_or("");
     let provided_bytes = provided_str.as_bytes();
 
-    // Build a same-length buffer and copy up to expected length.
-    let mut padded = vec![0u8; expected_bytes.len()];
-    let copy_len = std::cmp::min(provided_bytes.len(), expected_bytes.len());
-    padded[..copy_len].copy_from_slice(&provided_bytes[..copy_len]);
+    let expected_digest = Sha256::digest(expected_bytes);
+    let provided_digest = Sha256::digest(provided_bytes);
 
-    let content_eq = padded.ct_eq(expected_bytes);
+    let content_eq = expected_digest.ct_eq(&provided_digest);
 
     // Constant-time length equality via byte-wise comparison of u64 LE
     // encodings. This avoids leaking length differences via a quick

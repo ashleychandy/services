@@ -189,11 +189,9 @@ impl RunLoop {
                     tokio::time::timeout(FOLLOWER_POLL_INTERVAL, self_arc.wake_notify.notified())
                         .await;
 
-                // Snapshot previous block before calling `update_caches` in
-                // case the call mutates `last_block` internally.
                 let prev_block = last_block.clone();
 
-                let update_result = self_arc.update_caches(&mut last_block, false).await;
+                let update_result = self_arc.update_caches(prev_block.clone(), false).await;
 
                 Self::maybe_mark_startup_probe_ready(&self_arc.probes, &update_result);
                 let new_block = match update_result {
@@ -244,7 +242,7 @@ impl RunLoop {
                 continue;
             }
 
-            let update_result = self_arc.update_caches(&mut last_block, true).await;
+            let update_result = self_arc.update_caches(last_block.clone(), true).await;
             // For the leader path, only mark startup probe on successful cache
             // update to avoid masking genuine startup failures.
             Self::maybe_mark_startup_probe_ready(&self_arc.probes, &update_result);
@@ -310,7 +308,7 @@ impl RunLoop {
     #[instrument(skip_all)]
     async fn update_caches(
         &self,
-        prev_block: &mut Option<B256>,
+        prev_block: Option<B256>,
         is_leader: bool,
     ) -> Result<BlockInfo, anyhow::Error> {
         let current_block = *self.eth.current_block().borrow();
