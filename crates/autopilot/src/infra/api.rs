@@ -1638,6 +1638,53 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
+    static API_TEST_STATE_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[cfg(test)]
+    fn reset_api_test_state() {
+        *DELTA_SYNC_ENABLED_OVERRIDE
+            .lock()
+            .expect("delta sync enabled override lock poisoned") = None;
+        *DELTA_SYNC_LIVE_STREAM_OVERRIDE
+            .lock()
+            .expect("delta sync live stream override lock poisoned") = None;
+        *DELTA_SYNC_STREAM_BUFFER_OVERRIDE
+            .lock()
+            .expect("delta sync stream buffer override lock poisoned") = None;
+        *DELTA_SYNC_API_KEY_OVERRIDE
+            .lock()
+            .expect("delta sync api key override lock poisoned") = ApiKeyOverride::NotSet;
+        *DELTA_STREAM_BUFFER_SIZE
+            .lock()
+            .expect("delta stream buffer size mutex poisoned") = None;
+        DELTA_SYNC_SERVING_ENABLED.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    struct ApiTestStateGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(test)]
+    impl ApiTestStateGuard {
+        fn new() -> Self {
+            let lock = API_TEST_STATE_MUTEX
+                .lock()
+                .expect("api test state mutex poisoned");
+            reset_api_test_state();
+            Self { _lock: lock }
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for ApiTestStateGuard {
+        fn drop(&mut self) {
+            reset_api_test_state();
+        }
+    }
+
     async fn test_cache() -> Arc<SolvableOrdersCache> {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgresql://")
@@ -1876,6 +1923,7 @@ mod tests {
 
     #[test]
     fn authorize_delta_sync_rejects_wrong_key() {
+        let _test_state = ApiTestStateGuard::new();
         let _guard = ApiKeyOverrideGuard::set(Some("expected".to_string()));
         let headers = HeaderMap::new();
 
@@ -1885,6 +1933,7 @@ mod tests {
 
     #[test]
     fn authorize_delta_sync_accepts_correct_key() {
+        let _test_state = ApiTestStateGuard::new();
         let _guard = ApiKeyOverrideGuard::set(Some("expected".to_string()));
         let mut headers = HeaderMap::new();
         headers.insert("X-Delta-Sync-Api-Key", HeaderValue::from_static("expected"));
@@ -1892,9 +1941,9 @@ mod tests {
         assert!(authorize_delta_sync(&headers).is_ok());
     }
 
-    #[serial_test::serial]
     #[tokio::test]
     async fn delta_sync_disabled_disables_routes() {
+        let _test_state = ApiTestStateGuard::new();
         let _guard = DeltaSyncEnabledGuard::set(false);
         let cache = test_cache().await;
         let state = State {
@@ -1918,9 +1967,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    #[serial_test::serial]
     #[tokio::test]
     async fn delta_snapshot_http_response_is_consistent_with_history() {
+        let _test_state = ApiTestStateGuard::new();
         let _guard = DeltaSyncEnabledGuard::set(true);
         let _guard_key = ApiKeyOverrideGuard::set(None);
         let cache = test_cache().await;
@@ -1986,10 +2035,10 @@ mod tests {
         assert_eq!(snapshot["auction"], serde_json::to_value(expected).unwrap());
     }
 
-    #[serial_test::serial]
     #[tokio::test]
     #[ignore = "requires database-backed update pipeline"]
-    async fn update_drives_snapshot_and_stream_end_to_end() {
+    async fn postgres_update_drives_snapshot_and_stream_end_to_end() {
+        let _test_state = ApiTestStateGuard::new();
         let _guard = DeltaSyncEnabledGuard::set(true);
         let (cache, postgres) = db_cache().await;
 
@@ -2057,10 +2106,10 @@ mod tests {
         assert!(replay_has_order);
     }
 
-    #[serial_test::serial]
     #[tokio::test]
     #[ignore = "requires database-backed update pipeline"]
-    async fn snapshot_and_checksum_stay_committed_while_candidate_pending() {
+    async fn postgres_snapshot_and_checksum_stay_committed_while_candidate_pending() {
+        let _test_state = ApiTestStateGuard::new();
         let _guard_enabled = DeltaSyncEnabledGuard::set(true);
         let _guard_key = ApiKeyOverrideGuard::set(None);
         let (cache, postgres) = db_cache().await;
@@ -2256,9 +2305,9 @@ mod tests {
         );
     }
 
-    #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slow_consumer_gets_resync_required_event() {
+        let _test_state = ApiTestStateGuard::new();
         let _stream_ctx = DeltaStreamTestContext::new();
         let _guard_buffer = DeltaStreamBufferGuard::set(1);
         let cache = test_cache().await;
@@ -2583,9 +2632,9 @@ mod tests {
         assert_eq!(oldest_available, None);
     }
 
-    #[serial_test::serial]
     #[tokio::test]
     async fn get_delta_snapshot_when_cache_has_data() {
+        let _test_state = ApiTestStateGuard::new();
         let _guard = DeltaSyncEnabledGuard::set(true);
         let _guard_key = ApiKeyOverrideGuard::set(None);
         let cache = test_cache().await;
@@ -2636,9 +2685,9 @@ mod tests {
         assert_eq!(snapshot.auction.orders.len(), 1);
     }
 
-    #[serial_test::serial]
     #[tokio::test]
     async fn get_delta_snapshot_requires_auth_when_api_key_configured() {
+        let _test_state = ApiTestStateGuard::new();
         let _guard_enabled = DeltaSyncEnabledGuard::set(true);
         let _guard_key = ApiKeyOverrideGuard::set(Some("secret123".to_string()));
         let cache = test_cache().await;
@@ -2677,9 +2726,9 @@ mod tests {
         assert_eq!(response_with_key.status(), StatusCode::NO_CONTENT);
     }
 
-    #[serial_test::serial]
     #[tokio::test]
     async fn get_delta_checksum_returns_204_when_no_snapshot() {
+        let _test_state = ApiTestStateGuard::new();
         let _guard = DeltaSyncEnabledGuard::set(true);
         let _guard_key = ApiKeyOverrideGuard::set(None);
         let cache = test_cache().await;
@@ -2704,9 +2753,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
-    #[serial_test::serial]
     #[tokio::test]
     async fn get_delta_checksum_returns_correct_hash_when_snapshot_exists() {
+        let _test_state = ApiTestStateGuard::new();
         let _guard = DeltaSyncEnabledGuard::set(true);
         let _guard_key = ApiKeyOverrideGuard::set(None);
         let cache = test_cache().await;
@@ -2756,6 +2805,7 @@ mod tests {
 
     #[test]
     fn delta_stream_buffer_size_respects_override() {
+        let _test_state = ApiTestStateGuard::new();
         let _guard = DeltaStreamBufferGuard::set(256);
         assert_eq!(delta_stream_buffer_size(), 256);
     }
@@ -2773,9 +2823,9 @@ mod tests {
         assert_eq!(drained.payloads.len(), 0);
     }
 
-    #[serial_test::serial]
     #[tokio::test]
     async fn replay_envelopes_with_snapshot_sequence_field_populated() {
+        let _test_state = ApiTestStateGuard::new();
         let _stream_ctx = DeltaStreamTestContext::new();
         let cache = test_cache().await;
 

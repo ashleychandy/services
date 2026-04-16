@@ -387,8 +387,14 @@ struct Inner {
     delta_sequence: u64,
     delta_history: VecDeque<DeltaEnvelope>,
 
-    pending_events: VecDeque<Vec<DeltaEvent>>,
+    pending_events: VecDeque<PendingDeltaEvents>,
     indexed_state: Arc<IndexedAuctionState>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingDeltaEvents {
+    created_at_instant: Instant,
+    events: Vec<DeltaEvent>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -657,7 +663,7 @@ impl SolvableOrdersCache {
                 // DeltaEnvelope instances with proper sequence numbers and
                 // broadcast them in order while holding the cache lock so
                 // ordering remains consistent.
-                while let Some(events) = inner.pending_events.pop_front() {
+                while let Some(pending) = inner.pending_events.pop_front() {
                     // Advance global monotonic sequence and per-auction
                     // sequence counters. This cannot overflow because of the
                     // pre-check above.
@@ -675,7 +681,7 @@ impl SolvableOrdersCache {
                         to_sequence: next_seq,
                         published_at: chrono::Utc::now(),
                         created_at_instant: Instant::now(),
-                        events,
+                        events: pending.events,
                     };
 
                     inner.delta_sequence = next_seq;
@@ -1185,7 +1191,13 @@ impl SolvableOrdersCache {
                 .as_ref()
                 .map(|inner| inner.pending_events.clone())
                 .unwrap_or_default();
-            pending.push_back(events);
+            pending.push_back(PendingDeltaEvents {
+                created_at_instant: Instant::now(),
+                events,
+            });
+            let max_age = chrono::Duration::from_std(self.delta_config.history_max_age)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+            prune_pending_delta_events(&mut pending, max_age, &self.delta_config);
 
             // Preserve the current delta_sequence/auction_sequence and history
             // until the authoritative auction id is assigned.
@@ -2628,6 +2640,7 @@ pub(crate) fn apply_delta_events_to_auction(
             DeltaEvent::AuctionChanged { .. } => {
                 orders.clear();
                 prices.clear();
+                block = 0;
                 surplus_capturing_jit_order_owners.clear();
             }
             DeltaEvent::BlockChanged { block: b } => {
@@ -2662,6 +2675,37 @@ pub(crate) fn apply_delta_events_to_auction(
         orders,
         prices,
         surplus_capturing_jit_order_owners,
+    }
+}
+
+fn prune_pending_delta_events(
+    pending_events: &mut VecDeque<PendingDeltaEvents>,
+    max_age: chrono::Duration,
+    config: &DeltaSyncConfig,
+) {
+    let max_age_std = match max_age.to_std() {
+        Ok(d) => d,
+        Err(_) => {
+            tracing::warn!(
+                ?max_age,
+                "invalid max_age for pending delta event pruning; skipping age-based pruning"
+            );
+            return;
+        }
+    };
+    let min_retained = config.history_min_retained;
+
+    let pruneable = pending_events.len().saturating_sub(min_retained);
+    let to_remove_by_age = pending_events
+        .iter()
+        .take(pruneable)
+        .take_while(|entry| entry.created_at_instant.elapsed() > max_age_std)
+        .count();
+    let to_remove_by_count = pending_events.len().saturating_sub(MAX_DELTA_HISTORY);
+    let remove = to_remove_by_age.max(to_remove_by_count);
+
+    if remove > 0 {
+        pending_events.drain(..remove);
     }
 }
 
@@ -5176,12 +5220,14 @@ mod tests {
         {
             let mut lock = cache.cache.lock().await;
             if let Some(inner) = lock.as_mut() {
-                inner
-                    .pending_events
-                    .push_back(vec![DeltaEvent::OrderAdded(test_order(1, 10))]);
-                inner
-                    .pending_events
-                    .push_back(vec![DeltaEvent::OrderUpdated(test_order(2, 20))]);
+                inner.pending_events.push_back(PendingDeltaEvents {
+                    created_at_instant: Instant::now(),
+                    events: vec![DeltaEvent::OrderAdded(test_order(1, 10))],
+                });
+                inner.pending_events.push_back(PendingDeltaEvents {
+                    created_at_instant: Instant::now(),
+                    events: vec![DeltaEvent::OrderUpdated(test_order(2, 20))],
+                });
             }
         }
 
@@ -5234,9 +5280,10 @@ mod tests {
         {
             let mut lock = cache.cache.lock().await;
             if let Some(inner) = lock.as_mut() {
-                inner
-                    .pending_events
-                    .push_back(vec![DeltaEvent::OrderAdded(test_order(1, 10))]);
+                inner.pending_events.push_back(PendingDeltaEvents {
+                    created_at_instant: Instant::now(),
+                    events: vec![DeltaEvent::OrderAdded(test_order(1, 10))],
+                });
             }
         }
 
@@ -5279,9 +5326,10 @@ mod tests {
             let mut lock = cache.cache.lock().await;
             if let Some(inner) = lock.as_mut() {
                 inner.auction = new_auction.clone();
-                inner
-                    .pending_events
-                    .push_back(vec![DeltaEvent::BlockChanged { block: 2 }]);
+                inner.pending_events.push_back(PendingDeltaEvents {
+                    created_at_instant: Instant::now(),
+                    events: vec![DeltaEvent::BlockChanged { block: 2 }],
+                });
                 // committed_auction and delta_sequence intentionally unchanged
             }
         }
@@ -5393,6 +5441,35 @@ mod tests {
 
         assert_eq!(delta_history.len(), 1);
         assert_eq!(delta_history.front().unwrap().to_sequence, 3);
+    }
+
+    #[test]
+    fn prune_pending_delta_events_evicts_by_age() {
+        let config = DeltaSyncConfig {
+            history_min_retained: 1,
+            history_max_age: Duration::from_secs(300),
+            broadcast_capacity: 256,
+        };
+
+        let now = Instant::now();
+        let mut pending_events = VecDeque::from([
+            PendingDeltaEvents {
+                created_at_instant: now - Duration::from_secs(120),
+                events: vec![DeltaEvent::OrderAdded(test_order(1, 10))],
+            },
+            PendingDeltaEvents {
+                created_at_instant: now,
+                events: vec![DeltaEvent::OrderUpdated(test_order(2, 20))],
+            },
+        ]);
+
+        prune_pending_delta_events(&mut pending_events, chrono::Duration::seconds(60), &config);
+
+        assert_eq!(pending_events.len(), 1);
+        assert!(matches!(
+            pending_events.front(),
+            Some(entry) if matches!(entry.events.first(), Some(DeltaEvent::OrderUpdated(_)))
+        ));
     }
 
     #[test]
@@ -5741,8 +5818,9 @@ mod tests {
         let result =
             crate::solvable_orders::apply_delta_events_to_auction(auction.clone(), &events);
 
-        assert_eq!(result.block, auction.block);
+        assert_eq!(result.block, 0);
         assert_eq!(result.orders.len(), 0);
+        assert!(result.surplus_capturing_jit_order_owners.is_empty());
     }
 
     #[test]
