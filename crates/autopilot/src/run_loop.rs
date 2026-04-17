@@ -174,13 +174,21 @@ impl RunLoop {
                 leader_lock_tracker.try_acquire().await;
             }
 
-            let stepped_up_this_iteration = is_follower && leader_lock_tracker.is_leader();
+            let _stepped_up_this_iteration = is_follower && leader_lock_tracker.is_leader();
 
-            if stepped_up_this_iteration {
-                leader_lock_tracker.verify_or_refresh().await;
-            }
+            // Always verify/refresh immediately so a just-stepped-up leader
+            // consumes the `JustSteppedUp` transition in the same iteration
+            // (ensuring logs/metrics fire without waiting one loop).
+            leader_lock_tracker.verify_or_refresh().await;
 
             sync_serving_flag(&mut last_serving_flag, leader_lock_tracker.is_leader());
+
+            // Snapshot the last seen block for this iteration so both follower
+            // and leader paths use a consistent `prev_block` value. This
+            // avoids an off-by-one where a node that transitions from
+            // follower->leader within the same iteration would pass a stale
+            // `last_block` into `update_caches`.
+            let prev_block = last_block.clone();
 
             if !leader_lock_tracker.is_leader() {
                 // Follower: wait for a block notification (or timeout) before
@@ -188,8 +196,6 @@ impl RunLoop {
                 let _ =
                     tokio::time::timeout(FOLLOWER_POLL_INTERVAL, self_arc.wake_notify.notified())
                         .await;
-
-                let prev_block = last_block.clone();
 
                 let update_result = self_arc.update_caches(prev_block.clone(), false).await;
 
@@ -232,9 +238,8 @@ impl RunLoop {
                 }
             }
 
-            if !stepped_up_this_iteration {
-                leader_lock_tracker.verify_or_refresh().await;
-            }
+            // No-op: verification already performed at the top of the loop to
+            // ensure leadership transitions are handled immediately.
             let is_leader_now = leader_lock_tracker.is_leader();
             sync_serving_flag(&mut last_serving_flag, is_leader_now);
             if !is_leader_now {
@@ -242,7 +247,7 @@ impl RunLoop {
                 continue;
             }
 
-            let update_result = self_arc.update_caches(last_block.clone(), true).await;
+            let update_result = self_arc.update_caches(prev_block.clone(), true).await;
             // For the leader path, only mark startup probe on successful cache
             // update to avoid masking genuine startup failures.
             Self::maybe_mark_startup_probe_ready(&self_arc.probes, &update_result);
@@ -381,21 +386,49 @@ impl RunLoop {
             tracing::debug!("no current auction");
             return None;
         };
-        let id = self
-            .persistence
-            .get_next_auction_id()
-            .await
-            .inspect_err(|err| tracing::error!(?err, "failed to get next auction id"))
-            .ok()?;
-        Metrics::auction(id);
+        // If the cache already assigned an auction id (e.g. leader collapsed
+        // the commit into `update()`), reuse that id. Otherwise, claim the
+        // next id from persistence and set it here.
+        let snapshot = self.solvable_orders_cache.delta_snapshot().await;
+        let id: domain::auction::Id = if let Some(s) = snapshot {
+            if s.auction_id != 0 {
+                // Use already-assigned id.
+                i64::try_from(s.auction_id).unwrap_or_default()
+            } else {
+                let id = self
+                    .persistence
+                    .get_next_auction_id()
+                    .await
+                    .inspect_err(|err| tracing::error!(?err, "failed to get next auction id"))
+                    .ok()?;
 
-        if let Err(err) = self
-            .solvable_orders_cache
-            .set_auction_id(u64::try_from(id).unwrap_or_default())
-            .await
-        {
-            tracing::error!(?err, "failed to set auction id");
-        }
+                if let Err(err) = self
+                    .solvable_orders_cache
+                    .set_auction_id(u64::try_from(id).unwrap_or_default())
+                    .await
+                {
+                    tracing::error!(?err, "failed to set auction id");
+                }
+                id
+            }
+        } else {
+            let id = self
+                .persistence
+                .get_next_auction_id()
+                .await
+                .inspect_err(|err| tracing::error!(?err, "failed to get next auction id"))
+                .ok()?;
+
+            if let Err(err) = self
+                .solvable_orders_cache
+                .set_auction_id(u64::try_from(id).unwrap_or_default())
+                .await
+            {
+                tracing::error!(?err, "failed to set auction id");
+            }
+            id
+        };
+        Metrics::auction(id);
 
         // always update the auction because the tests use this as a readiness probe
         self.persistence.replace_current_auction_in_db(id, &auction);

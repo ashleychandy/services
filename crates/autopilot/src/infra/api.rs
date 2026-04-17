@@ -1233,19 +1233,40 @@ fn ensure_delta_sync_serving_enabled() -> Result<(), Response> {
     if delta_sync_serving_enabled() {
         return Ok(());
     }
-
-    #[cfg(any(test, feature = "test-util"))]
-    {
-        if delta_sync_enabled() {
-            return Ok(());
-        }
-    }
-
+    // Require explicit serving enablement even in tests. Previously the
+    // test-only branch returned `Ok` when `delta_sync_enabled()` was true,
+    // which bypassed the leader-controlled serving flag and allowed tests
+    // to succeed without calling `set_delta_sync_serving_enabled(true)`.
+    //
+    // Keep the behavior consistent with production: delta sync must be
+    // both enabled and actively serving to accept requests.
     Err((
         StatusCode::SERVICE_UNAVAILABLE,
         "delta sync is unavailable on this autopilot instance",
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod serving_flag_tests {
+    use {super::*, axum::http::StatusCode};
+
+    #[tokio::test]
+    async fn delta_sync_enabled_but_not_serving_returns_503() {
+        // Acquire test guard to isolate API test state and allow using
+        // the set_delta_sync_* override helpers safely.
+        let _guard = ApiTestStateGuard::new();
+
+        // Enable delta sync feature but do NOT enable serving. The
+        // handler should return SERVICE_UNAVAILABLE.
+        set_delta_sync_enabled_override(Some(true));
+        set_delta_sync_serving_enabled(false);
+
+        let result = ensure_delta_sync_serving_enabled();
+        assert!(result.is_err());
+        let resp = result.err().unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 
 fn delta_stream_max_lag() -> u64 {
@@ -1656,11 +1677,14 @@ mod tests {
     #[cfg(test)]
     impl DeltaStreamTestContext {
         fn new() -> Self {
-            Self {
+            let ctx = Self {
                 _enabled: DeltaSyncEnabledGuard::set(true),
                 _live: DeltaSyncLiveGuard::set(true),
                 _key: ApiKeyOverrideGuard::set(None),
-            }
+            };
+
+            set_delta_sync_serving_enabled(true);
+            ctx
         }
     }
 
@@ -1991,6 +2015,8 @@ mod tests {
     async fn delta_snapshot_http_response_is_consistent_with_history() {
         let _test_state = ApiTestStateGuard::new();
         let _guard = DeltaSyncEnabledGuard::set(true);
+
+        set_delta_sync_serving_enabled(true);
         let _guard_key = ApiKeyOverrideGuard::set(None);
         let cache = test_cache().await;
 
@@ -2060,6 +2086,8 @@ mod tests {
     async fn postgres_update_drives_snapshot_and_stream_end_to_end() {
         let _test_state = ApiTestStateGuard::new();
         let _guard = DeltaSyncEnabledGuard::set(true);
+
+        set_delta_sync_serving_enabled(true);
         let (cache, postgres) = db_cache().await;
 
         let uid: database::OrderUid = ByteArray([0x11; 56]);
@@ -2131,6 +2159,8 @@ mod tests {
     async fn postgres_snapshot_and_checksum_stay_committed_while_candidate_pending() {
         let _test_state = ApiTestStateGuard::new();
         let _guard_enabled = DeltaSyncEnabledGuard::set(true);
+
+        set_delta_sync_serving_enabled(true);
         let _guard_key = ApiKeyOverrideGuard::set(None);
         let (cache, postgres) = db_cache().await;
 
@@ -2656,6 +2686,8 @@ mod tests {
     async fn get_delta_snapshot_when_cache_has_data() {
         let _test_state = ApiTestStateGuard::new();
         let _guard = DeltaSyncEnabledGuard::set(true);
+
+        set_delta_sync_serving_enabled(true);
         let _guard_key = ApiKeyOverrideGuard::set(None);
         let cache = test_cache().await;
 
@@ -2709,6 +2741,8 @@ mod tests {
     async fn get_delta_snapshot_requires_auth_when_api_key_configured() {
         let _test_state = ApiTestStateGuard::new();
         let _guard_enabled = DeltaSyncEnabledGuard::set(true);
+
+        set_delta_sync_serving_enabled(true);
         let _guard_key = ApiKeyOverrideGuard::set(Some("secret123".to_string()));
         let cache = test_cache().await;
 
@@ -2750,6 +2784,8 @@ mod tests {
     async fn get_delta_checksum_returns_204_when_no_snapshot() {
         let _test_state = ApiTestStateGuard::new();
         let _guard = DeltaSyncEnabledGuard::set(true);
+
+        set_delta_sync_serving_enabled(true);
         let _guard_key = ApiKeyOverrideGuard::set(None);
         let cache = test_cache().await;
 
@@ -2777,6 +2813,8 @@ mod tests {
     async fn get_delta_checksum_returns_correct_hash_when_snapshot_exists() {
         let _test_state = ApiTestStateGuard::new();
         let _guard = DeltaSyncEnabledGuard::set(true);
+
+        set_delta_sync_serving_enabled(true);
         let _guard_key = ApiKeyOverrideGuard::set(None);
         let cache = test_cache().await;
 

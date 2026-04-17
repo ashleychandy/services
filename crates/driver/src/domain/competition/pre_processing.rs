@@ -2007,7 +2007,17 @@ mod tests {
 
         assert!(result.is_err());
         let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_millis(400));
+        // Use the configured retry delay as the primary lower bound with a
+        // small tolerance to tolerate scheduler jitter. This avoids a flaky
+        // hard-coded value that can be invalid if the configured delay is
+        // changed via environment variables in test environments.
+        let configured_delay = delta_sync_resync_retry_delay();
+        let tolerance = Duration::from_millis(100);
+        let min_expected = configured_delay.saturating_sub(tolerance);
+        assert!(
+            elapsed >= min_expected,
+            "elapsed={elapsed:?} min_expected={min_expected:?}"
+        );
         assert!(elapsed < Duration::from_secs(2));
     }
 

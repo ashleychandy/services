@@ -474,40 +474,50 @@ impl DeltaReplicaTestGuard {
 #[cfg(any(test, feature = "test-helpers"))]
 impl Drop for DeltaReplicaTestGuard {
     fn drop(&mut self) {
-        // Clone the Arc twice so one clone can be moved into the
-        // `block_in_place` closure and another can be used by the
-        // fallback `std::thread::spawn` closure. This avoids moving the
-        // same `Arc` value into multiple closures.
-        let replica_for_block = Arc::clone(&self.replica);
-        let replica_for_thread = Arc::clone(&self.replica);
+        // Try a non-blocking in-place reset first. This avoids calling
+        // `tokio::task::block_in_place` (which panics on current-thread
+        // runtimes) and avoids spawning threads that could deadlock if the
+        // runtime is holding the inner lock. If the immediate attempt
+        // fails, spin briefly trying `try_write()` and then fall back to
+        // replacing the global Arc or, as a final fallback, spawning a
+        // thread to perform the replacement synchronously.
+        let replica_arc = Arc::clone(&self.replica);
 
-        if std::thread::panicking() {
-            tracing::warn!("delta replica reset via std::thread fallback during unwind");
-            let handle = std::thread::spawn(move || {
-                let mut guard = replica_for_thread.blocking_write();
-                *guard = Replica::default();
-            });
-            if let Err(e) = handle.join() {
-                tracing::error!(
-                    ?e,
-                    "delta replica reset thread panicked in fallback (unwind)"
-                );
-            }
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(500);
+        let mut did_reset = false;
+
+        // Fast path: try to obtain the inner write lock without blocking.
+        if let Ok(mut inner) = replica_arc.try_write() {
+            *inner = Replica::default();
+            did_reset = true;
         } else {
-            let block_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tokio::task::block_in_place(move || {
-                    let mut guard = replica_for_block.blocking_write();
-                    *guard = Replica::default();
-                })
-            }));
+            // Spin briefly trying to acquire the write lock. This mirrors the
+            // async helper's behaviour but uses `std::thread::sleep` so it
+            // can run synchronously from `Drop`.
+            while start.elapsed() < timeout {
+                if let Ok(mut inner) = replica_arc.try_write() {
+                    *inner = Replica::default();
+                    did_reset = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
 
-            if block_result.is_err() {
-                tracing::warn!(
-                    "tokio::task::block_in_place failed; resetting via std::thread fallback"
-                );
+        if !did_reset {
+            // Try to replace the global Arc quickly without blocking on the
+            // inner tokio lock. If that fails, synchronously spawn a thread
+            // which takes the std::sync write lock and replaces the Arc.
+            if let Ok(mut global_guard) = DELTA_REPLICA.try_write() {
+                *global_guard = Arc::new(RwLock::new(Replica::default()));
+            } else {
                 let handle = std::thread::spawn(move || {
-                    let mut guard = replica_for_thread.blocking_write();
-                    *guard = Replica::default();
+                    let mut guard = match DELTA_REPLICA.write() {
+                        Ok(g) => g,
+                        Err(poison) => poison.into_inner(),
+                    };
+                    *guard = Arc::new(RwLock::new(Replica::default()));
                 });
                 if let Err(e) = handle.join() {
                     tracing::error!(?e, "delta replica reset thread panicked in fallback");

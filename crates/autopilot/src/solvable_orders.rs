@@ -1344,6 +1344,105 @@ impl SolvableOrdersCache {
                 pending_events: pending,
                 indexed_state: computed_indexed_state.clone(),
             });
+            // If we're the leader, collapse the two-phase commit by claiming
+            // the next auction id and flushing pending events here while
+            // still holding the update lock. This reduces the window where
+            // pending events only exist in-memory between `update()` and
+            // `set_auction_id()`.
+            if store_events {
+                // We still hold the cache lock; operate on the inner state.
+                if let Some(inner) = cache.as_mut() {
+                    // Pre-check that advancing the global delta sequence will
+                    // not overflow given how many envelopes we need to emit
+                    // (1 for AuctionChanged + N pending events).
+                    let pending_count: u64 =
+                        inner.pending_events.len().try_into().unwrap_or(u64::MAX);
+                    let required = pending_count.saturating_add(1);
+                    let available = u64::MAX.saturating_sub(inner.delta_sequence);
+                    if available < required {
+                        Metrics::get().delta_incremental_failure_total.inc();
+                        tracing::error!(
+                            available,
+                            required,
+                            "delta sequence would overflow while flushing pending events; \
+                             refusing to set auction id"
+                        );
+                    } else {
+                        match self.persistence.get_next_auction_id().await {
+                            Ok(db_id) => {
+                                let auction_id_u64 = u64::try_from(db_id).unwrap_or_default();
+                                if let Some(envelope) = apply_auction_id_change(
+                                    inner,
+                                    auction_id_u64,
+                                    &self.delta_config,
+                                ) {
+                                    // Send the AuctionChanged envelope while
+                                    // holding the cache lock so ordering stays
+                                    // consistent with replay.
+                                    send_or_warn!(
+                                        self.delta_sender,
+                                        envelope.clone(),
+                                        "delta broadcast"
+                                    );
+
+                                    // Flush any pending per-auction events that
+                                    // were queued while waiting for the
+                                    // authoritative auction id. Create real
+                                    // DeltaEnvelope instances with proper
+                                    // sequence numbers and broadcast them in
+                                    // order while holding the cache lock so
+                                    // ordering remains consistent.
+                                    while let Some(pending) = inner.pending_events.pop_front() {
+                                        let next_seq = inner
+                                            .delta_sequence
+                                            .checked_add(1)
+                                            .expect("pre-checked available delta sequence space");
+
+                                        let next_auction_seq =
+                                            inner.auction_sequence.saturating_add(1);
+
+                                        let pending_envelope = DeltaEnvelope {
+                                            auction_id: inner.auction_id,
+                                            auction_sequence: next_auction_seq,
+                                            from_sequence: inner.delta_sequence,
+                                            to_sequence: next_seq,
+                                            published_at: chrono::Utc::now(),
+                                            created_at_instant: Instant::now(),
+                                            events: pending.events,
+                                        };
+
+                                        inner.delta_sequence = next_seq;
+                                        inner.auction_sequence = next_auction_seq;
+                                        inner.delta_history.push_back(pending_envelope.clone());
+                                        let max_age = chrono::Duration::from_std(
+                                            self.delta_config.history_max_age,
+                                        )
+                                        .unwrap_or_else(|_| chrono::Duration::seconds(60));
+                                        prune_delta_history(
+                                            &mut inner.delta_history,
+                                            max_age,
+                                            &self.delta_config,
+                                        );
+
+                                        send_or_warn!(
+                                            self.delta_sender,
+                                            pending_envelope,
+                                            "delta broadcast"
+                                        );
+                                    }
+
+                                    inner.committed_auction = inner.auction.clone();
+                                }
+                            }
+                            Err(err) => tracing::error!(
+                                ?err,
+                                "failed to get next auction id while flushing pending events; \
+                                 pending events remain queued"
+                            ),
+                        }
+                    }
+                }
+            }
         } else {
             let envelope = DeltaEnvelope {
                 auction_id: current_auction_id,
