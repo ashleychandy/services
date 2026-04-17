@@ -61,7 +61,54 @@ static DELTA_STREAM_BUFFER_SIZE: std::sync::LazyLock<std::sync::Mutex<Option<usi
 static DELTA_STREAM_KEEPALIVE_INTERVAL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 static DELTA_SYNC_SERVING_ENABLED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
+static API_TEST_STATE_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+#[cfg(any(test, feature = "test-util"))]
+pub fn reset_api_test_state() {
+    *DELTA_SYNC_ENABLED_OVERRIDE
+        .lock()
+        .expect("delta sync enabled override lock poisoned") = None;
+    *DELTA_SYNC_LIVE_STREAM_OVERRIDE
+        .lock()
+        .expect("delta sync live stream override lock poisoned") = None;
+    *DELTA_SYNC_STREAM_BUFFER_OVERRIDE
+        .lock()
+        .expect("delta sync stream buffer override lock poisoned") = None;
+    *DELTA_SYNC_API_KEY_OVERRIDE
+        .lock()
+        .expect("delta sync api key override lock poisoned") = ApiKeyOverride::NotSet;
+    *DELTA_STREAM_BUFFER_SIZE
+        .lock()
+        .expect("delta stream buffer size mutex poisoned") = None;
+    DELTA_SYNC_SERVING_ENABLED.store(false, Ordering::Release);
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub struct ApiTestStateGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl ApiTestStateGuard {
+    pub fn new() -> Self {
+        let lock = API_TEST_STATE_MUTEX
+            .lock()
+            .expect("api test state mutex poisoned");
+        reset_api_test_state();
+        Self { _lock: lock }
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl Drop for ApiTestStateGuard {
+    fn drop(&mut self) {
+        reset_api_test_state();
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Clone, Debug)]
 enum ApiKeyOverride {
     /// No override: fall through to the environment variable / OnceLock.
@@ -194,14 +241,14 @@ mod invariant_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Default for ApiKeyOverride {
     fn default() -> Self {
         Self::NotSet
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static DELTA_SYNC_API_KEY_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<ApiKeyOverride>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(ApiKeyOverride::NotSet));
 
@@ -211,6 +258,15 @@ static DELTA_SYNC_ENABLED_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<
 
 #[cfg(any(test, feature = "test-util"))]
 pub fn set_delta_sync_enabled_override(value: Option<bool>) {
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        if API_TEST_STATE_MUTEX.try_lock().is_ok() {
+            panic!(
+                "set_delta_sync_enabled_override must be called while holding ApiTestStateGuard"
+            );
+        }
+    }
+
     *DELTA_SYNC_ENABLED_OVERRIDE
         .lock()
         .expect("delta sync enabled override lock poisoned") = value;
@@ -232,6 +288,16 @@ static DELTA_SYNC_LIVE_STREAM_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Opt
 
 #[cfg(any(test, feature = "test-util"))]
 pub fn set_delta_sync_live_stream_override(value: Option<bool>) {
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        if API_TEST_STATE_MUTEX.try_lock().is_ok() {
+            panic!(
+                "set_delta_sync_live_stream_override must be called while holding \
+                 ApiTestStateGuard"
+            );
+        }
+    }
+
     *DELTA_SYNC_LIVE_STREAM_OVERRIDE
         .lock()
         .expect("delta sync live stream override lock poisoned") = value;
@@ -267,7 +333,7 @@ impl Drop for DeltaSyncLiveGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static DELTA_SYNC_STREAM_BUFFER_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<Option<usize>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
@@ -1452,6 +1518,7 @@ fn error_to_response(err: PriceEstimationError) -> Response {
 
 #[cfg(test)]
 mod tests {
+
     use {
         super::*,
         crate::{
@@ -1635,53 +1702,6 @@ mod tests {
             *DELTA_SYNC_API_KEY_OVERRIDE
                 .lock()
                 .expect("delta sync api key override lock poisoned") = self.previous.clone();
-        }
-    }
-
-    #[cfg(test)]
-    static API_TEST_STATE_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-
-    #[cfg(test)]
-    fn reset_api_test_state() {
-        *DELTA_SYNC_ENABLED_OVERRIDE
-            .lock()
-            .expect("delta sync enabled override lock poisoned") = None;
-        *DELTA_SYNC_LIVE_STREAM_OVERRIDE
-            .lock()
-            .expect("delta sync live stream override lock poisoned") = None;
-        *DELTA_SYNC_STREAM_BUFFER_OVERRIDE
-            .lock()
-            .expect("delta sync stream buffer override lock poisoned") = None;
-        *DELTA_SYNC_API_KEY_OVERRIDE
-            .lock()
-            .expect("delta sync api key override lock poisoned") = ApiKeyOverride::NotSet;
-        *DELTA_STREAM_BUFFER_SIZE
-            .lock()
-            .expect("delta stream buffer size mutex poisoned") = None;
-        DELTA_SYNC_SERVING_ENABLED.store(false, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    struct ApiTestStateGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    #[cfg(test)]
-    impl ApiTestStateGuard {
-        fn new() -> Self {
-            let lock = API_TEST_STATE_MUTEX
-                .lock()
-                .expect("api test state mutex poisoned");
-            reset_api_test_state();
-            Self { _lock: lock }
-        }
-    }
-
-    #[cfg(test)]
-    impl Drop for ApiTestStateGuard {
-        fn drop(&mut self) {
-            reset_api_test_state();
         }
     }
 

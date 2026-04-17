@@ -185,6 +185,13 @@ impl<'a> Services<'a> {
             ..config
         };
 
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            let guard = autopilot::infra::api::ApiTestStateGuard::new();
+            let _static_guard_ref: &'static autopilot::infra::api::ApiTestStateGuard =
+                Box::leak(Box::new(guard));
+        }
+
         let join_handle = tokio::task::spawn(autopilot::run(config, control));
         self.wait_until_autopilot_ready().await;
 

@@ -14,6 +14,7 @@ pub(in crate::infra::api) fn solve(router: axum::Router<State>) -> axum::Router<
     router.route("/solve", axum::routing::post(route))
 }
 
+#[axum::debug_handler]
 async fn route(
     state: axum::extract::State<State>,
     // Take the request as raw request to extract the body as a stream.

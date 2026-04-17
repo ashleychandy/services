@@ -27,7 +27,7 @@ alloy = { workspace = true, features = [
 ] }
 app-data = { workspace = true }
 async-trait = { workspace = true }
-axum = { workspace = true }
+axum = { workspace = true, features = ["macros"] }
 bad-tokens = { workspace = true }
 balance-overrides = { workspace = true }
 bigdecimal = { workspace = true }
@@ -66,8 +66,8 @@ serde = { workspace = true, features = ["derive"] }
 serde-ext = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
-simulator = { workspace = true }
 sha2 = { workspace = true }
+simulator = { workspace = true }
 solvers-dto = { path = "../solvers-dto" }
 thiserror = { workspace = true }
 tikv-jemallocator = { workspace = true }

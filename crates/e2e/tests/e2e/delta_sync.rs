@@ -758,6 +758,7 @@ static DELTA_ENV_MUTEX: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
 struct DeltaEnvGuard {
     _lock: OwnedMutexGuard<()>,
+    _autopilot_test_state: Option<autopilot::infra::api::ApiTestStateGuard>,
 }
 
 impl DeltaEnvGuard {
@@ -771,6 +772,7 @@ impl DeltaEnvGuard {
         // threads/tasks see the change safely. We do NOT write to the process
         // environment here; that avoids TOCTOU and visibility issues for
         // concurrently running tasks.
+        let autopilot_guard = autopilot::infra::api::ApiTestStateGuard::new();
         autopilot::infra::api::set_delta_sync_enabled_override(Some(true));
         #[cfg(any(test, feature = "test-helpers"))]
         {
@@ -782,7 +784,10 @@ impl DeltaEnvGuard {
             driver::test_helpers::set_replica_preprocessing_override(Some(true));
         }
 
-        Self { _lock: lock }
+        Self {
+            _lock: lock,
+            _autopilot_test_state: Some(autopilot_guard),
+        }
     }
 }
 

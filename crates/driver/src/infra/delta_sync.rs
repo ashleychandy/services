@@ -458,6 +458,8 @@ impl DeltaReplicaTestGuard {
             let mut inner = replica_arc.blocking_write();
             *inner = Replica::default();
 
+            drop(inner);
+
             replica_arc
         });
         let replica = handle.await.expect("replica reset thread panicked");
@@ -472,9 +474,45 @@ impl DeltaReplicaTestGuard {
 #[cfg(any(test, feature = "test-helpers"))]
 impl Drop for DeltaReplicaTestGuard {
     fn drop(&mut self) {
-        {
-            let mut replica = self.replica.blocking_write();
-            *replica = Replica::default();
+        // Clone the Arc twice so one clone can be moved into the
+        // `block_in_place` closure and another can be used by the
+        // fallback `std::thread::spawn` closure. This avoids moving the
+        // same `Arc` value into multiple closures.
+        let replica_for_block = Arc::clone(&self.replica);
+        let replica_for_thread = Arc::clone(&self.replica);
+
+        if std::thread::panicking() {
+            tracing::warn!("delta replica reset via std::thread fallback during unwind");
+            let handle = std::thread::spawn(move || {
+                let mut guard = replica_for_thread.blocking_write();
+                *guard = Replica::default();
+            });
+            if let Err(e) = handle.join() {
+                tracing::error!(
+                    ?e,
+                    "delta replica reset thread panicked in fallback (unwind)"
+                );
+            }
+        } else {
+            let block_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(move || {
+                    let mut guard = replica_for_block.blocking_write();
+                    *guard = Replica::default();
+                })
+            }));
+
+            if block_result.is_err() {
+                tracing::warn!(
+                    "tokio::task::block_in_place failed; resetting via std::thread fallback"
+                );
+                let handle = std::thread::spawn(move || {
+                    let mut guard = replica_for_thread.blocking_write();
+                    *guard = Replica::default();
+                });
+                if let Err(e) = handle.join() {
+                    tracing::error!(?e, "delta replica reset thread panicked in fallback");
+                }
+            }
         }
 
         if let Some(lock) = self._lock.take() {

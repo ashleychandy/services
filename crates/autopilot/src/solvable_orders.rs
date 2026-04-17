@@ -1,3 +1,6 @@
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
 use {
     crate::{
         boundary::{self, SolvableOrders},
@@ -193,6 +196,8 @@ pub struct SolvableOrdersCache {
     deny_listed_tokens: DenyListedTokens,
     cache: Mutex<Option<Inner>>,
     update_lock: Mutex<()>,
+    #[cfg(debug_assertions)]
+    update_lock_held: AtomicBool,
     native_price_estimator: Arc<NativePriceUpdater>,
     weth: Address,
     protocol_fees: domain::ProtocolFees,
@@ -210,10 +215,15 @@ pub struct SolvableOrdersCache {
 #[must_use = "holding the UpdateGuard ensures the update lock remains held"]
 pub struct UpdateGuard<'a> {
     inner: tokio::sync::MutexGuard<'a, ()>,
+    #[cfg(debug_assertions)]
+    lock_held_flag: &'a AtomicBool,
 }
 
 impl<'a> Drop for UpdateGuard<'a> {
     fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        self.lock_held_flag.store(false, AtomicOrdering::Release);
+
         // `inner` is dropped automatically here; no debug-side effects.
     }
 }
@@ -223,18 +233,18 @@ type Balances = HashMap<Query, U256>;
 /// Configuration for delta sync behavior.
 #[derive(Clone, Debug)]
 pub struct DeltaSyncConfig {
-    /// Minimum number of delta envelopes to retain regardless of age.
-    pub history_min_retained: usize,
-    /// Maximum age for delta history entries before pruning.
+    pub replay_history_min_retained: usize,
+
+    pub pending_events_min_retained: usize,
     pub history_max_age: Duration,
-    /// Broadcast channel capacity for live delta streaming.
     pub broadcast_capacity: usize,
 }
 
 impl Default for DeltaSyncConfig {
     fn default() -> Self {
         Self {
-            history_min_retained: MIN_DELTA_HISTORY_RETAINED,
+            replay_history_min_retained: MIN_DELTA_HISTORY_RETAINED,
+            pending_events_min_retained: MIN_DELTA_HISTORY_RETAINED,
             history_max_age: DEFAULT_DELTA_HISTORY_MAX_AGE,
             broadcast_capacity: DELTA_BROADCAST_CAPACITY,
         }
@@ -377,6 +387,8 @@ pub struct DeltaReplay {
 ///   single auction.
 /// - `delta_sequence`: global, monotonic sequence counter. Never resets and is
 ///   the authoritative ordering counter used for replay and gap detection.
+/// - `auction.block`: after `AuctionChanged`, delta reconstruction uses `block
+///   = 0` as an explicit "unknown until next block-bearing update" sentinel.
 struct Inner {
     auction: domain::RawAuctionData,
 
@@ -445,6 +457,117 @@ struct CollectedAuctionInputs {
     mode: CollectionMode,
 }
 
+fn register_filter_transition(
+    filter_transitions: &mut Vec<FilterTransition>,
+    uid: OrderUid,
+    reason: OrderFilterReason,
+    was_filtered: bool,
+    is_filtered: bool,
+) {
+    if was_filtered != is_filtered {
+        filter_transitions.push(FilterTransition {
+            uid: domain::OrderUid(uid.0),
+            reason,
+            is_filtered,
+        });
+    }
+}
+
+fn apply_removed_order_candidates(
+    indexed_state: &mut IndexedAuctionState,
+    removed_candidates: &[domain::OrderUid],
+    filter_transitions: &mut Vec<FilterTransition>,
+) {
+    for uid in removed_candidates {
+        let model_uid = OrderUid(uid.0);
+        indexed_state.current_orders_by_uid.remove(uid);
+        let was_invalid_reason = indexed_state.filtered_invalid.remove(&model_uid);
+        let was_in_flight = indexed_state.filtered_in_flight.remove(&model_uid);
+        let was_no_balance = indexed_state.filtered_no_balance.remove(&model_uid);
+        let was_no_price = indexed_state.filtered_no_price.remove(&model_uid);
+        let was_dust = indexed_state.filtered_dust.remove(&model_uid);
+
+        if let Some(reason) = was_invalid_reason {
+            register_filter_transition(filter_transitions, model_uid, reason, true, false);
+        }
+        register_filter_transition(
+            filter_transitions,
+            model_uid,
+            InFlight,
+            was_in_flight,
+            false,
+        );
+        register_filter_transition(
+            filter_transitions,
+            model_uid,
+            InsufficientBalance,
+            was_no_balance,
+            false,
+        );
+        register_filter_transition(
+            filter_transitions,
+            model_uid,
+            MissingNativePrice,
+            was_no_price,
+            false,
+        );
+        register_filter_transition(filter_transitions, model_uid, DustOrder, was_dust, false);
+    }
+}
+
+fn build_impacted_order_uids(
+    change_bundle: &ChangeBundle,
+    indexed_state: &IndexedAuctionState,
+    in_flight: &HashSet<OrderUid>,
+) -> HashSet<domain::OrderUid> {
+    let mut impacted_uids = change_bundle
+        .order_updated_candidates
+        .iter()
+        .chain(change_bundle.quote_updated_candidates.iter())
+        .chain(change_bundle.order_added_candidates.iter())
+        .copied()
+        .collect::<HashSet<_>>();
+
+    impacted_uids.extend(
+        indexed_state
+            .filtered_no_balance
+            .iter()
+            .map(|uid| domain::OrderUid(uid.0)),
+    );
+    impacted_uids.extend(
+        indexed_state
+            .filtered_no_price
+            .iter()
+            .map(|uid| domain::OrderUid(uid.0)),
+    );
+    impacted_uids.extend(
+        indexed_state
+            .filtered_dust
+            .iter()
+            .map(|uid| domain::OrderUid(uid.0)),
+    );
+
+    impacted_uids.extend(
+        in_flight
+            .iter()
+            .filter(|uid| {
+                indexed_state
+                    .current_orders_by_uid
+                    .contains_key(&domain::OrderUid(uid.0))
+            })
+            .map(|uid| domain::OrderUid(uid.0)),
+    );
+    impacted_uids.extend(
+        indexed_state
+            .filtered_in_flight
+            .iter()
+            .filter(|uid| !in_flight.contains(uid))
+            .map(|uid| domain::OrderUid(uid.0)),
+    );
+
+    impacted_uids
+}
+
 impl SolvableOrdersCache {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -490,6 +613,8 @@ impl SolvableOrdersCache {
             deny_listed_tokens,
             cache: Mutex::new(None),
             update_lock: Mutex::new(()),
+            #[cfg(debug_assertions)]
+            update_lock_held: AtomicBool::new(false),
             native_price_estimator,
             weth,
             protocol_fees,
@@ -510,10 +635,10 @@ impl SolvableOrdersCache {
     fn assert_update_lock_held(&self, _guard: &UpdateGuard<'_>) {
         #[cfg(debug_assertions)]
         {
-            if let Ok(g) = self.update_lock.try_lock() {
-                drop(g);
-                debug_assert!(false, "update_lock must be held when mutating cache");
-            }
+            debug_assert!(
+                self.update_lock_held.load(AtomicOrdering::Acquire),
+                "update_lock must be held when mutating cache"
+            );
         }
     }
 
@@ -521,10 +646,10 @@ impl SolvableOrdersCache {
     pub(crate) fn assert_update_lock_held_unchecked(&self) {
         #[cfg(debug_assertions)]
         {
-            if let Ok(g) = self.update_lock.try_lock() {
-                drop(g);
-                debug_assert!(false, "update_lock must be held when mutating cache");
-            }
+            debug_assert!(
+                self.update_lock_held.load(AtomicOrdering::Acquire),
+                "update_lock must be held when mutating cache"
+            );
         }
     }
 
@@ -711,8 +836,14 @@ impl SolvableOrdersCache {
 
     pub async fn acquire_update_guard(&self) -> UpdateGuard<'_> {
         let guard = self.update_lock.lock().await;
+        #[cfg(debug_assertions)]
+        self.update_lock_held.store(true, AtomicOrdering::Release);
 
-        return UpdateGuard { inner: guard };
+        return UpdateGuard {
+            inner: guard,
+            #[cfg(debug_assertions)]
+            lock_held_flag: &self.update_lock_held,
+        };
     }
 
     pub async fn subscribe_deltas_with_replay(
@@ -1430,81 +1561,16 @@ impl SolvableOrdersCache {
         let mut invalid_order_uids: HashMap<OrderUid, OrderFilterReason> = HashMap::new();
         let mut filter_transitions: Vec<FilterTransition> = Vec::new();
 
-        let mut register_transition =
-            |uid: OrderUid, reason: OrderFilterReason, was_filtered: bool, is_filtered: bool| {
-                if was_filtered != is_filtered {
-                    filter_transitions.push(FilterTransition {
-                        uid: domain::OrderUid(uid.0),
-                        reason,
-                        is_filtered,
-                    });
-                }
-            };
-
-        for uid in &change_bundle.order_removed_candidates {
-            let model_uid = OrderUid(uid.0);
-            indexed_state.current_orders_by_uid.remove(uid);
-            let was_invalid_reason = indexed_state.filtered_invalid.remove(&model_uid);
-            let was_in_flight = indexed_state.filtered_in_flight.remove(&model_uid);
-            let was_no_balance = indexed_state.filtered_no_balance.remove(&model_uid);
-            let was_no_price = indexed_state.filtered_no_price.remove(&model_uid);
-            let was_dust = indexed_state.filtered_dust.remove(&model_uid);
-
-            if let Some(reason) = was_invalid_reason {
-                register_transition(model_uid, reason, true, false);
-            }
-            register_transition(model_uid, InFlight, was_in_flight, false);
-            register_transition(model_uid, InsufficientBalance, was_no_balance, false);
-            register_transition(model_uid, MissingNativePrice, was_no_price, false);
-            register_transition(model_uid, DustOrder, was_dust, false);
-        }
+        apply_removed_order_candidates(
+            &mut indexed_state,
+            &change_bundle.order_removed_candidates,
+            &mut filter_transitions,
+        );
 
         let in_flight = self.fetch_in_flight_orders(block).await;
 
-        let mut impacted_uids = change_bundle
-            .order_updated_candidates
-            .iter()
-            .chain(change_bundle.quote_updated_candidates.iter())
-            .chain(change_bundle.order_added_candidates.iter())
-            .copied()
-            .collect::<HashSet<_>>();
-
-        impacted_uids.extend(
-            indexed_state
-                .filtered_no_balance
-                .iter()
-                .map(|uid| domain::OrderUid(uid.0)),
-        );
-        impacted_uids.extend(
-            indexed_state
-                .filtered_no_price
-                .iter()
-                .map(|uid| domain::OrderUid(uid.0)),
-        );
-        impacted_uids.extend(
-            indexed_state
-                .filtered_dust
-                .iter()
-                .map(|uid| domain::OrderUid(uid.0)),
-        );
-
-        impacted_uids.extend(
-            in_flight
-                .iter()
-                .filter(|uid| {
-                    indexed_state
-                        .current_orders_by_uid
-                        .contains_key(&domain::OrderUid(uid.0))
-                })
-                .map(|uid| domain::OrderUid(uid.0)),
-        );
-        impacted_uids.extend(
-            indexed_state
-                .filtered_in_flight
-                .iter()
-                .filter(|uid| !in_flight.contains(uid))
-                .map(|uid| domain::OrderUid(uid.0)),
-        );
+        let mut impacted_uids =
+            build_impacted_order_uids(change_bundle, &indexed_state, &in_flight);
 
         let queries = impacted_uids
             .iter()
@@ -1630,7 +1696,7 @@ impl SolvableOrdersCache {
         for (uid, reason) in invalid_for_impacted.iter() {
             let was_filtered = indexed_state.filtered_invalid.contains_key(uid);
             indexed_state.filtered_invalid.insert(*uid, *reason);
-            register_transition(*uid, *reason, was_filtered, true);
+            register_filter_transition(&mut filter_transitions, *uid, *reason, was_filtered, true);
             indexed_state
                 .current_orders_by_uid
                 .remove(&domain::OrderUid(uid.0));
@@ -1648,7 +1714,7 @@ impl SolvableOrdersCache {
         for uid in in_flight_removed {
             let was_filtered = indexed_state.filtered_in_flight.contains(&uid);
             indexed_state.filtered_in_flight.insert(uid);
-            register_transition(uid, InFlight, was_filtered, true);
+            register_filter_transition(&mut filter_transitions, uid, InFlight, was_filtered, true);
             indexed_state
                 .current_orders_by_uid
                 .remove(&domain::OrderUid(uid.0));
@@ -1667,7 +1733,13 @@ impl SolvableOrdersCache {
             for uid in removed_no_balance {
                 let was_filtered = indexed_state.filtered_no_balance.contains(&uid);
                 indexed_state.filtered_no_balance.insert(uid);
-                register_transition(uid, InsufficientBalance, was_filtered, true);
+                register_filter_transition(
+                    &mut filter_transitions,
+                    uid,
+                    InsufficientBalance,
+                    was_filtered,
+                    true,
+                );
                 indexed_state
                     .current_orders_by_uid
                     .remove(&domain::OrderUid(uid.0));
@@ -1678,7 +1750,13 @@ impl SolvableOrdersCache {
             for uid in removed_dust {
                 let was_filtered = indexed_state.filtered_dust.contains(&uid);
                 indexed_state.filtered_dust.insert(uid);
-                register_transition(uid, DustOrder, was_filtered, true);
+                register_filter_transition(
+                    &mut filter_transitions,
+                    uid,
+                    DustOrder,
+                    was_filtered,
+                    true,
+                );
                 indexed_state
                     .current_orders_by_uid
                     .remove(&domain::OrderUid(uid.0));
@@ -1693,12 +1771,24 @@ impl SolvableOrdersCache {
                 if !invalid_for_impacted.contains_key(&model_uid) {
                     let was_filtered_reason = indexed_state.filtered_invalid.remove(&model_uid);
                     if let Some(reason) = was_filtered_reason {
-                        register_transition(model_uid, reason, true, false);
+                        register_filter_transition(
+                            &mut filter_transitions,
+                            model_uid,
+                            reason,
+                            true,
+                            false,
+                        );
                     }
                 }
                 if !in_flight.contains(&model_uid) {
                     let was_filtered = indexed_state.filtered_in_flight.remove(&model_uid);
-                    register_transition(model_uid, InFlight, was_filtered, false);
+                    register_filter_transition(
+                        &mut filter_transitions,
+                        model_uid,
+                        InFlight,
+                        was_filtered,
+                        false,
+                    );
                 }
             }
         }
@@ -1717,7 +1807,13 @@ impl SolvableOrdersCache {
         for uid in removed_missing_price {
             let was_filtered = indexed_state.filtered_no_price.contains(&uid);
             indexed_state.filtered_no_price.insert(uid);
-            register_transition(uid, MissingNativePrice, was_filtered, true);
+            register_filter_transition(
+                &mut filter_transitions,
+                uid,
+                MissingNativePrice,
+                was_filtered,
+                true,
+            );
             indexed_state
                 .current_orders_by_uid
                 .remove(&domain::OrderUid(uid.0));
@@ -1770,13 +1866,31 @@ impl SolvableOrdersCache {
                 .insert(domain_uid, domain_order);
 
             let was_no_price = indexed_state.filtered_no_price.remove(&model_uid);
-            register_transition(model_uid, MissingNativePrice, was_no_price, false);
+            register_filter_transition(
+                &mut filter_transitions,
+                model_uid,
+                MissingNativePrice,
+                was_no_price,
+                false,
+            );
 
             let was_no_balance = indexed_state.filtered_no_balance.remove(&model_uid);
-            register_transition(model_uid, InsufficientBalance, was_no_balance, false);
+            register_filter_transition(
+                &mut filter_transitions,
+                model_uid,
+                InsufficientBalance,
+                was_no_balance,
+                false,
+            );
 
             let was_dust = indexed_state.filtered_dust.remove(&model_uid);
-            register_transition(model_uid, DustOrder, was_dust, false);
+            register_filter_transition(
+                &mut filter_transitions,
+                model_uid,
+                DustOrder,
+                was_dust,
+                false,
+            );
         }
 
         if jit_owners_changed {
@@ -2335,7 +2449,7 @@ fn prune_delta_history(
             return;
         }
     };
-    let min_retained = config.history_min_retained;
+    let min_retained = config.replay_history_min_retained;
 
     // How many elements may be removed by age while still retaining the minimum
     // required elements.
@@ -2640,6 +2754,8 @@ pub(crate) fn apply_delta_events_to_auction(
             DeltaEvent::AuctionChanged { .. } => {
                 orders.clear();
                 prices.clear();
+                // Keep using block=0 as the explicit "unknown until next
+                // block-bearing update" sentinel for delta reconstruction.
                 block = 0;
                 surplus_capturing_jit_order_owners.clear();
             }
@@ -2693,7 +2809,7 @@ fn prune_pending_delta_events(
             return;
         }
     };
-    let min_retained = config.history_min_retained;
+    let min_retained = config.pending_events_min_retained;
 
     let pruneable = pending_events.len().saturating_sub(min_retained);
     let to_remove_by_age = pending_events
@@ -2703,6 +2819,23 @@ fn prune_pending_delta_events(
         .count();
     let to_remove_by_count = pending_events.len().saturating_sub(MAX_DELTA_HISTORY);
     let remove = to_remove_by_age.max(to_remove_by_count);
+
+    if to_remove_by_count > 0 {
+        tracing::warn!(
+            queue_len = pending_events.len(),
+            to_remove_by_count,
+            "pending delta events queue reached retention limit; dropping oldest entries"
+        );
+    }
+
+    if to_remove_by_age > 0 {
+        tracing::warn!(
+            queue_len = pending_events.len(),
+            to_remove_by_age,
+            "pending delta events queue exceeded max age; dropping oldest entries and requiring \
+             downstream resync if replay window is crossed"
+        );
+    }
 
     if remove > 0 {
         pending_events.drain(..remove);
@@ -5410,7 +5543,8 @@ mod tests {
     #[test]
     fn prune_delta_history_evicts_by_age() {
         let config = DeltaSyncConfig {
-            history_min_retained: 1,
+            replay_history_min_retained: 1,
+            pending_events_min_retained: 1,
             history_max_age: Duration::from_secs(300),
             broadcast_capacity: 256,
         };
@@ -5446,7 +5580,8 @@ mod tests {
     #[test]
     fn prune_pending_delta_events_evicts_by_age() {
         let config = DeltaSyncConfig {
-            history_min_retained: 1,
+            replay_history_min_retained: 1,
+            pending_events_min_retained: 1,
             history_max_age: Duration::from_secs(300),
             broadcast_capacity: 256,
         };
@@ -5674,7 +5809,8 @@ mod tests {
     #[test]
     fn prune_delta_history_respects_min_retained() {
         let config = DeltaSyncConfig {
-            history_min_retained: 3,
+            replay_history_min_retained: 3,
+            pending_events_min_retained: 3,
             history_max_age: Duration::from_secs(60),
             broadcast_capacity: 256,
         };
@@ -5719,7 +5855,8 @@ mod tests {
     #[test]
     fn prune_delta_history_with_zero_age_respects_minimum() {
         let config = DeltaSyncConfig {
-            history_min_retained: 2,
+            replay_history_min_retained: 2,
+            pending_events_min_retained: 2,
             history_max_age: Duration::from_secs(60),
             broadcast_capacity: 256,
         };
@@ -5866,17 +6003,20 @@ mod tests {
     #[test]
     fn delta_sync_config_allows_custom_min_retained() {
         let config = DeltaSyncConfig {
-            history_min_retained: 42,
+            replay_history_min_retained: 42,
+            pending_events_min_retained: 42,
             history_max_age: Duration::from_secs(60),
             broadcast_capacity: 256,
         };
-        assert_eq!(config.history_min_retained, 42);
+        assert_eq!(config.replay_history_min_retained, 42);
+        assert_eq!(config.pending_events_min_retained, 42);
     }
 
     #[test]
     fn delta_sync_config_allows_custom_max_age() {
         let config = DeltaSyncConfig {
-            history_min_retained: 10,
+            replay_history_min_retained: 10,
+            pending_events_min_retained: 10,
             history_max_age: Duration::from_secs(123),
             broadcast_capacity: 256,
         };
