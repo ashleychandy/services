@@ -303,10 +303,8 @@ mod tests {
         serde::Deserialize,
         serde_json::json,
         serde_with::serde_as,
-        std::{
-            collections::HashMap,
-            hash::{DefaultHasher, Hash, Hasher},
-        },
+        sha2::{Digest, Sha256},
+        std::collections::HashMap,
         winner_selection::state::RankedItem,
     };
 
@@ -1245,9 +1243,12 @@ mod tests {
     // Used to generate deterministic identifiers (e.g., UIDs, addresses) from
     // string descriptions.
     fn hash(s: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        s.hash(&mut hasher);
-        hasher.finish()
+        let mut hasher = Sha256::new();
+        hasher.update(s.as_bytes());
+        let res = hasher.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&res[..8]);
+        u64::from_le_bytes(bytes)
     }
 
     // Needed to automatically deserialize order::Side in JSON test cases

@@ -38,6 +38,8 @@ pub struct Snapshot {
     pub version: u32,
     #[serde(default)]
     pub boot_id: Option<String>,
+    #[serde(default)]
+    pub chain_id: Option<u64>,
     pub auction_id: Option<u64>,
     pub sequence: u64,
     pub auction: RawAuctionData,
@@ -56,6 +58,8 @@ pub struct Envelope {
     pub version: u32,
     #[serde(default)]
     pub boot_id: Option<String>,
+    #[serde(default)]
+    pub chain_id: Option<u64>,
     #[serde(default)]
     pub auction_id: u64,
     #[serde(default)]
@@ -561,9 +565,11 @@ mod tests {
             "preInteractions": [],
             "postInteractions": [],
             "class": "market",
+            "sellTokenBalance": "erc20",
+            "buyTokenBalance": "erc20",
             "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
             "signingScheme": "eip712",
-            "signature": "0x00",
+            "signature": format!("0x{}", hex::encode([0u8; 65])),
             "quote": null
         })
     }
@@ -572,6 +578,7 @@ mod tests {
         Snapshot {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: Some(0),
             sequence,
             auction: RawAuctionData {
@@ -604,10 +611,49 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn checksum_prices_leading_zero_variants() {
+        let token = Address::repeat_byte(0xBB);
+        let mut prices = HashMap::new();
+        prices.insert(token, "0".to_string());
+
+        let hash_zero = Replica::checksum_prices(&prices).unwrap();
+        prices.insert(token, "000".to_string());
+        let hash_zero_padded = Replica::checksum_prices(&prices).unwrap();
+
+        assert_eq!(hash_zero, hash_zero_padded);
+    }
+
+    #[test]
+    fn checksum_prices_large_number_and_padded() {
+        let token = Address::repeat_byte(0xCC);
+        let mut prices = HashMap::new();
+        let max_str = eth::U256::MAX.to_string();
+        prices.insert(token, max_str.clone());
+
+        let hash_max = Replica::checksum_prices(&prices).unwrap();
+        prices.insert(token, format!("000{}", max_str));
+        let hash_max_padded = Replica::checksum_prices(&prices).unwrap();
+
+        assert_eq!(hash_max, hash_max_padded);
+    }
+
+    #[test]
+    fn checksum_prices_rejects_space_and_plus_variants() {
+        let token = Address::repeat_byte(0xDD);
+        let mut prices = HashMap::new();
+        prices.insert(token, " 10".to_string());
+        assert!(Replica::checksum_prices(&prices).is_err());
+
+        prices.insert(token, "+10".to_string());
+        assert!(Replica::checksum_prices(&prices).is_err());
+    }
+
     fn envelope(from_sequence: u64, to_sequence: u64, events: Vec<Event>) -> Envelope {
         Envelope {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: 0,
             auction_sequence: 0,
             from_sequence,
@@ -627,6 +673,7 @@ mod tests {
             .apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 7,
                 auction: RawAuctionData {
@@ -698,6 +745,7 @@ mod tests {
             .apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 10,
                 auction: RawAuctionData {
@@ -803,6 +851,7 @@ mod tests {
             .apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 5,
                 auction: RawAuctionData {
@@ -880,6 +929,7 @@ mod tests {
             .apply_delta(Envelope {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: 0,
                 auction_sequence: 0,
                 from_sequence: 5,
@@ -915,6 +965,7 @@ mod tests {
             .apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 1,
                 auction: RawAuctionData {
@@ -974,5 +1025,331 @@ mod tests {
             "100"
         );
         assert!(!replica.prices().contains_key(&Address::repeat_byte(20)));
+    }
+
+    #[test]
+    // Verifies autopilot <-> driver checksum equivalence for a single order.
+    fn checksum_equivalence_autopilot_driver_single_order() {
+        use {
+            alloy::primitives::{Address, B256},
+            autopilot::{domain as ap_domain, infra::persistence::dto::order as ap_order},
+            eth_domain_types as eth,
+            sha2::{Digest, Sha256},
+            std::collections::HashMap,
+        };
+
+        // Build a canonical domain order (similar to
+        // autopilot::test_helpers::test_order)
+        let uid_byte: u8 = 1;
+        let amount: u8 = 1;
+        let domain_order = ap_domain::Order {
+            uid: ap_domain::OrderUid([uid_byte; 56]),
+            sell: eth::Asset {
+                token: Address::repeat_byte(uid_byte).into(),
+                amount: eth::TokenAmount::from(eth::U256::from(u128::from(amount))),
+            },
+            buy: eth::Asset {
+                token: Address::repeat_byte(uid_byte.saturating_add(1)).into(),
+                amount: eth::TokenAmount::from(eth::U256::from(u128::from(
+                    amount.saturating_add(1),
+                ))),
+            },
+            protocol_fees: Vec::new(),
+            side: ap_domain::auction::order::Side::Sell,
+            created: u32::from(uid_byte),
+            valid_to: u32::from(uid_byte) + 100,
+            receiver: None,
+            owner: Address::repeat_byte(uid_byte.saturating_add(2)).into(),
+            partially_fillable: false,
+            executed: ap_domain::auction::order::TargetAmount(eth::U256::ZERO),
+            pre_interactions: Vec::new(),
+            post_interactions: Vec::new(),
+            sell_token_balance: ap_domain::auction::order::SellTokenSource::Erc20,
+            buy_token_balance: ap_domain::auction::order::BuyTokenDestination::Erc20,
+            app_data: ap_domain::auction::order::AppDataHash([uid_byte; 32]),
+            signature: ap_domain::auction::order::Signature::Eip712(
+                ap_domain::auction::order::EcdsaSignature {
+                    r: B256::ZERO,
+                    s: B256::ZERO,
+                    v: 27,
+                },
+            ),
+            quote: None,
+        };
+
+        // Compute autopilot-style checksum by serializing the persistence DTO.
+        let ap_dto = ap_order::from_domain(domain_order.clone());
+        let ap_bytes = serde_json::to_vec(&ap_dto).expect("serialize ap dto");
+        let mut ap_serialized = vec![ap_bytes.clone()];
+        ap_serialized.sort();
+        let mut hasher = Sha256::new();
+        for b in ap_serialized {
+            hasher.update(&b);
+        }
+        let ap_hash = format!("0x{}", const_hex::encode(hasher.finalize()));
+
+        // Compute driver-style checksum from a raw JSON `Value` that is
+        // constructed independently from the autopilot DTO. This ensures the
+        // test would fail if autopilot and driver produce different canonical
+        // serializations rather than simply matching the same preprocessed
+        // input.
+        fn manual_value_from_domain(domain_order: &ap_domain::Order) -> serde_json::Value {
+            use serde_json::json;
+            let uid = domain_order.uid.to_string();
+            let sell = domain_order.sell.token;
+            let buy = domain_order.buy.token;
+            // signature: scheme + bytes
+            let scheme = match domain_order.signature.scheme() {
+                ap_domain::auction::order::SigningScheme::Eip712 => "eip712",
+                ap_domain::auction::order::SigningScheme::EthSign => "ethsign",
+                ap_domain::auction::order::SigningScheme::Eip1271 => "eip1271",
+                ap_domain::auction::order::SigningScheme::PreSign => "presign",
+            };
+            let sig_bytes = domain_order.signature.to_bytes();
+            let sig_hex = format!("0x{}", hex::encode(sig_bytes));
+
+            json!({
+                "uid": uid,
+                "sellToken": sell.to_string(),
+                "buyToken": buy.to_string(),
+                "sellAmount": domain_order.sell.amount.0.to_string(),
+                "buyAmount": domain_order.buy.amount.0.to_string(),
+                "protocolFees": serde_json::Value::Array(vec![]),
+                "created": domain_order.created,
+                "validTo": domain_order.valid_to,
+                "kind": match domain_order.side {
+                    ap_domain::auction::order::Side::Sell => "sell",
+                    ap_domain::auction::order::Side::Buy => "buy",
+                },
+                "receiver": serde_json::Value::Null,
+                "owner": domain_order.owner.to_string(),
+                "partiallyFillable": domain_order.partially_fillable,
+                "executed": "0",
+                "preInteractions": serde_json::Value::Array(vec![]),
+                "postInteractions": serde_json::Value::Array(vec![]),
+                "sellTokenBalance": "erc20",
+                "buyTokenBalance": "erc20",
+                "class": "limit",
+                "appData": format!("0x{}", hex::encode(domain_order.app_data.0)),
+                "signingScheme": scheme,
+                "signature": sig_hex,
+                "quote": serde_json::Value::Null
+            })
+        }
+
+        let uid = domain_order.uid.to_string();
+        let mut orders_map: HashMap<String, serde_json::Value> = HashMap::new();
+        orders_map.insert(uid, manual_value_from_domain(&domain_order));
+        let driver_hash = Replica::checksum_order_contents_raw(&orders_map);
+
+        // Validate the manually constructed JSON parses into the driver's DTO.
+        let _parsed_driver: crate::infra::api::routes::solve::dto::solve_request::Order =
+            serde_json::from_value(manual_value_from_domain(&domain_order)).expect("driver parse");
+        assert_eq!(ap_hash, driver_hash);
+    }
+
+    #[test]
+    // Verifies autopilot <-> driver checksum equivalence for a multi-order
+    // auction including UID, prices and full snapshot checksum.
+    fn checksum_equivalence_autopilot_driver_full_auction() {
+        use {
+            alloy::primitives::Address,
+            autopilot::{domain as ap_domain, infra::persistence::dto::order as ap_order},
+            eth_domain_types as eth,
+            serde_json::Value,
+            sha2::{Digest, Sha256},
+            std::collections::HashMap,
+        };
+
+        // Build several canonical domain orders.
+        let mut domain_orders = Vec::new();
+        for (uid_byte, sell_token_byte, buy_token_byte, amount) in vec![
+            (1u8, 0x10u8, 0x11u8, 1u8),
+            (2u8, 0x20u8, 0x21u8, 10u8),
+            (3u8, 0x30u8, 0x31u8, 255u8),
+        ] {
+            let domain_order = ap_domain::Order {
+                uid: ap_domain::OrderUid([uid_byte; 56]),
+                sell: eth::Asset {
+                    token: Address::repeat_byte(sell_token_byte).into(),
+                    amount: eth::TokenAmount::from(eth::U256::from(u128::from(amount))),
+                },
+                buy: eth::Asset {
+                    token: Address::repeat_byte(buy_token_byte).into(),
+                    amount: eth::TokenAmount::from(eth::U256::from(u128::from(
+                        amount.saturating_add(1),
+                    ))),
+                },
+                protocol_fees: Vec::new(),
+                side: ap_domain::auction::order::Side::Sell,
+                created: u32::from(uid_byte),
+                valid_to: u32::from(uid_byte) + 100,
+                receiver: None,
+                owner: Address::repeat_byte(uid_byte.saturating_add(2)).into(),
+                partially_fillable: false,
+                executed: ap_domain::auction::order::TargetAmount(eth::U256::ZERO),
+                pre_interactions: Vec::new(),
+                post_interactions: Vec::new(),
+                sell_token_balance: ap_domain::auction::order::SellTokenSource::Erc20,
+                buy_token_balance: ap_domain::auction::order::BuyTokenDestination::Erc20,
+                app_data: ap_domain::auction::order::AppDataHash([uid_byte; 32]),
+                signature: ap_domain::auction::order::Signature::Eip712(
+                    ap_domain::auction::order::EcdsaSignature {
+                        r: alloy::primitives::B256::ZERO,
+                        s: alloy::primitives::B256::ZERO,
+                        v: 27,
+                    },
+                ),
+                quote: None,
+            };
+            domain_orders.push(domain_order);
+        }
+
+        // Autopilot-style order content hash: serialize DTOs, sort and hash.
+        let mut serialized: Vec<Vec<u8>> = Vec::new();
+        let mut ap_values: Vec<Value> = Vec::new();
+        for domain_order in &domain_orders {
+            let dto = ap_order::from_domain(domain_order.clone());
+            let bytes = serde_json::to_vec(&dto).expect("serialize ap dto");
+            serialized.push(bytes.clone());
+            ap_values.push(serde_json::to_value(&dto).expect("ap dto -> value"));
+        }
+        serialized.sort();
+        let mut hasher = Sha256::new();
+        for b in &serialized {
+            hasher.update(b);
+        }
+        let ap_order_content_hash = format!("0x{}", const_hex::encode(hasher.finalize()));
+
+        // Driver-style hash from a raw orders map constructed independently
+        // from the autopilot DTOs. Build JSON values from the domain orders
+        // rather than reusing the autopilot DTO `Value` to avoid a false
+        // positive where both sides rely on the same conversion.
+        fn manual_value_from_domain(domain_order: &ap_domain::Order) -> serde_json::Value {
+            use serde_json::json;
+            let uid = domain_order.uid.to_string();
+            let sell = domain_order.sell.token;
+            let buy = domain_order.buy.token;
+            let scheme = match domain_order.signature.scheme() {
+                ap_domain::auction::order::SigningScheme::Eip712 => "eip712",
+                ap_domain::auction::order::SigningScheme::EthSign => "ethsign",
+                ap_domain::auction::order::SigningScheme::Eip1271 => "eip1271",
+                ap_domain::auction::order::SigningScheme::PreSign => "presign",
+            };
+            let sig_bytes = domain_order.signature.to_bytes();
+            let sig_hex = format!("0x{}", hex::encode(sig_bytes));
+
+            json!({
+                "uid": uid,
+                "sellToken": sell.to_string(),
+                "buyToken": buy.to_string(),
+                "sellAmount": domain_order.sell.amount.0.to_string(),
+                "buyAmount": domain_order.buy.amount.0.to_string(),
+                "protocolFees": serde_json::Value::Array(vec![]),
+                "created": domain_order.created,
+                "validTo": domain_order.valid_to,
+                "kind": match domain_order.side {
+                    ap_domain::auction::order::Side::Sell => "sell",
+                    ap_domain::auction::order::Side::Buy => "buy",
+                },
+                "receiver": serde_json::Value::Null,
+                "owner": domain_order.owner.to_string(),
+                "partiallyFillable": domain_order.partially_fillable,
+                "executed": "0",
+                "preInteractions": serde_json::Value::Array(vec![]),
+                "postInteractions": serde_json::Value::Array(vec![]),
+                "sellTokenBalance": "erc20",
+                "buyTokenBalance": "erc20",
+                "class": "limit",
+                "appData": format!("0x{}", hex::encode(domain_order.app_data.0)),
+                "signingScheme": scheme,
+                "signature": sig_hex,
+                "quote": serde_json::Value::Null
+            })
+        }
+
+        let mut orders_map: HashMap<String, Value> = HashMap::new();
+        for domain_order in domain_orders.iter() {
+            orders_map.insert(
+                domain_order.uid.to_string(),
+                manual_value_from_domain(domain_order),
+            );
+        }
+        let driver_order_content_hash = Replica::checksum_order_contents_raw(&orders_map);
+        // If checksums differ, print canonical serialized forms for debugging
+        if ap_order_content_hash != driver_order_content_hash {
+            // ap serialized vector `serialized` contains the autopilot DTO bytes
+            // sorted earlier. Build the driver-serialized bytes for comparison.
+            let mut driver_serialized_vec: Vec<Vec<u8>> = Vec::new();
+            for domain_order in domain_orders.iter() {
+                let val = manual_value_from_domain(domain_order);
+                let parsed: crate::infra::api::routes::solve::dto::solve_request::Order =
+                    serde_json::from_value(val).expect("driver parse");
+                driver_serialized_vec.push(serde_json::to_vec(&parsed).expect("driver serialize"));
+            }
+            driver_serialized_vec.sort();
+        }
+        assert_eq!(ap_order_content_hash, driver_order_content_hash);
+
+        // UID hash: autopilot sorts raw uid bytes then hashes.
+        let mut uids: Vec<[u8; 56]> = domain_orders.iter().map(|o| o.uid.0).collect();
+        uids.sort_unstable();
+        let mut hasher = Sha256::new();
+        for uid in uids {
+            hasher.update(&uid);
+        }
+        let ap_uid_hash = format!("0x{}", const_hex::encode(hasher.finalize()));
+
+        // Driver uid hash should match when computed from the uid bytes map.
+        let mut uid_map: HashMap<String, [u8; 56]> = HashMap::new();
+        for domain_order in &domain_orders {
+            uid_map.insert(domain_order.uid.to_string(), domain_order.uid.0);
+        }
+        let driver_uid_hash = Replica::checksum_order_uids(&uid_map);
+        assert_eq!(ap_uid_hash, driver_uid_hash);
+
+        // Prices: include non-canonical representations to exercise canonicalization.
+        let token_a = Address::repeat_byte(0xAA);
+        let token_b = Address::repeat_byte(0xBB);
+        let mut prices: HashMap<Address, String> = HashMap::new();
+        prices.insert(token_a, "0010".to_string());
+        prices.insert(token_b, "20".to_string());
+
+        // Autopilot-style price hash: sort tokens and canonicalize decimals.
+        let mut entries = prices.iter().collect::<Vec<_>>();
+        entries.sort_by(|(l, _), (r, _)| l.as_slice().cmp(r.as_slice()));
+        let mut hasher = Sha256::new();
+        for (token, price_str) in entries {
+            hasher.update(token.as_slice());
+            let canonical = eth::U256::from_str(price_str)
+                .expect("parse price")
+                .to_string();
+            hasher.update(canonical.as_bytes());
+        }
+        let ap_price_hash = format!("0x{}", const_hex::encode(hasher.finalize()));
+
+        // Driver price hash should match.
+        let driver_price_hash = Replica::checksum_prices(&prices).unwrap();
+        assert_eq!(ap_price_hash, driver_price_hash);
+
+        // Full Replica checksum via apply_snapshot should reflect the same components.
+        let snapshot = Snapshot {
+            version: 1,
+            boot_id: None,
+            chain_id: None,
+            auction_id: Some(0),
+            sequence: 42,
+            auction: RawAuctionData {
+                orders: ap_values,
+                prices: prices.clone(),
+            },
+        };
+
+        let mut replica = Replica::default();
+        replica.apply_snapshot(snapshot).unwrap();
+        let checksum = replica.checksum().unwrap();
+        assert_eq!(checksum.order_uid_hash, ap_uid_hash);
+        assert_eq!(checksum.order_content_hash, ap_order_content_hash);
+        assert_eq!(checksum.price_hash, ap_price_hash);
     }
 }

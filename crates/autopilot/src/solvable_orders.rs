@@ -1,6 +1,3 @@
-#[cfg(debug_assertions)]
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-
 use {
     crate::{
         boundary::{self, SolvableOrders},
@@ -42,7 +39,12 @@ use {
         cmp::Ordering,
         collections::{BTreeMap, HashMap, HashSet, VecDeque, btree_map::Entry},
         future::Future,
-        sync::{Arc, OnceLock},
+        sync::{
+            Arc,
+            OnceLock,
+            RwLock as StdRwLock,
+            atomic::{AtomicBool, Ordering as AtomicOrdering},
+        },
         time::{Duration, Instant},
     },
     strum::VariantNames,
@@ -50,26 +52,78 @@ use {
     tracing::instrument,
 };
 
-static BOOT_ID: OnceLock<String> = OnceLock::new();
+const DEFAULT_BOOT_KEY: &str = "__DEFAULT__";
 
-macro_rules! send_or_warn {
-    ($sender:expr, $value:expr, $context:literal) => {
-        // Avoid spurious warnings when there are no receivers yet.
-        if $sender.receiver_count() == 0 {
-            tracing::debug!(context = $context, "delta sender has no receivers; dropping envelope");
-        } else {
-            match $sender.send($value) {
-                Ok(_) => {}
-                Err(e) => tracing::warn!(context = $context, error = ?e, "failed to send; receiver dropped"),
-            }
-        }
-    };
+// Map of autopilot-instance-scoped boot ids. Keys are formed from the
+// autopilot instance identifier and the optional chain id so a single
+// process serving multiple chains can present distinct boot ids per-chain.
+static BOOT_IDS: OnceLock<StdRwLock<HashMap<String, OnceLock<String>>>> = OnceLock::new();
+
+fn boot_ids_map() -> &'static StdRwLock<HashMap<String, OnceLock<String>>> {
+    BOOT_IDS.get_or_init(|| {
+        let mut m = HashMap::new();
+        m.insert(DEFAULT_BOOT_KEY.to_string(), OnceLock::new());
+        StdRwLock::new(m)
+    })
 }
 
+fn autopilot_instance_key() -> String {
+    std::env::var("AUTOPILOT_INSTANCE_KEY").unwrap_or_else(|_| DEFAULT_BOOT_KEY.to_string())
+}
+
+/// Return a stable boot id for the given optional chain id. When a chain id
+/// is provided, the boot id is namespaced by the autopilot instance key and
+/// the chain id so restarts can be distinguished per-chain when a single
+/// process serves multiple chains.
+pub fn boot_id_for_chain(chain_id: Option<u64>) -> String {
+    let base = autopilot_instance_key();
+    let key = match chain_id {
+        Some(cid) => format!("{}:{}", base, cid),
+        None => base,
+    };
+
+    // Fast-path: try a read lock and return immediately if the OnceLock is
+    // already initialized for this key. Only take the write lock to insert
+    // or initialize the OnceLock if missing, avoiding unnecessary mutex
+    // contention on the hot path where boot ids are already present.
+    //
+    // Note on concurrency: this is a double-checked pattern. In a race a
+    // concurrent writer may insert the map entry between the read-path and
+    // write-path, but `HashMap::entry(...).or_insert_with(...)` will return
+    // the existing entry when that happens. The per-key `OnceLock`'s
+    // `get_or_init` ensures that only one initializer runs, so at most one
+    // UUID will be generated. This makes the pattern safe: it avoids
+    // unnecessary contention on the hot path while guaranteeing a single
+    // boot id is produced for each key.
+    if let Ok(guard) = boot_ids_map().read() {
+        if let Some(once) = guard.get(&key) {
+            if let Some(val) = once.get() {
+                return val.clone();
+            }
+        }
+    }
+
+    // Fallback: obtain write lock to initialize the map entry.
+    let mut guard = boot_ids_map().write().expect("boot ids lock poisoned");
+    let once = guard.entry(key).or_insert_with(|| OnceLock::new());
+    once.get_or_init(|| uuid::Uuid::new_v4().to_string())
+        .clone()
+}
+
+// Test helper: clear boot ids map to ensure tests can operate with isolated
+// boot id state. This is only compiled for unit tests or when the
+// `test-helpers` feature is enabled.
+#[cfg(test)]
+pub(crate) fn clear_boot_ids_for_tests() {
+    let mut guard = boot_ids_map().write().expect("boot ids lock poisoned");
+    guard.clear();
+    guard.insert(DEFAULT_BOOT_KEY.to_string(), OnceLock::new());
+}
+
+/// Backwards-compatible wrapper for callers that do not have a chain id.
 pub fn boot_id() -> &'static str {
-    BOOT_ID
-        .get_or_init(|| uuid::Uuid::new_v4().to_string())
-        .as_str()
+    static BOOT_ID: OnceLock<String> = OnceLock::new();
+    BOOT_ID.get_or_init(|| boot_id_for_chain(None)).as_str()
 }
 
 #[derive(prometheus_metric_storage::MetricStorage)]
@@ -210,6 +264,9 @@ pub struct SolvableOrdersCache {
     shadow_compare_incremental: bool,
     incremental_primary: bool,
     delta_config: DeltaSyncConfig,
+    chain_id: u64,
+    #[cfg(test)]
+    test_send_behavior: std::sync::Arc<std::sync::Mutex<Option<TestSendBehavior>>>,
 }
 
 #[must_use = "holding the UpdateGuard ensures the update lock remains held"]
@@ -326,6 +383,14 @@ pub enum DeltaEvent {
     },
 }
 
+// Test-only helpers to simulate various send behaviors when broadcasting
+// delta envelopes in unit tests.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum TestSendBehavior {
+    ErrOnce,
+}
+
 #[derive(Clone, Debug)]
 pub struct DeltaEnvelope {
     pub auction_id: u64,
@@ -397,6 +462,8 @@ struct Inner {
     auction_id: u64,
     auction_sequence: u64,
     delta_sequence: u64,
+    /// Per-cache allocator for assigned delta sequence numbers.
+    allocated_delta_sequence: u64,
     delta_history: VecDeque<DeltaEnvelope>,
 
     pending_events: VecDeque<PendingDeltaEvents>,
@@ -407,6 +474,7 @@ struct Inner {
 struct PendingDeltaEvents {
     created_at_instant: Instant,
     events: Vec<DeltaEvent>,
+    assigned_to_sequence: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -568,6 +636,24 @@ fn build_impacted_order_uids(
     impacted_uids
 }
 
+/// Lightweight wrapper type to make the distinction between candidate
+/// (in-progress) auctions and the committed snapshot explicit at the
+/// type level. This prevents accidental leakage of the candidate view
+/// to external consumers.
+pub(crate) struct CandidateAuction(pub(crate) domain::RawAuctionData);
+
+impl CandidateAuction {
+    /// Consume the newtype and return the inner `RawAuctionData`.
+    pub(crate) fn into_inner(self) -> domain::RawAuctionData {
+        self.0
+    }
+
+    /// Borrow the inner `RawAuctionData` for read-only access.
+    pub(crate) fn as_ref(&self) -> &domain::RawAuctionData {
+        &self.0
+    }
+}
+
 impl SolvableOrdersCache {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -584,6 +670,7 @@ impl SolvableOrdersCache {
         settlement_contract: Address,
         disable_order_balance_filter: bool,
         delta_config: Option<DeltaSyncConfig>,
+        chain_id: u64,
     ) -> Arc<Self> {
         let delta_config = delta_config.unwrap_or_default();
         let (delta_sender, _) = broadcast::channel(delta_config.broadcast_capacity);
@@ -627,6 +714,9 @@ impl SolvableOrdersCache {
             shadow_compare_incremental,
             incremental_primary,
             delta_config,
+            chain_id,
+            #[cfg(test)]
+            test_send_behavior: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -644,13 +734,12 @@ impl SolvableOrdersCache {
 
     #[cfg(test)]
     pub(crate) fn assert_update_lock_held_unchecked(&self) {
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                self.update_lock_held.load(AtomicOrdering::Acquire),
-                "update_lock must be held when mutating cache"
-            );
-        }
+        // In test builds, fail fast if the update lock is not held so tests
+        // cannot accidentally mutate cache without proper synchronization.
+        assert!(
+            self.update_lock_held.load(AtomicOrdering::Acquire),
+            "update_lock must be held when mutating cache"
+        );
     }
 
     pub async fn current_auction(&self) -> Option<domain::RawAuctionData> {
@@ -659,6 +748,23 @@ impl SolvableOrdersCache {
             .await
             .as_ref()
             .map(|inner| inner.auction.clone())
+    }
+
+    /// Return the in-progress candidate auction (may be ahead of the
+    /// committed snapshot). This is crate-visible only and must not be used
+    /// by external consumers that require a stable view consistent with
+    /// `delta_snapshot()`.
+    pub(crate) async fn current_candidate_auction(&self) -> Option<CandidateAuction> {
+        self.cache
+            .lock()
+            .await
+            .as_ref()
+            .map(|inner| CandidateAuction(inner.auction.clone()))
+    }
+
+    /// Return the configured chain id for this cache instance.
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     pub async fn delta_snapshot(&self) -> Option<DeltaSnapshot> {
@@ -730,6 +836,7 @@ impl SolvableOrdersCache {
             auction_id,
             auction_sequence,
             delta_sequence,
+            allocated_delta_sequence: delta_sequence,
             delta_history,
             pending_events: VecDeque::new(),
             indexed_state,
@@ -749,12 +856,139 @@ impl SolvableOrdersCache {
             prune_delta_history(&mut inner.delta_history, max_age, &self.delta_config);
         }
         // Send while holding the cache lock to keep replay + live ordering consistent
-        send_or_warn!(self.delta_sender, envelope, "delta broadcast");
+        if let Err(e) = self.try_send_envelope(envelope) {
+            tracing::warn!(error = ?e, "delta broadcast failed");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_enqueue_pending_events_authoritative(
+        &self,
+        events: Vec<DeltaEvent>,
+    ) -> Result<()> {
+        let mut lock = self.cache.lock().await;
+        let cache = lock
+            .as_mut()
+            .expect("cache must be initialized for test helper");
+
+        let base_alloc = cache.allocated_delta_sequence;
+        let last_assigned = cache
+            .pending_events
+            .back()
+            .and_then(|p| p.assigned_to_sequence)
+            .unwrap_or(base_alloc);
+        let assigned = last_assigned.checked_add(1).unwrap_or(u64::MAX);
+
+        let new_pending = PendingDeltaEvents {
+            created_at_instant: Instant::now(),
+            events,
+            assigned_to_sequence: Some(assigned),
+        };
+
+        cache.pending_events.push_back(new_pending);
+        cache.allocated_delta_sequence = cache.allocated_delta_sequence.max(assigned);
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn delta_receiver_count(&self) -> usize {
         self.delta_sender.receiver_count()
+    }
+
+    fn flush_pending_event(&self, inner: &mut Inner, pending: PendingDeltaEvents) {
+        // Allocate a sequence for this pending batch and advance the
+        // allocator accordingly.
+        //
+        // NOTE: The auction sequence used for flushed pending events is the
+        // current `inner.auction_sequence`. This is deliberate: all pending
+        // events that belong to the same auction share the same
+        // `auction_sequence` value. The auction sequence is updated by
+        // `apply_auction_id_change()` (e.g. to `0` on an auction transition)
+        // prior to flushing pending events in `set_auction_id()` so the
+        // flushed envelopes will carry the auction sequence that corresponds
+        // to the authoritative auction state.
+        let assigned_seq = self.allocate_assigned_sequence(inner, pending.assigned_to_sequence);
+
+        let pending_envelope = DeltaEnvelope {
+            auction_id: inner.auction_id,
+            auction_sequence: inner.auction_sequence,
+            from_sequence: inner.delta_sequence,
+            to_sequence: assigned_seq,
+            published_at: chrono::Utc::now(),
+            created_at_instant: Instant::now(),
+            events: pending.events,
+        };
+
+        // Attempt to send; treat send errors as non-fatal. Prefer test
+        // override when running unit tests so we can simulate send
+        // failures deterministically.
+        if let Err(e) = self.try_send_envelope(pending_envelope.clone()) {
+            tracing::warn!(error = ?e, "delta broadcast failed");
+        }
+
+        // Commit to history regardless of send result so replay can deliver.
+        self.commit_envelope(inner, pending_envelope);
+    }
+
+    fn allocate_assigned_sequence(&self, inner: &mut Inner, assigned_opt: Option<u64>) -> u64 {
+        // Allocate from the per-cache allocator to ensure uniqueness.
+        let mut assigned_seq = if let Some(a) = assigned_opt {
+            a
+        } else {
+            inner
+                .allocated_delta_sequence
+                .checked_add(1)
+                .expect("pre-checked available delta sequence")
+        };
+
+        // Ensure monotonicity relative to committed sequence.
+        if assigned_seq <= inner.delta_sequence {
+            assigned_seq = inner
+                .delta_sequence
+                .checked_add(1)
+                .expect("available delta sequence");
+        }
+
+        // Advance allocator to cover the assigned sequence.
+        inner.allocated_delta_sequence = inner.allocated_delta_sequence.max(assigned_seq);
+        assigned_seq
+    }
+
+    fn commit_envelope(&self, inner: &mut Inner, envelope: DeltaEnvelope) {
+        inner.delta_sequence = envelope.to_sequence;
+        inner.allocated_delta_sequence = inner.allocated_delta_sequence.max(inner.delta_sequence);
+        inner.auction_sequence = envelope.auction_sequence;
+        inner.delta_history.push_back(envelope.clone());
+        let max_age = chrono::Duration::from_std(self.delta_config.history_max_age)
+            .unwrap_or_else(|_| chrono::Duration::seconds(60));
+        prune_delta_history(&mut inner.delta_history, max_age, &self.delta_config);
+    }
+
+    fn try_send_envelope(
+        &self,
+        envelope: DeltaEnvelope,
+    ) -> Result<usize, broadcast::error::SendError<DeltaEnvelope>> {
+        // On test and test-util builds allow deterministic injection of
+        // send failures. Keep the test hook behind the same cfg as before
+        // but simplify the control flow so the non-test path is the common
+        // case.
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            #[cfg(test)]
+            {
+                let mut guard = self.test_send_behavior.lock().unwrap();
+                if let Some(behavior) = guard.take() {
+                    match behavior {
+                        TestSendBehavior::ErrOnce => {
+                            return Err(broadcast::error::SendError(envelope));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Normal path (and for test builds after potential injection above).
+        self.delta_sender.send(envelope)
     }
 
     pub async fn set_auction_id(&self, auction_id: u64) -> Result<()> {
@@ -763,10 +997,34 @@ impl SolvableOrdersCache {
         self.assert_update_lock_held(&_update_guard);
         let mut lock = self.cache.lock().await;
         if let Some(inner) = lock.as_mut() {
-            let pending = inner.pending_events.len().try_into().unwrap_or(u64::MAX);
-            // 1 for the auction change envelope itself
-            let required = pending.saturating_add(1);
-            let available = u64::MAX.saturating_sub(inner.delta_sequence);
+            // Compute required delta sequence capacity conservatively:
+            // - 1 slot for the auction-change envelope itself
+            // - for pending events that already carry an `assigned_to_sequence`, ensure we
+            //   can accommodate the largest assigned value
+            // - for pending events without an assigned sequence, count how many new
+            //   allocations will be needed
+            let mut required: u64 = 1; // auction change envelope
+            let max_assigned = inner
+                .pending_events
+                .iter()
+                .filter_map(|p| p.assigned_to_sequence)
+                .max();
+            if let Some(max_assigned) = max_assigned {
+                if max_assigned > inner.allocated_delta_sequence {
+                    required =
+                        required.saturating_add(max_assigned - inner.allocated_delta_sequence);
+                }
+            }
+            let unassigned = inner
+                .pending_events
+                .iter()
+                .filter(|p| p.assigned_to_sequence.is_none())
+                .count()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            required = required.saturating_add(unassigned);
+
+            let available = u64::MAX.saturating_sub(inner.allocated_delta_sequence);
             if available < required {
                 Metrics::get().delta_incremental_failure_total.inc();
                 tracing::error!(
@@ -781,42 +1039,15 @@ impl SolvableOrdersCache {
             if let Some(envelope) = apply_auction_id_change(inner, auction_id, &self.delta_config) {
                 // Send while holding cache lock to keep replay + live ordering
                 // consistent (same pattern as update()).
-                send_or_warn!(self.delta_sender, envelope.clone(), "delta broadcast");
+                if let Err(e) = self.try_send_envelope(envelope.clone()) {
+                    tracing::warn!(error = ?e, "delta broadcast failed");
+                }
 
                 // Flush any pending per-auction events that were queued while
-                // waiting for the authoritative auction id. Create real
-                // DeltaEnvelope instances with proper sequence numbers and
-                // broadcast them in order while holding the cache lock so
-                // ordering remains consistent.
+                // waiting for the authoritative auction id. Use centralized
+                // helper to allocate/commit/publish.
                 while let Some(pending) = inner.pending_events.pop_front() {
-                    // Advance global monotonic sequence and per-auction
-                    // sequence counters. This cannot overflow because of the
-                    // pre-check above.
-                    let next_seq = inner
-                        .delta_sequence
-                        .checked_add(1)
-                        .expect("pre-checked available delta sequence space");
-
-                    let next_auction_seq = inner.auction_sequence.saturating_add(1);
-
-                    let pending_envelope = DeltaEnvelope {
-                        auction_id: inner.auction_id,
-                        auction_sequence: next_auction_seq,
-                        from_sequence: inner.delta_sequence,
-                        to_sequence: next_seq,
-                        published_at: chrono::Utc::now(),
-                        created_at_instant: Instant::now(),
-                        events: pending.events,
-                    };
-
-                    inner.delta_sequence = next_seq;
-                    inner.auction_sequence = next_auction_seq;
-                    inner.delta_history.push_back(pending_envelope.clone());
-                    let max_age = chrono::Duration::from_std(self.delta_config.history_max_age)
-                        .unwrap_or_else(|_| chrono::Duration::seconds(60));
-                    prune_delta_history(&mut inner.delta_history, max_age, &self.delta_config);
-
-                    send_or_warn!(self.delta_sender, pending_envelope, "delta broadcast");
+                    self.flush_pending_event(inner, pending);
                 }
 
                 inner.committed_auction = inner.auction.clone();
@@ -851,7 +1082,7 @@ impl SolvableOrdersCache {
         after_sequence: u64,
     ) -> Result<(broadcast::Receiver<DeltaEnvelope>, DeltaReplay), DeltaAfterError> {
         let lock = self.cache.lock().await;
-        let mut receiver = self.delta_sender.subscribe();
+        let receiver = self.delta_sender.subscribe();
         let replay = Self::build_delta_replay(after_sequence, lock.as_ref())?;
         Ok((receiver, replay))
     }
@@ -1322,10 +1553,30 @@ impl SolvableOrdersCache {
                 .as_ref()
                 .map(|inner| inner.pending_events.clone())
                 .unwrap_or_default();
-            pending.push_back(PendingDeltaEvents {
+
+            // Build a pending entry.
+            // Allocate a per-cache sequence so allocations remain monotonic.
+            // Use the last assigned value if present otherwise start at the
+            // base allocator.
+            let base_alloc = cache
+                .as_ref()
+                .map(|inner| inner.allocated_delta_sequence)
+                .or(previous_delta_sequence)
+                .unwrap_or_default();
+            let last_assigned = pending
+                .back()
+                .and_then(|p| p.assigned_to_sequence)
+                .unwrap_or(base_alloc);
+            let assigned = last_assigned.checked_add(1).unwrap_or(u64::MAX);
+
+            let new_pending = PendingDeltaEvents {
                 created_at_instant: Instant::now(),
-                events,
-            });
+                events: events.clone(),
+                assigned_to_sequence: Some(assigned),
+            };
+
+            pending.push_back(new_pending);
+
             let max_age = chrono::Duration::from_std(self.delta_config.history_max_age)
                 .unwrap_or_else(|_| chrono::Duration::seconds(60));
             prune_pending_delta_events(&mut pending, max_age, &self.delta_config);
@@ -1340,6 +1591,7 @@ impl SolvableOrdersCache {
                 auction_id: current_auction_id,
                 auction_sequence: previous_auction_sequence.unwrap_or_default(),
                 delta_sequence: previous_delta_sequence.unwrap_or_default(),
+                allocated_delta_sequence: assigned,
                 delta_history,
                 pending_events: pending,
                 indexed_state: computed_indexed_state.clone(),
@@ -1350,15 +1602,16 @@ impl SolvableOrdersCache {
             // pending events only exist in-memory between `update()` and
             // `set_auction_id()`.
             if store_events {
-                // We still hold the cache lock; operate on the inner state.
+                // Operate on the inner state while holding the cache lock.
                 if let Some(inner) = cache.as_mut() {
                     // Pre-check that advancing the global delta sequence will
                     // not overflow given how many envelopes we need to emit
-                    // (1 for AuctionChanged + N pending events).
+                    // (1 for AuctionChanged + N pending events). Use the
+                    // allocated sequence so reserved assignments are counted.
                     let pending_count: u64 =
                         inner.pending_events.len().try_into().unwrap_or(u64::MAX);
                     let required = pending_count.saturating_add(1);
-                    let available = u64::MAX.saturating_sub(inner.delta_sequence);
+                    let available = u64::MAX.saturating_sub(inner.allocated_delta_sequence);
                     if available < required {
                         Metrics::get().delta_incremental_failure_total.inc();
                         tracing::error!(
@@ -1379,56 +1632,14 @@ impl SolvableOrdersCache {
                                     // Send the AuctionChanged envelope while
                                     // holding the cache lock so ordering stays
                                     // consistent with replay.
-                                    send_or_warn!(
-                                        self.delta_sender,
-                                        envelope.clone(),
-                                        "delta broadcast"
-                                    );
+                                    if let Err(e) = self.try_send_envelope(envelope.clone()) {
+                                        tracing::warn!(error = ?e, "delta broadcast failed");
+                                    }
 
-                                    // Flush any pending per-auction events that
-                                    // were queued while waiting for the
-                                    // authoritative auction id. Create real
-                                    // DeltaEnvelope instances with proper
-                                    // sequence numbers and broadcast them in
-                                    // order while holding the cache lock so
-                                    // ordering remains consistent.
+                                    // Flush any pending per-auction events that were
+                                    // queued while waiting for the authoritative id.
                                     while let Some(pending) = inner.pending_events.pop_front() {
-                                        let next_seq = inner
-                                            .delta_sequence
-                                            .checked_add(1)
-                                            .expect("pre-checked available delta sequence space");
-
-                                        let next_auction_seq =
-                                            inner.auction_sequence.saturating_add(1);
-
-                                        let pending_envelope = DeltaEnvelope {
-                                            auction_id: inner.auction_id,
-                                            auction_sequence: next_auction_seq,
-                                            from_sequence: inner.delta_sequence,
-                                            to_sequence: next_seq,
-                                            published_at: chrono::Utc::now(),
-                                            created_at_instant: Instant::now(),
-                                            events: pending.events,
-                                        };
-
-                                        inner.delta_sequence = next_seq;
-                                        inner.auction_sequence = next_auction_seq;
-                                        inner.delta_history.push_back(pending_envelope.clone());
-                                        let max_age = chrono::Duration::from_std(
-                                            self.delta_config.history_max_age,
-                                        )
-                                        .unwrap_or_else(|_| chrono::Duration::seconds(60));
-                                        prune_delta_history(
-                                            &mut inner.delta_history,
-                                            max_age,
-                                            &self.delta_config,
-                                        );
-
-                                        send_or_warn!(
-                                            self.delta_sender,
-                                            pending_envelope,
-                                            "delta broadcast"
-                                        );
+                                        self.flush_pending_event(inner, pending);
                                     }
 
                                     inner.committed_auction = inner.auction.clone();
@@ -1467,6 +1678,7 @@ impl SolvableOrdersCache {
                 auction_id: current_auction_id,
                 auction_sequence: next_auction_sequence,
                 delta_sequence: next_sequence,
+                allocated_delta_sequence: next_sequence,
                 delta_history,
                 pending_events: VecDeque::new(),
                 indexed_state,
@@ -1474,7 +1686,9 @@ impl SolvableOrdersCache {
             // Replay history is updated under the cache lock; subscribers build replay
             // while holding the same lock, so sending while locked keeps replay +
             // live ordering consistent.
-            send_or_warn!(self.delta_sender, envelope, "delta broadcast");
+            if let Err(e) = self.try_send_envelope(envelope) {
+                tracing::warn!(error = ?e, "delta broadcast failed");
+            }
         }
 
         tracing::debug!(%block, "updated current auction cache");
@@ -3438,7 +3652,88 @@ mod tests {
             Address::repeat_byte(0xFF),
             false,
             None, // Use default delta sync config
+            1,
         )
+    }
+
+    #[tokio::test]
+    async fn set_auction_id_commits_when_no_receivers() {
+        let cache = test_cache().await;
+
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        // Initialize cache state: auction_id=1, auction_sequence=0, delta_sequence=10
+        cache
+            .set_state_for_tests(auction.clone(), 1, 0, 10, VecDeque::new())
+            .await;
+
+        // Add two pending event groups using the authoritative test helper so
+        // sequence allocator state stays in sync with queued pending events.
+        cache
+            .test_enqueue_pending_events_authoritative(vec![DeltaEvent::OrderAdded(test_order(
+                1, 10,
+            ))])
+            .await
+            .unwrap();
+        cache
+            .test_enqueue_pending_events_authoritative(vec![DeltaEvent::OrderUpdated(test_order(
+                2, 20,
+            ))])
+            .await
+            .unwrap();
+
+        // Call set_auction_id which should commit pending events even when
+        // there are no receivers (send is best-effort).
+        cache.set_auction_id(2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn flushed_pending_events_share_auction_sequence() {
+        let cache = test_cache().await;
+
+        let auction = domain::RawAuctionData {
+            block: 1,
+            orders: Vec::new(),
+            prices: HashMap::new(),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        cache
+            .set_state_for_tests(auction.clone(), 1, 0, 10, VecDeque::new())
+            .await;
+
+        let mut receiver = cache.subscribe_deltas();
+
+        cache
+            .test_enqueue_pending_events_authoritative(vec![DeltaEvent::OrderAdded(test_order(
+                1, 10,
+            ))])
+            .await
+            .unwrap();
+        cache
+            .test_enqueue_pending_events_authoritative(vec![DeltaEvent::OrderUpdated(test_order(
+                2, 20,
+            ))])
+            .await
+            .unwrap();
+
+        cache.set_auction_id(2).await.unwrap();
+
+        let auction_changed = receiver.recv().await.expect("auction change envelope");
+        let pending_one = receiver.recv().await.expect("first pending envelope");
+        let pending_two = receiver.recv().await.expect("second pending envelope");
+
+        assert_eq!(auction_changed.auction_sequence, 0);
+        assert_eq!(pending_one.auction_sequence, 0);
+        assert_eq!(pending_two.auction_sequence, 0);
+        assert_eq!(pending_one.auction_sequence, pending_two.auction_sequence);
+        assert_eq!(pending_one.auction_id, 2);
+        assert_eq!(pending_two.auction_id, 2);
     }
 
     #[tokio::test]
@@ -3507,6 +3802,7 @@ mod tests {
             Address::repeat_byte(0xFF),
             true,
             None,
+            1,
         );
         Arc::get_mut(&mut cache)
             .expect("cache arc should be uniquely owned in test")
@@ -3703,6 +3999,7 @@ mod tests {
             Address::repeat_byte(0xFF),
             true,
             None,
+            1,
         );
 
         // Seed a consistent previous cache state and keep DB empty, so update
@@ -3789,6 +4086,7 @@ mod tests {
             Address::repeat_byte(0xFF),
             true,
             None,
+            1,
         );
 
         Arc::get_mut(&mut cache)
@@ -5255,6 +5553,7 @@ mod tests {
             auction_id: 1,
             auction_sequence: 7,
             delta_sequence: 9,
+            allocated_delta_sequence: 9,
             delta_history: VecDeque::new(),
             pending_events: VecDeque::new(),
             indexed_state: Arc::new(IndexedAuctionState::default()),
@@ -5292,6 +5591,7 @@ mod tests {
             auction_id: 5,
             auction_sequence: 2,
             delta_sequence: 3,
+            allocated_delta_sequence: 3,
             delta_history: VecDeque::new(),
             pending_events: VecDeque::new(),
             indexed_state: Arc::new(IndexedAuctionState::default()),
@@ -5324,6 +5624,7 @@ mod tests {
             auction_id: 1,
             auction_sequence: 0,
             delta_sequence: u64::MAX,
+            allocated_delta_sequence: u64::MAX,
             delta_history: VecDeque::new(),
             pending_events: VecDeque::new(),
             indexed_state: Arc::new(IndexedAuctionState::default()),
@@ -5379,6 +5680,7 @@ mod tests {
             auction_id: 7,
             auction_sequence: 2,
             delta_sequence: 2,
+            allocated_delta_sequence: 2,
             delta_history: VecDeque::from([envelope.clone()]),
             pending_events: VecDeque::new(),
             indexed_state: Arc::new(IndexedAuctionState::default()),
@@ -5419,6 +5721,7 @@ mod tests {
             auction_id: 8,
             auction_sequence: 0,
             delta_sequence: 4,
+            allocated_delta_sequence: 4,
             delta_history: VecDeque::from([envelope.clone()]),
             pending_events: VecDeque::new(),
             indexed_state: Arc::new(IndexedAuctionState::default()),
@@ -5455,10 +5758,12 @@ mod tests {
                 inner.pending_events.push_back(PendingDeltaEvents {
                     created_at_instant: Instant::now(),
                     events: vec![DeltaEvent::OrderAdded(test_order(1, 10))],
+                    assigned_to_sequence: None,
                 });
                 inner.pending_events.push_back(PendingDeltaEvents {
                     created_at_instant: Instant::now(),
                     events: vec![DeltaEvent::OrderUpdated(test_order(2, 20))],
+                    assigned_to_sequence: None,
                 });
             }
         }
@@ -5515,6 +5820,7 @@ mod tests {
                 inner.pending_events.push_back(PendingDeltaEvents {
                     created_at_instant: Instant::now(),
                     events: vec![DeltaEvent::OrderAdded(test_order(1, 10))],
+                    assigned_to_sequence: None,
                 });
             }
         }
@@ -5561,6 +5867,7 @@ mod tests {
                 inner.pending_events.push_back(PendingDeltaEvents {
                     created_at_instant: Instant::now(),
                     events: vec![DeltaEvent::BlockChanged { block: 2 }],
+                    assigned_to_sequence: None,
                 });
                 // committed_auction and delta_sequence intentionally unchanged
             }
@@ -5690,10 +5997,12 @@ mod tests {
             PendingDeltaEvents {
                 created_at_instant: now - Duration::from_secs(120),
                 events: vec![DeltaEvent::OrderAdded(test_order(1, 10))],
+                assigned_to_sequence: None,
             },
             PendingDeltaEvents {
                 created_at_instant: now,
                 events: vec![DeltaEvent::OrderUpdated(test_order(2, 20))],
+                assigned_to_sequence: None,
             },
         ]);
 

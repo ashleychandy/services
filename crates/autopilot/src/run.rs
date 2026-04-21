@@ -471,7 +471,6 @@ pub async fn run(config: Configuration, shutdown_controller: ShutdownController)
         config.price_estimation.quote_verification,
         config.price_estimation.quote_timeout,
     ));
-
     let solvable_orders_cache = SolvableOrdersCache::new(
         config.min_order_validity_period,
         persistence.clone(),
@@ -499,6 +498,7 @@ pub async fn run(config: Configuration, shutdown_controller: ShutdownController)
         *eth.contracts().settlement().address(),
         config.disable_order_balance_filter,
         None, // Use default delta sync config
+        eth.chain().id(),
     );
 
     let liveness = Arc::new(Liveness::new(config.max_auction_age));

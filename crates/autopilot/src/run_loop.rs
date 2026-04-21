@@ -382,10 +382,25 @@ impl RunLoop {
     }
 
     async fn cut_auction(&self) -> Option<domain::Auction> {
-        let Some(auction) = self.solvable_orders_cache.current_auction().await else {
+        // NOTE: We intentionally use the *candidate* (in-progress / possibly
+        // uncommitted) auction state here when building the auction for
+        // solvers. This allows solvers to begin work on auctions that are
+        // slightly ahead of the committed snapshot, reducing end-to-end
+        // latency. The delta snapshot/stream API (and `current_auction()`)
+        // instead expose the *committed* auction snapshot which is the
+        // stable, replayable view consumed by downstream clients.
+        //
+        // Keep this separation: solvers may operate on the candidate state,
+        // but any externally-consumed delta events must reflect the
+        // committed snapshot to preserve replay/consistency guarantees.
+        // See `solvable_orders::current_auction` and
+        // `solvable_orders::current_candidate_auction` for the canonical
+        // behavior and tests that verify the separation.
+        let Some(candidate) = self.solvable_orders_cache.current_candidate_auction().await else {
             tracing::debug!("no current auction");
             return None;
         };
+        let auction = candidate.into_inner();
         // If the cache already assigned an auction id (e.g. leader collapsed
         // the commit into `update()`), reuse that id. Otherwise, claim the
         // next id from persistence and set it here.

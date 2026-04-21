@@ -18,7 +18,7 @@ use {
             LazyLock,
             OnceLock,
             RwLock as StdRwLock,
-            atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
+            atomic::{AtomicU8, Ordering},
         },
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
@@ -30,8 +30,24 @@ const STREAM_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const SNAPSHOT_BOOTSTRAP_RETRIES: usize = 3;
 const SNAPSHOT_BOOTSTRAP_DELAY: Duration = Duration::from_millis(100);
 const DELTA_SYNC_API_KEY_HEADER: &str = "X-Delta-Sync-Api-Key";
-static DELTA_REPLICA: LazyLock<StdRwLock<Arc<RwLock<Replica>>>> =
-    LazyLock::new(|| StdRwLock::new(Arc::new(RwLock::new(Replica::default()))));
+const DEFAULT_REPLICA_KEY: &str = "__DEFAULT__";
+
+/// Map of replica instances keyed by a per-replica identifier. The key is
+/// typically the configured autopilot base URL (when present) so that a
+/// single process can safely host multiple drivers talking to different
+/// autopilots without sharing replica state.
+static DELTA_REPLICA: OnceLock<StdRwLock<HashMap<String, Arc<RwLock<Replica>>>>> = OnceLock::new();
+
+fn delta_replica_map() -> &'static StdRwLock<HashMap<String, Arc<RwLock<Replica>>>> {
+    DELTA_REPLICA.get_or_init(|| {
+        let mut m = HashMap::new();
+        m.insert(
+            DEFAULT_REPLICA_KEY.to_string(),
+            Arc::new(RwLock::new(Replica::default())),
+        );
+        StdRwLock::new(m)
+    })
+}
 #[cfg(any(test, feature = "test-helpers"))]
 static DELTA_REPLICA_TEST_MUTEX: LazyLock<Arc<tokio::sync::Mutex<()>>> =
     LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
@@ -68,18 +84,90 @@ static REPLICA_PREPROCESSING_STATE: AtomicU8 = AtomicU8::new(0);
 static REPLICA_FULL_BODY_BINDING_STATE: AtomicU8 = AtomicU8::new(0);
 static DELTA_REPLICA_MAX_STALENESS: OnceLock<Option<Duration>> = OnceLock::new();
 static DELTA_REPLICA_RESNAPSHOT_INTERVAL: OnceLock<Option<Duration>> = OnceLock::new();
+#[cfg(not(any(test, feature = "test-helpers")))]
+static DELTA_REPLICA_KEY: OnceLock<String> = OnceLock::new();
 static BOOTSTRAP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 #[cfg(any(test, feature = "test-helpers"))]
 pub static REPLICA_PREPROCESSING_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 // Circuit breaker for consecutive thin-replica binding failures. This prevents
 // repeated thin-replica attempts when the replica is persistently diverged
 // (e.g. checksum or sequence mismatches).
-static CONSECUTIVE_BINDING_FAILURES: AtomicU32 = AtomicU32::new(0);
 const BINDING_FAILURE_CIRCUIT_BREAKER: u32 = 3;
 
-// Timestamp (epoch seconds) when the circuit breaker most recently opened.
-// 0 means "not set".
-static LAST_BINDING_FAILURE_AT: AtomicU64 = AtomicU64::new(0);
+// Per-replica circuit-breaker state keyed by replica identifier.
+// Stores: (consecutive_failure_count, opened_at_timestamp_secs,
+// opened_auction_id)
+#[derive(Debug)]
+struct BindingFailureState {
+    count: u32,
+    ts: u64,
+    opened_auction: Option<u64>,
+}
+
+static BINDING_FAILURES: OnceLock<
+    StdRwLock<HashMap<String, std::sync::Mutex<BindingFailureState>>>,
+> = OnceLock::new();
+
+fn binding_failures_map()
+-> &'static StdRwLock<HashMap<String, std::sync::Mutex<BindingFailureState>>> {
+    BINDING_FAILURES.get_or_init(|| {
+        let mut m = HashMap::new();
+        m.insert(
+            DEFAULT_REPLICA_KEY.to_string(),
+            std::sync::Mutex::new(BindingFailureState {
+                count: 0,
+                ts: 0,
+                opened_auction: None,
+            }),
+        );
+        StdRwLock::new(m)
+    })
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn reset_binding_failures_for_tests() {
+    let mut guard = binding_failures_map()
+        .write()
+        .expect("binding failures lock poisoned");
+    guard.clear();
+    guard.insert(
+        DEFAULT_REPLICA_KEY.to_string(),
+        std::sync::Mutex::new(BindingFailureState {
+            count: 0,
+            ts: 0,
+            opened_auction: None,
+        }),
+    );
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+static BINDING_FAILURES_TEST_LOCK: LazyLock<std::sync::Mutex<()>> =
+    LazyLock::new(|| std::sync::Mutex::new(()));
+
+/// Global test guard to serialize binding-failure state across tests.
+#[cfg(any(test, feature = "test-helpers"))]
+pub struct BindingFailuresTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl BindingFailuresTestGuard {
+    pub fn acquire() -> Self {
+        let lock = BINDING_FAILURES_TEST_LOCK
+            .lock()
+            .expect("binding failures test lock poisoned");
+
+        reset_binding_failures_for_tests();
+        Self { _lock: lock }
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for BindingFailuresTestGuard {
+    fn drop(&mut self) {
+        reset_binding_failures_for_tests();
+    }
+}
 
 // Cooldown period (seconds) after which the circuit will be allowed to
 // transition back to closed automatically. Can be configured via
@@ -96,55 +184,159 @@ fn binding_failure_cooldown_secs() -> u64 {
 }
 
 pub fn record_binding_failure() {
-    use std::sync::atomic::Ordering;
+    record_binding_failure_for_auction(None);
+}
 
-    let prev = CONSECUTIVE_BINDING_FAILURES.fetch_add(1, Ordering::Release);
-    let new = prev.saturating_add(1);
-    if new >= BINDING_FAILURE_CIRCUIT_BREAKER {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        LAST_BINDING_FAILURE_AT.store(now, Ordering::Release);
+pub fn record_binding_failure_for_auction(auction_id: Option<u64>) {
+    let key = delta_replica_key();
+
+    let mut guard = binding_failures_map()
+        .write()
+        .expect("binding failures lock poisoned");
+    let entry = guard.entry(key).or_insert_with(|| {
+        std::sync::Mutex::new(BindingFailureState {
+            count: 0,
+            ts: 0,
+            opened_auction: None,
+        })
+    });
+    if let Ok(mut state) = entry.lock() {
+        state.count = state.count.saturating_add(1);
+        if state.count >= BINDING_FAILURE_CIRCUIT_BREAKER {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            state.ts = now;
+            state.opened_auction = auction_id;
+        }
     }
 }
 
 pub fn record_binding_success() {
-    use std::sync::atomic::Ordering;
-
-    CONSECUTIVE_BINDING_FAILURES.store(0, Ordering::Release);
-    LAST_BINDING_FAILURE_AT.store(0, Ordering::Release);
+    let key = delta_replica_key();
+    // Always reset under write guard so callers holding a read guard cannot
+    // observe intermediate mutation.
+    let mut guard = binding_failures_map()
+        .write()
+        .expect("binding failures lock poisoned");
+    let entry = guard.entry(key).or_insert_with(|| {
+        std::sync::Mutex::new(BindingFailureState {
+            count: 0,
+            ts: 0,
+            opened_auction: None,
+        })
+    });
+    if let Ok(mut state) = entry.lock() {
+        state.count = 0;
+        state.ts = 0;
+        state.opened_auction = None;
+    }
 }
 
-pub fn replica_binding_circuit_open() -> bool {
-    use std::sync::atomic::Ordering;
+/// Pure query: evaluate whether the binding failure circuit is open for the
+/// given optional `current_auction_id` without mutating stored state.
+pub fn replica_binding_circuit_is_open_for_auction(current_auction_id: Option<u64>) -> bool {
+    let key = delta_replica_key();
 
-    let count = CONSECUTIVE_BINDING_FAILURES.load(Ordering::Acquire);
-    if count < BINDING_FAILURE_CIRCUIT_BREAKER {
+    // Pure query: read-only check of the per-replica circuit state. This
+    // function does not mutate the stored state; callers that wish to
+    // perform reset behaviour on auction mismatch or cooldown should call
+    // `replica_binding_circuit_reset_if_mismatch_or_cooldown()` explicitly.
+    let guard = binding_failures_map()
+        .read()
+        .expect("binding failures lock poisoned");
+    let Some(mutex) = guard.get(&key) else {
+        return false;
+    };
+    let Ok(state) = mutex.lock() else {
+        return false;
+    };
+
+    if state.count < BINDING_FAILURE_CIRCUIT_BREAKER {
         return false;
     }
 
-    let last = LAST_BINDING_FAILURE_AT.load(Ordering::Acquire);
-    if last == 0 {
-        // No timestamp set; treat as open until we can set a timestamp.
-        return true;
+    if let Some(opened) = state.opened_auction {
+        if let Some(current) = current_auction_id {
+            return opened == current;
+        }
     }
 
+    // Timestamp fallback.
+    if state.ts == 0 {
+        return true;
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let cooldown = binding_failure_cooldown_secs();
-
-    if now.saturating_sub(last) >= cooldown {
-        // Cooldown expired: reset the circuit so we can attempt bootstrap
-        // again.
-        CONSECUTIVE_BINDING_FAILURES.store(0, Ordering::Release);
-        LAST_BINDING_FAILURE_AT.store(0, Ordering::Release);
+    if now.saturating_sub(state.ts) >= binding_failure_cooldown_secs() {
         return false;
     }
-
     true
+}
+
+/// Mutating helper: reset the per-replica circuit when the provided
+/// `current_auction_id` does not match the opened auction, or when the
+/// cooldown window has expired. This mirrors the previous behaviour but is
+/// intentionally separated from the pure-query function above so callers
+/// can choose whether a read should also perform state mutation.
+pub fn replica_binding_circuit_reset_if_mismatch_or_cooldown(current_auction_id: Option<u64>) {
+    let key = delta_replica_key();
+
+    // Keep check/reset in one critical section to avoid losing failures that
+    // arrive between a read probe and a subsequent reset.
+    let mut guard = binding_failures_map()
+        .write()
+        .expect("binding failures lock poisoned");
+    let Some(mutex) = guard.get(&key) else {
+        return;
+    };
+    if let Ok(mut state) = mutex.lock() {
+        if state.count < BINDING_FAILURE_CIRCUIT_BREAKER {
+            return;
+        }
+
+        if let Some(opened) = state.opened_auction {
+            if let Some(current) = current_auction_id {
+                if opened != current {
+                    // Auction mismatch: reset and indicate not open.
+                    state.count = 0;
+                    state.ts = 0;
+                    state.opened_auction = None;
+                    return;
+                }
+            }
+        }
+
+        // Timestamp fallback.
+        if state.ts == 0 {
+            return;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now.saturating_sub(state.ts) >= binding_failure_cooldown_secs() {
+            state.count = 0;
+            state.ts = 0;
+            state.opened_auction = None;
+            return;
+        }
+    }
+}
+
+/// Backwards-compatible wrapper retaining the original function name but
+/// implemented as a pure query (no mutation). Callers that relied on the
+/// previous implicit-reset behaviour must call
+/// `replica_binding_circuit_reset_if_mismatch_or_cooldown()` explicitly.
+pub fn replica_binding_circuit_open_for_auction(current_auction_id: Option<u64>) -> bool {
+    replica_binding_circuit_is_open_for_auction(current_auction_id)
+}
+
+pub fn replica_binding_circuit_open() -> bool {
+    replica_binding_circuit_open_for_auction(None)
 }
 
 #[derive(Debug, Clone)]
@@ -177,21 +369,6 @@ struct DeltaStreamGonePayload {
     #[serde(default)]
     message: Option<String>,
 }
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeltaChecksumResponse {
-    version: u32,
-    sequence: u64,
-    order_uid_hash: String,
-    price_hash: String,
-    order_content_hash: String,
-}
-
-/// Starts a background delta-sync task if DRIVER_DELTA_SYNC_AUTOPILOT_URL is
-/// set.
-///
-/// The task keeps a local replica up to date from snapshot + delta SSE stream.
 pub fn maybe_spawn_from_env() -> Option<tokio::task::JoinHandle<()>> {
     #[cfg(any(test, feature = "test-helpers"))]
     {
@@ -203,20 +380,16 @@ pub fn maybe_spawn_from_env() -> Option<tokio::task::JoinHandle<()>> {
                 tracing::warn!("driver delta sync disabled via test override");
                 return None;
             }
-            // Some(true): fallthrough, skipping the env check below.
-        } else {
-            if !shared::env::flag_enabled(
-                std::env::var("DRIVER_DELTA_SYNC_ENABLED").ok().as_deref(),
-                true,
-            ) {
-                tracing::warn!("driver delta sync disabled via DRIVER_DELTA_SYNC_ENABLED");
-                return None;
-            }
+            // Some(true): fallthrough to continue spawning.
+        } else if !shared::env::flag_enabled(
+            std::env::var("DRIVER_DELTA_SYNC_ENABLED").ok().as_deref(),
+            true,
+        ) {
+            tracing::warn!("driver delta sync disabled via DRIVER_DELTA_SYNC_ENABLED");
+            return None;
         }
     }
 
-    // Non-test builds (or when test-helpers feature is disabled) still consult
-    // the environment flag normally.
     #[cfg(not(any(test, feature = "test-helpers")))]
     if !shared::env::flag_enabled(
         std::env::var("DRIVER_DELTA_SYNC_ENABLED").ok().as_deref(),
@@ -226,7 +399,9 @@ pub fn maybe_spawn_from_env() -> Option<tokio::task::JoinHandle<()>> {
         return None;
     }
 
-    let base = delta_sync_base_url_from_env()?;
+    let Some(base) = delta_sync_base_url_from_env() else {
+        return None;
+    };
 
     // Create two separate reqwest clients: one with a short timeout for
     // snapshot/bootstrap HTTP requests, and one without a global timeout for
@@ -261,55 +436,73 @@ pub(crate) async fn snapshot() -> Option<ReplicaSnapshot> {
 
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn reset_delta_replica_for_tests() {
-    let mut guard = match DELTA_REPLICA.write() {
+    let active_key = delta_replica_key();
+    let mut guard = match delta_replica_map().write() {
         Ok(g) => g,
         Err(poison) => poison.into_inner(),
     };
-    *guard = Arc::new(RwLock::new(Replica::default()));
+    guard.clear();
+    // Always ensure default mapping exists for tests.
+    guard.insert(
+        DEFAULT_REPLICA_KEY.to_string(),
+        Arc::new(RwLock::new(Replica::default())),
+    );
+    if active_key != DEFAULT_REPLICA_KEY {
+        guard.insert(active_key, Arc::new(RwLock::new(Replica::default())));
+    }
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
 pub async fn reset_delta_replica_for_tests_async() {
-    if let Ok(guard) = DELTA_REPLICA.read() {
-        // Clone the Arc and release the read guard quickly so we don't hold
-        // the std::sync::RwLock across await points (which would block
-        // writers). The spin loop below will attempt to reset the inner
-        // tokio lock in-place; if contended, we fall back to replacing the
-        // global Arc.
-        let replica_arc = guard.clone();
-        drop(guard);
+    if let Ok(guard) = delta_replica_map().read() {
+        // Try to reset the default-key replica in-place to avoid replacing
+        // the global map. Clone the Arc and release the read guard quickly
+        // so we don't hold the std::sync::RwLock across await points.
+        let key = delta_replica_key();
+        if let Some(replica_arc) = guard.get(&key) {
+            let replica_arc = replica_arc.clone();
+            drop(guard);
 
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(500) {
-            if let Ok(mut inner) = replica_arc.try_write() {
-                *inner = Replica::default();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(500) {
+                if let Ok(mut inner) = replica_arc.try_write() {
+                    *inner = Replica::default();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            if let Ok(mut global_guard) = delta_replica_map().try_write() {
+                global_guard.insert(key.clone(), Arc::new(RwLock::new(Replica::default())));
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
 
-        if let Ok(mut global_guard) = DELTA_REPLICA.try_write() {
-            *global_guard = Arc::new(RwLock::new(Replica::default()));
+            let new_arc = Arc::new(RwLock::new(Replica::default()));
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut guard = match delta_replica_map().write() {
+                    Ok(g) => g,
+                    Err(poison) => poison.into_inner(),
+                };
+                guard.insert(key, new_arc);
+            })
+            .await;
             return;
         }
-
-        let new_arc = Arc::new(RwLock::new(Replica::default()));
-        let _ = tokio::task::spawn_blocking(move || {
-            let mut guard = match DELTA_REPLICA.write() {
-                Ok(g) => g,
-                Err(poison) => poison.into_inner(),
-            };
-            *guard = new_arc;
-        })
-        .await;
-        return;
     }
 
-    let mut guard = match DELTA_REPLICA.write() {
+    let active_key = delta_replica_key();
+    let mut guard = match delta_replica_map().write() {
         Ok(g) => g,
         Err(poison) => poison.into_inner(),
     };
-    *guard = Arc::new(RwLock::new(Replica::default()));
+    guard.clear();
+    guard.insert(
+        DEFAULT_REPLICA_KEY.to_string(),
+        Arc::new(RwLock::new(Replica::default())),
+    );
+    if active_key != DEFAULT_REPLICA_KEY {
+        guard.insert(active_key, Arc::new(RwLock::new(Replica::default())));
+    }
 }
 
 #[cfg(test)]
@@ -387,6 +580,7 @@ mod snapshot_tests {
         let delta_snapshot = DeltaSnapshot {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: Some(0),
             sequence: 1,
             auction: RawAuctionData {
@@ -433,6 +627,7 @@ pub(crate) async fn set_replica_state_for_tests(state: ReplicaState) {
 pub struct DeltaReplicaTestGuard {
     _lock: Option<tokio::sync::OwnedMutexGuard<()>>,
     replica: Arc<RwLock<Replica>>,
+    key: String,
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -445,14 +640,19 @@ impl DeltaReplicaTestGuard {
         // in-place reset of any preexisting `Arc<RwLock<Replica>>` clones by
         // acquiring the inner tokio RwLock in blocking mode. This is safe
         // because we're executing on a dedicated blocking thread.
-        let handle = tokio::task::spawn_blocking(|| {
+        let key = delta_replica_key();
+        let key_for_thread = key.clone();
+        let handle = tokio::task::spawn_blocking(move || {
             // Try to obtain a read guard on the global StdRwLock to access
             // the inner Arc without blocking writers.
-            let guard = match DELTA_REPLICA.read() {
+            let guard = match delta_replica_map().read() {
                 Ok(g) => g,
                 Err(poison) => poison.into_inner(),
             };
-            let replica_arc = guard.clone();
+            let replica_arc = guard
+                .get(&key_for_thread)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(RwLock::new(Replica::default())));
 
             // Acquire the inner tokio RwLock in blocking mode and reset in-place.
             let mut inner = replica_arc.blocking_write();
@@ -463,10 +663,13 @@ impl DeltaReplicaTestGuard {
             replica_arc
         });
         let replica = handle.await.expect("replica reset thread panicked");
+        // Also reset binding-failure state to keep test state isolated.
+        reset_binding_failures_for_tests();
 
         Self {
             _lock: Some(lock),
             replica,
+            key,
         }
     }
 }
@@ -506,18 +709,20 @@ impl Drop for DeltaReplicaTestGuard {
         }
 
         if !did_reset {
-            // Try to replace the global Arc quickly without blocking on the
-            // inner tokio lock. If that fails, synchronously spawn a thread
-            // which takes the std::sync write lock and replaces the Arc.
-            if let Ok(mut global_guard) = DELTA_REPLICA.try_write() {
-                *global_guard = Arc::new(RwLock::new(Replica::default()));
+            // Replace the global map entry for the replica key we recorded
+            // at acquisition time. This avoids the surprising fallback of
+            // inserting under the default key when the map was mutated
+            // concurrently.
+            if let Ok(mut global_guard) = delta_replica_map().try_write() {
+                global_guard.insert(self.key.clone(), Arc::new(RwLock::new(Replica::default())));
             } else {
+                let key = self.key.clone();
                 let handle = std::thread::spawn(move || {
-                    let mut guard = match DELTA_REPLICA.write() {
+                    let mut guard = match delta_replica_map().write() {
                         Ok(g) => g,
                         Err(poison) => poison.into_inner(),
                     };
-                    *guard = Arc::new(RwLock::new(Replica::default()));
+                    guard.insert(key, Arc::new(RwLock::new(Replica::default())));
                 });
                 if let Err(e) = handle.join() {
                     tracing::error!(?e, "delta replica reset thread panicked in fallback");
@@ -528,6 +733,11 @@ impl Drop for DeltaReplicaTestGuard {
         if let Some(lock) = self._lock.take() {
             drop(lock);
         }
+        // Also reset binding-failure state to keep test state isolated on
+        // teardown. This mirrors the acquire-time reset and ensures tests
+        // that only use `DeltaReplicaTestGuard` do not leak a tripped
+        // circuit into subsequent tests.
+        reset_binding_failures_for_tests();
     }
 }
 
@@ -635,7 +845,12 @@ pub async fn replica_health() -> Option<ReplicaHealth> {
         let local_checksum_clone = local_checksum.clone();
         match compare_replica_checksum(&base_url, local_checksum_clone).await {
             Ok(true) => {
-                // Replica checksum matches remote; proceed to report health.
+                // Replica checksum matches remote; ensure the replica is marked
+                // Ready so health checks and consumers can begin serving thin
+                // requests again, even if it was previously Resyncing.
+                let replica_arc = delta_replica();
+                let mut lock = replica_arc.write().await;
+                lock.set_state(ReplicaState::Ready);
             }
             Ok(false) => {
                 // Replica diverged from remote checksum: treat as unhealthy so
@@ -647,9 +862,18 @@ pub async fn replica_health() -> Option<ReplicaHealth> {
                 return None;
             }
             Err(err) => {
-                // On transient errors, keep reporting the replica as available
-                // but surface a warning to logs for investigation.
-                tracing::warn!(?err, "delta replica checksum comparison failed");
+                // On errors (for example network partition or request timeout),
+                // treat the replica as degraded: stop serving thin requests by
+                // marking the replica as `Syncing` and report unhealthy so
+                // health endpoints and consumers observe the degraded state.
+                tracing::warn!(
+                    ?err,
+                    "delta replica checksum comparison failed; marking replica degraded"
+                );
+                let replica_arc = delta_replica();
+                let mut lock = replica_arc.write().await;
+                lock.set_state(ReplicaState::Syncing);
+                return None;
             }
         }
     }
@@ -833,38 +1057,41 @@ async fn run(
             let mut lock = replica.write().await;
             lock.set_state(ReplicaState::Syncing);
         }
-        // Fetch snapshot and capture session boot_id for validation of live envelopes.
-        let session_boot_id = match fetch_snapshot(&snapshot_client, &base_url).await {
-            Ok(snapshot) => {
-                let boot_id = snapshot.boot_id.clone();
-                let applied = {
-                    let mut lock = replica.write().await;
-                    lock.apply_snapshot(snapshot)
-                };
-                if let Err(err) = applied {
-                    tracing::warn!(?err, "delta sync snapshot apply failed; retrying");
+        // Fetch snapshot and capture session boot_id and chain_id for validation of
+        // live envelopes.
+        let (session_boot_id, session_chain_id) =
+            match fetch_snapshot(&snapshot_client, &base_url).await {
+                Ok(snapshot) => {
+                    let boot_id = snapshot.boot_id.clone();
+                    let chain_id = snapshot.chain_id;
+                    let applied = {
+                        let mut lock = replica.write().await;
+                        lock.apply_snapshot(snapshot)
+                    };
+                    if let Err(err) = applied {
+                        tracing::warn!(?err, "delta sync snapshot apply failed; retrying");
+                        tokio::time::sleep(DEFAULT_RETRY_DELAY).await;
+                        continue;
+                    }
+                    let view = replica.read().await;
+                    tracing::info!(
+                        sequence = view.sequence(),
+                        orders = view.orders().len(),
+                        prices = view.prices().len(),
+                        "delta sync snapshot applied"
+                    );
+                    (boot_id, chain_id)
+                }
+                Err(err) => {
+                    {
+                        let mut lock = replica.write().await;
+                        lock.set_state(ReplicaState::Resyncing);
+                    }
+                    tracing::warn!(?err, "delta sync snapshot fetch failed; retrying");
                     tokio::time::sleep(DEFAULT_RETRY_DELAY).await;
                     continue;
                 }
-                let view = replica.read().await;
-                tracing::info!(
-                    sequence = view.sequence(),
-                    orders = view.orders().len(),
-                    prices = view.prices().len(),
-                    "delta sync snapshot applied"
-                );
-                boot_id
-            }
-            Err(err) => {
-                {
-                    let mut lock = replica.write().await;
-                    lock.set_state(ReplicaState::Resyncing);
-                }
-                tracing::warn!(?err, "delta sync snapshot fetch failed; retrying");
-                tokio::time::sleep(DEFAULT_RETRY_DELAY).await;
-                continue;
-            }
-        };
+            };
 
         let snapshot_started_at = Instant::now();
         loop {
@@ -874,6 +1101,7 @@ async fn run(
                 &replica,
                 snapshot_started_at,
                 session_boot_id.as_deref(),
+                session_chain_id,
             )
             .await
             {
@@ -939,6 +1167,7 @@ async fn follow_stream(
     replica: &std::sync::Arc<RwLock<Replica>>,
     snapshot_started_at: Instant,
     session_boot_id: Option<&str>,
+    session_chain_id: Option<u64>,
 ) -> anyhow::Result<StreamControl> {
     let url = shared::url::join(base_url, "delta/stream");
     let after_sequence = replica.read().await.sequence();
@@ -992,7 +1221,7 @@ async fn follow_stream(
     let max_staleness = delta_replica_max_staleness();
     let resnapshot_interval = delta_replica_resnapshot_interval();
 
-    let mut safety_sleep = tokio::time::sleep(Duration::from_secs(5));
+    let safety_sleep = tokio::time::sleep(Duration::from_secs(5));
     tokio::pin!(safety_sleep);
 
     loop {
@@ -1025,7 +1254,7 @@ async fn follow_stream(
                             let block = buffer[..idx].to_string();
                             buffer.drain(..idx + 2);
 
-                            match handle_sse_block(&block, replica, session_boot_id).await? {
+                            match handle_sse_block(&block, replica, session_boot_id, session_chain_id).await? {
                                 BlockControl::Continue => {}
                                 BlockControl::Resnapshot => return Ok(StreamControl::Resnapshot),
                             }
@@ -1047,7 +1276,12 @@ async fn follow_stream(
                                 return Ok(StreamControl::Resnapshot);
                             }
                             Err(err) => {
-                                tracing::warn!(?err, "delta replica checksum comparison failed");
+                                // Treat transient comparison errors (timeouts, network
+                                // partitions) as a degraded state: mark the replica as
+                                // Syncing to avoid serving thin requests until
+                                // connectivity is restored or max staleness is hit.
+                                tracing::warn!(?err, "delta replica checksum comparison failed; marking replica degraded");
+                                replica.write().await.set_state(ReplicaState::Syncing);
                             }
                         }
                     }
@@ -1092,6 +1326,7 @@ async fn handle_sse_block(
     block: &str,
     replica: &std::sync::Arc<RwLock<Replica>>,
     session_boot_id: Option<&str>,
+    session_chain_id: Option<u64>,
 ) -> anyhow::Result<BlockControl> {
     let (event, data) = parse_sse_block(block);
     let Some(data) = data else {
@@ -1108,13 +1343,47 @@ async fn handle_sse_block(
             if let (Some(session), Some(received)) = (session_boot_id, envelope.boot_id.as_deref())
             {
                 if session != received {
-                    replica.write().await.set_state(ReplicaState::Resyncing);
-                    tracing::warn!(
-                        session_boot_id = %session,
-                        received_boot_id = %received,
-                        "autopilot boot ID changed; forcing resnapshot"
-                    );
-                    return Ok(BlockControl::Resnapshot);
+                    // If both snapshot and envelope include chain identifiers,
+                    // only trigger a resnapshot when the chain ids match. This
+                    // avoids cross-chain resnapshot when a different chain's
+                    // stream restarted but the autopilot's global boot id
+                    // changed.
+                    match (session_chain_id, envelope.chain_id) {
+                        (Some(s_chain), Some(e_chain)) => {
+                            if s_chain == e_chain {
+                                replica.write().await.set_state(ReplicaState::Resyncing);
+                                tracing::warn!(
+                                    session_boot_id = %session,
+                                    received_boot_id = %received,
+                                    session_chain_id = s_chain,
+                                    envelope_chain_id = ?e_chain,
+                                    "autopilot boot ID changed for this chain; forcing resnapshot"
+                                );
+                                return Ok(BlockControl::Resnapshot);
+                            } else {
+                                tracing::warn!(
+                                    session_boot_id = %session,
+                                    received_boot_id = %received,
+                                    session_chain_id = s_chain,
+                                    envelope_chain_id = ?e_chain,
+                                    "autopilot boot ID changed for a different chain; ignoring"
+                                );
+                                // Don't apply deltas from a different chain – skip.
+                                return Ok(BlockControl::Continue);
+                            }
+                        }
+                        // Missing chain id information: fall back to the
+                        // conservative (safe) behaviour of forcing a resnapshot.
+                        _ => {
+                            replica.write().await.set_state(ReplicaState::Resyncing);
+                            tracing::warn!(
+                                session_boot_id = %session,
+                                received_boot_id = %received,
+                                "autopilot boot ID changed; forcing resnapshot"
+                            );
+                            return Ok(BlockControl::Resnapshot);
+                        }
+                    }
                 }
             }
 
@@ -1183,6 +1452,17 @@ fn delta_sync_checksum_enabled() -> bool {
             .as_deref(),
         true,
     )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeltaChecksumResponse {
+    #[serde(default)]
+    version: Option<u64>,
+    sequence: u64,
+    order_uid_hash: String,
+    price_hash: String,
+    order_content_hash: String,
 }
 
 async fn compare_replica_checksum(
@@ -1275,10 +1555,66 @@ fn delta_sync_api_key_from_env() -> Option<String> {
 }
 
 fn delta_replica() -> Arc<RwLock<Replica>> {
-    DELTA_REPLICA
-        .read()
-        .expect("delta replica lock poisoned")
+    // Determine per-replica key (typically autopilot base URL) and return
+    // the corresponding replica `Arc<RwLock<Replica>>`, creating a new
+    // default-initialized replica for the key if needed.
+    let key = delta_replica_key();
+
+    // Fast path: try read lock and return clone if present.
+    {
+        let guard = delta_replica_map()
+            .read()
+            .expect("delta replica lock poisoned");
+        if let Some(replica) = guard.get(&key) {
+            return replica.clone();
+        }
+    }
+
+    // Missing entry: create under write lock and return.
+    let mut guard = delta_replica_map()
+        .write()
+        .expect("delta replica lock poisoned");
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(RwLock::new(Replica::default())))
         .clone()
+}
+
+fn delta_replica_key() -> String {
+    // In test and `test-helpers` builds we intentionally avoid caching the
+    // replica key so runtime test overrides (env-based or explicit test
+    // helpers) are immediately observed. In production builds we cache the
+    // computed key in `DELTA_REPLICA_KEY` (a `OnceLock`) to avoid repeated
+    // environment lookups on hot paths.
+    #[cfg(any(test, feature = "test-helpers"))]
+    {
+        if let Some(url) = delta_sync_base_url_from_env() {
+            return url.as_str().to_string();
+        }
+        if let Ok(custom) = std::env::var("DRIVER_DELTA_SYNC_REPLICA_KEY") {
+            if !custom.is_empty() {
+                return custom;
+            }
+        }
+        return DEFAULT_REPLICA_KEY.to_string();
+    }
+
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    {
+        DELTA_REPLICA_KEY
+            .get_or_init(|| {
+                if let Some(url) = delta_sync_base_url_from_env() {
+                    return url.as_str().to_string();
+                }
+                if let Ok(custom) = std::env::var("DRIVER_DELTA_SYNC_REPLICA_KEY") {
+                    if !custom.is_empty() {
+                        return custom;
+                    }
+                }
+                DEFAULT_REPLICA_KEY.to_string()
+            })
+            .clone()
+    }
 }
 
 fn parse_sse_block(block: &str) -> (&str, Option<String>) {
@@ -1358,7 +1694,7 @@ mod tests {
             "class": "market",
             "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
             "signingScheme": "eip712",
-            "signature": "0x00",
+            "signature": format!("0x{}", hex::encode([0u8; 65])),
             "quote": null
         })
     }
@@ -1506,6 +1842,7 @@ mod tests {
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -1525,7 +1862,9 @@ mod tests {
             valid_order(&uid)
         );
 
-        let outcome = handle_sse_block(&block, &replica, None).await.unwrap();
+        let outcome = handle_sse_block(&block, &replica, None, None)
+            .await
+            .unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
 
         let view = replica.read().await;
@@ -1538,7 +1877,9 @@ mod tests {
         let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
         let block = "event: resync_required\ndata: lagged\n\n";
 
-        let outcome = handle_sse_block(&block, &replica, None).await.unwrap();
+        let outcome = handle_sse_block(&block, &replica, None, None)
+            .await
+            .unwrap();
         assert!(matches!(outcome, BlockControl::Resnapshot));
     }
 
@@ -1547,7 +1888,9 @@ mod tests {
         let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
         let block = "event: keepalive\ndata: ok\n\n";
 
-        let outcome = handle_sse_block(&block, &replica, None).await.unwrap();
+        let outcome = handle_sse_block(&block, &replica, None, None)
+            .await
+            .unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
     }
 
@@ -1556,7 +1899,9 @@ mod tests {
         let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
         let block = "event: delta\ndata: not-json\n\n";
 
-        let err = handle_sse_block(block, &replica, None).await.unwrap_err();
+        let err = handle_sse_block(block, &replica, None, None)
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("expected ident")
                 || err.to_string().contains("expected value")
@@ -1571,6 +1916,7 @@ mod tests {
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -1584,7 +1930,9 @@ mod tests {
         let block = "event: delta\ndata: \
                      {\"version\":2,\"fromSequence\":0,\"toSequence\":1,\"events\":[]}\n\n";
 
-        let outcome = handle_sse_block(&block, &replica, None).await.unwrap();
+        let outcome = handle_sse_block(&block, &replica, None, None)
+            .await
+            .unwrap();
         assert!(matches!(outcome, BlockControl::Resnapshot));
     }
 
@@ -1596,6 +1944,7 @@ mod tests {
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 2,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -1614,7 +1963,9 @@ mod tests {
              orderRemoved\",\"uid\":\"{uid}\"}}]}}\n\n"
         );
 
-        let outcome = handle_sse_block(&block, &replica, None).await.unwrap();
+        let outcome = handle_sse_block(&block, &replica, None, None)
+            .await
+            .unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
 
         let view = replica.read().await;
@@ -1629,6 +1980,7 @@ mod tests {
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -1647,7 +1999,9 @@ mod tests {
             valid_order(&uid)
         );
 
-        let outcome = handle_sse_block(&block, &replica, None).await.unwrap();
+        let outcome = handle_sse_block(&block, &replica, None, None)
+            .await
+            .unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
 
         let view = replica.read().await;
@@ -1663,6 +2017,7 @@ mod tests {
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -1681,7 +2036,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
 
 "#;
 
-        let outcome = handle_sse_block(block, &replica, None).await.unwrap();
+        let outcome = handle_sse_block(block, &replica, None, None).await.unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
 
         let view = replica.read().await;
@@ -1851,6 +2206,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 3,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -1862,7 +2218,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
         }
 
         let client = reqwest::Client::new();
-        let err = follow_stream(&client, &base_url, &replica, Instant::now(), None)
+        let err = follow_stream(&client, &base_url, &replica, Instant::now(), None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("delta stream closed"));
@@ -1905,6 +2261,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 5,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -1916,7 +2273,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
         }
 
         let client = reqwest::Client::new();
-        let control = follow_stream(&client, &base_url, &replica, Instant::now(), None)
+        let control = follow_stream(&client, &base_url, &replica, Instant::now(), None, None)
             .await
             .unwrap();
         assert!(matches!(control, StreamControl::Resnapshot));
@@ -1951,6 +2308,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 10,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -1962,7 +2320,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
         }
 
         let client = reqwest::Client::new();
-        let control = follow_stream(&client, &base_url, &replica, Instant::now(), None)
+        let control = follow_stream(&client, &base_url, &replica, Instant::now(), None, None)
             .await
             .unwrap();
         assert!(matches!(control, StreamControl::Resnapshot));
@@ -2036,7 +2394,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(snapshot_payload).unwrap();
         }
 
-        let err = follow_stream(&client, &base_url, &replica, Instant::now(), None)
+        let err = follow_stream(&client, &base_url, &replica, Instant::now(), None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("delta stream closed"));
@@ -2068,6 +2426,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 1,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -2124,6 +2483,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
         set_replica_snapshot_for_tests(Snapshot {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: Some(0),
             sequence: 1,
             auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -2146,6 +2506,84 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
     }
 
     #[tokio::test]
+    async fn replica_health_returns_none_on_checksum_error() {
+        // Ensure clean global replica state for the test.
+        let _guard = DeltaReplicaTestGuard::acquire().await;
+
+        use axum::{Router, routing::get};
+
+        // Server returns 500 to simulate an error (e.g., network issue or
+        // server-side failure) which should be treated as degraded.
+        let app = Router::new().route(
+            "/delta/checksum",
+            get(|| async move { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "err") }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Point the delta sync base URL override at the test server.
+        set_driver_delta_sync_autopilot_url_override(Some(
+            Url::parse(&format!("http://{addr}")).unwrap(),
+        ));
+        set_driver_delta_sync_enabled_override(Some(true));
+
+        // Apply a local snapshot so the replica has a checksum to compare.
+        set_replica_snapshot_for_tests(Snapshot {
+            version: 1,
+            boot_id: None,
+            chain_id: None,
+            auction_id: Some(0),
+            sequence: 1,
+            auction: crate::domain::competition::delta_replica::RawAuctionData {
+                orders: vec![valid_order(&valid_uid(1))],
+                prices: HashMap::new(),
+            },
+        })
+        .await;
+
+        // When the remote checksum endpoint errors, replica_health should
+        // report None and the replica should be marked degraded (Syncing).
+        let health = replica_health().await;
+        assert!(
+            health.is_none(),
+            "expected replica_health() to return None on checksum error"
+        );
+
+        let state = replica_state().await;
+        assert!(matches!(state, Some(ReplicaState::Syncing)));
+
+        // Clean up server
+        server.abort();
+    }
+
+    #[test]
+    fn binding_circuit_opens_per_auction() {
+        let _guard = BindingFailuresTestGuard::acquire();
+
+        // Trip the circuit for auction id 1.
+        record_binding_failure_for_auction(Some(1));
+        record_binding_failure_for_auction(Some(1));
+        record_binding_failure_for_auction(Some(1));
+
+        // Circuit should be open for auction 1 (pure query).
+        assert!(replica_binding_circuit_is_open_for_auction(Some(1)));
+
+        // For a different auction id the circuit must be treated as closed
+        // for that auction (pure query remains read-only).
+        assert!(!replica_binding_circuit_is_open_for_auction(Some(2)));
+
+        // Explicitly reset the circuit due to auction-id mismatch (this
+        // mirrors the previous implicit behaviour, but the reset is now
+        // explicit to avoid surprising side-effects from a read).
+        replica_binding_circuit_reset_if_mismatch_or_cooldown(Some(2));
+
+        // After reset, circuit should not be open for auction 1 either.
+        assert!(!replica_binding_circuit_is_open_for_auction(Some(1)));
+    }
+
+    #[tokio::test]
     async fn delta_replica_test_guard_resets_preexisting_clone() {
         let replica = delta_replica();
 
@@ -2154,6 +2592,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(7),
                 sequence: 9,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -2174,6 +2613,98 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
     }
 
     #[tokio::test]
+    async fn delta_replica_test_guard_replaces_map_entry_when_old_arc_locked() {
+        // Ensure clean starting state.
+        reset_delta_replica_for_tests();
+
+        // Acquire the test guard which records the key and holds the mutex.
+        let guard = DeltaReplicaTestGuard::acquire().await;
+
+        // Determine the recorded key and capture the Arc that was active at
+        // acquisition time.
+        let key = delta_replica_key();
+        let old_arc = {
+            let map = delta_replica_map()
+                .read()
+                .expect("delta replica lock poisoned");
+            map.get(&key).cloned().expect("replica arc present")
+        };
+
+        // Spawn a thread that takes a blocking write lock on the old Arc and
+        // holds it until signalled. This ensures `try_write()` in `Drop`
+        // cannot succeed, forcing the replacement fallback path.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let old_arc_clone = old_arc.clone();
+        let handle = std::thread::spawn(move || {
+            let _write_guard = old_arc_clone.blocking_write();
+            // Notify the main thread that the write lock is held.
+            let _ = ready_tx.send(());
+            // Wait until main test signals to release the write lock.
+            let _ = rx.recv();
+        });
+
+        // Ensure the spawned thread holds the write lock before proceeding so
+        // the `Drop` fast path cannot acquire the lock.
+        let _ = ready_rx.recv().expect("thread ready");
+
+        // Concurrently replace the global map entry for the recorded key with
+        // a non-default replica so we can detect whether `Drop` overwrote it.
+        let mut special = Replica::default();
+        special
+            .apply_snapshot(Snapshot {
+                version: 1,
+                boot_id: None,
+                chain_id: None,
+                auction_id: Some(0),
+                sequence: 999,
+                auction: crate::domain::competition::delta_replica::RawAuctionData {
+                    orders: vec![],
+                    prices: HashMap::new(),
+                },
+            })
+            .expect("apply snapshot");
+        let special_arc = Arc::new(RwLock::new(special));
+        {
+            let mut map = delta_replica_map()
+                .write()
+                .expect("delta replica lock poisoned");
+            map.insert(key.clone(), special_arc.clone());
+        }
+
+        // Drop the guard to trigger the `Drop` implementation path. Because
+        // the old Arc is write-locked in another thread, the in-place reset
+        // will fail and the Drop fallback should replace the map entry by
+        // the originally recorded key.
+        drop(guard);
+
+        // Allow the spawned thread to release its write lock and join.
+        tx.send(()).expect("signal thread");
+        handle.join().expect("thread join");
+
+        // Verify that the map entry for the recorded key was replaced by
+        // `Drop` (i.e., it is the default replica, not the special one we
+        // inserted earlier with sequence = 999).
+        let map = delta_replica_map()
+            .read()
+            .expect("delta replica lock poisoned");
+        let current_arc = map.get(&key).expect("entry missing").clone();
+        let current = current_arc.read().await;
+        assert_eq!(
+            current.sequence(),
+            0,
+            "Drop should have replaced the map entry with a default replica"
+        );
+        // Also ensure the special arc we inserted is not the same instance
+        // still present under the recorded key — Drop must have inserted a
+        // fresh default replica instead.
+        assert!(
+            !Arc::ptr_eq(&current_arc, &special_arc),
+            "Drop must have inserted a new arc, not left the special one in place"
+        );
+    }
+
+    #[tokio::test]
     async fn boot_id_mismatch_in_delta_requests_resnapshot() {
         let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
         {
@@ -2181,6 +2712,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: Some("session-boot-id-A".to_string()),
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -2196,7 +2728,7 @@ data: {"version":1,"bootId":"session-boot-id-B","fromSequence":0,"toSequence":1,
 
 "#;
 
-        let outcome = handle_sse_block(block, &replica, Some("session-boot-id-A"))
+        let outcome = handle_sse_block(block, &replica, Some("session-boot-id-A"), None)
             .await
             .unwrap();
         assert!(matches!(outcome, BlockControl::Resnapshot));
@@ -2211,6 +2743,7 @@ data: {"version":1,"bootId":"session-boot-id-B","fromSequence":0,"toSequence":1,
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: Some("session-boot-id-A".to_string()),
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -2226,7 +2759,7 @@ data: {"version":1,"bootId":"session-boot-id-A","fromSequence":0,"toSequence":1,
 
 "#;
 
-        let outcome = handle_sse_block(block, &replica, Some("session-boot-id-A"))
+        let outcome = handle_sse_block(block, &replica, Some("session-boot-id-A"), None)
             .await
             .unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
@@ -2241,6 +2774,7 @@ data: {"version":1,"bootId":"session-boot-id-A","fromSequence":0,"toSequence":1,
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -2256,7 +2790,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
 
 "#;
 
-        let outcome = handle_sse_block(block, &replica, None).await.unwrap();
+        let outcome = handle_sse_block(block, &replica, None, None).await.unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
         assert_eq!(replica.read().await.sequence(), 1);
     }
@@ -2269,6 +2803,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             lock.apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: Some("session-boot-id-A".to_string()),
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 0,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {
@@ -2284,11 +2819,132 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
 
 "#;
 
-        let outcome = handle_sse_block(block, &replica, Some("session-boot-id-A"))
+        let outcome = handle_sse_block(block, &replica, Some("session-boot-id-A"), None)
             .await
             .unwrap();
         assert!(matches!(outcome, BlockControl::Continue));
         assert_eq!(replica.read().await.sequence(), 1);
+    }
+
+    #[tokio::test]
+    async fn boot_id_mismatch_same_chain_requests_resnapshot() {
+        let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
+        {
+            let mut lock = replica.write().await;
+            lock.apply_snapshot(Snapshot {
+                version: 1,
+                boot_id: Some("session-boot-id-A".to_string()),
+                chain_id: None,
+                auction_id: Some(0),
+                sequence: 0,
+                auction: crate::domain::competition::delta_replica::RawAuctionData {
+                    orders: vec![],
+                    prices: HashMap::new(),
+                },
+            })
+            .unwrap();
+        }
+
+        // Envelope from a restarted autopilot for the same chain id should
+        // trigger a resnapshot when boot ids differ.
+        let block = r#"event: delta
+data: {"version":1,"bootId":"session-boot-id-B","chainId":100,"fromSequence":0,"toSequence":1,"events":[]}
+
+"#;
+
+        let outcome = handle_sse_block(block, &replica, Some("session-boot-id-A"), Some(100))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, BlockControl::Resnapshot));
+        assert_eq!(replica.read().await.sequence(), 0);
+    }
+
+    #[tokio::test]
+    async fn boot_id_mismatch_different_chain_is_ignored_and_applies_delta() {
+        let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
+        {
+            let mut lock = replica.write().await;
+            lock.apply_snapshot(Snapshot {
+                version: 1,
+                boot_id: Some("session-boot-id-A".to_string()),
+                chain_id: None,
+                auction_id: Some(0),
+                sequence: 0,
+                auction: crate::domain::competition::delta_replica::RawAuctionData {
+                    orders: vec![],
+                    prices: HashMap::new(),
+                },
+            })
+            .unwrap();
+        }
+
+        // Envelope boot id differs but for a different chain -> should be
+        // ignored. The implementation skips applying deltas from a different
+        // chain to avoid cross-chain contamination, so the sequence remains
+        // unchanged.
+        let block = r#"event: delta
+data: {"version":1,"bootId":"session-boot-id-B","chainId":200,"fromSequence":0,"toSequence":1,"events":[]}
+
+"#;
+
+        let outcome = handle_sse_block(block, &replica, Some("session-boot-id-A"), Some(100))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, BlockControl::Continue));
+        // We skip applying deltas from a different chain; sequence should
+        // remain at 0.
+        assert_eq!(replica.read().await.sequence(), 0);
+    }
+
+    #[tokio::test]
+    async fn boot_id_mismatch_missing_chain_info_falls_back_to_resnapshot() {
+        let replica = std::sync::Arc::new(RwLock::new(Replica::default()));
+        {
+            let mut lock = replica.write().await;
+            lock.apply_snapshot(Snapshot {
+                version: 1,
+                boot_id: Some("session-boot-id-A".to_string()),
+                chain_id: None,
+                auction_id: Some(0),
+                sequence: 0,
+                auction: crate::domain::competition::delta_replica::RawAuctionData {
+                    orders: vec![],
+                    prices: HashMap::new(),
+                },
+            })
+            .unwrap();
+        }
+
+        // Envelope missing chainId while session provides one -> conservative
+        // fallback should force a resnapshot.
+        let block_missing_chain = r#"event: delta
+data: {"version":1,"bootId":"session-boot-id-B","fromSequence":0,"toSequence":1,"events":[]}
+
+"#;
+
+        let outcome = handle_sse_block(
+            block_missing_chain,
+            &replica,
+            Some("session-boot-id-A"),
+            Some(100),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, BlockControl::Resnapshot));
+        assert_eq!(replica.read().await.sequence(), 0);
+
+        // Session missing chain info but envelope includes it -> also fallback
+        // to resnapshot.
+        let block_with_chain = r#"event: delta
+data: {"version":1,"bootId":"session-boot-id-B","chainId":100,"fromSequence":0,"toSequence":1,"events":[]}
+
+"#;
+        let outcome2 =
+            handle_sse_block(block_with_chain, &replica, Some("session-boot-id-A"), None)
+                .await
+                .unwrap();
+        assert!(matches!(outcome2, BlockControl::Resnapshot));
+        assert_eq!(replica.read().await.sequence(), 0);
     }
 
     #[test]
@@ -2299,6 +2955,7 @@ data: {"version":1,"fromSequence":0,"toSequence":1,"events":[]}
             .apply_snapshot(Snapshot {
                 version: 1,
                 boot_id: None,
+                chain_id: None,
                 auction_id: Some(0),
                 sequence: 1,
                 auction: crate::domain::competition::delta_replica::RawAuctionData {

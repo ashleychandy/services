@@ -35,7 +35,7 @@ use {
         time::{Duration, Instant},
     },
     subtle::ConstantTimeEq,
-    tokio::sync::{Notify, broadcast::error::TryRecvError, oneshot, watch},
+    tokio::sync::{broadcast::error::TryRecvError, oneshot, watch},
     tokio_stream::wrappers::{
         BroadcastStream,
         ReceiverStream,
@@ -180,7 +180,7 @@ mod invariant_tests {
         }
 
         let outcome =
-            drain_live_envelopes(&mut receiver, checkpoint, checkpoint, &mut replay_to).unwrap();
+            drain_live_envelopes(&mut receiver, checkpoint, checkpoint, &mut replay_to, 1).unwrap();
 
         // Every payload must have to_sequence > checkpoint
         for payload in &outcome.payloads {
@@ -218,7 +218,7 @@ mod invariant_tests {
         }
 
         let mut replay_to = 4u64;
-        let outcome = drain_live_envelopes(&mut receiver, 4, 4, &mut replay_to).unwrap();
+        let outcome = drain_live_envelopes(&mut receiver, 4, 4, &mut replay_to, 1).unwrap();
 
         // Verify contiguity
         let mut sequences: Vec<u64> = outcome
@@ -303,6 +303,27 @@ pub fn set_delta_sync_live_stream_override(value: Option<bool>) {
         .expect("delta sync live stream override lock poisoned") = value;
 }
 
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_delta_stream_buffer_override(value: Option<usize>) {
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        if API_TEST_STATE_MUTEX.try_lock().is_ok() {
+            panic!(
+                "set_delta_stream_buffer_override must be called while holding ApiTestStateGuard"
+            );
+        }
+    }
+
+    *DELTA_SYNC_STREAM_BUFFER_OVERRIDE
+        .lock()
+        .expect("delta sync stream buffer override lock poisoned") = value;
+
+    // Clear cached computed buffer so the override takes effect immediately
+    *DELTA_STREAM_BUFFER_SIZE
+        .lock()
+        .expect("delta stream buffer size mutex poisoned") = None;
+}
+
 #[cfg(test)]
 struct DeltaSyncLiveGuard {
     previous: Option<bool>,
@@ -366,6 +387,7 @@ struct DeltaStreamQuery {
 struct DeltaSnapshotResponse {
     version: u32,
     boot_id: String,
+    chain_id: u64,
     auction_id: u64,
     auction_sequence: u64,
     sequence: u64,
@@ -388,6 +410,7 @@ struct DeltaChecksumResponse {
 struct DeltaEventEnvelope {
     version: u32,
     boot_id: String,
+    chain_id: u64,
     auction_id: u64,
     auction_sequence: u64,
     from_sequence: u64,
@@ -542,7 +565,11 @@ async fn get_delta_snapshot(headers: HeaderMap, AxumState(state): AxumState<Stat
 
     let response = DeltaSnapshotResponse {
         version: 1,
-        boot_id: crate::solvable_orders::boot_id().to_owned(),
+        boot_id: crate::solvable_orders::boot_id_for_chain(Some(
+            state.solvable_orders_cache.chain_id(),
+        ))
+        .to_owned(),
+        chain_id: state.solvable_orders_cache.chain_id(),
         auction_id: snapshot.auction_id,
         auction_sequence: snapshot.auction_sequence,
         sequence: snapshot.sequence,
@@ -802,7 +829,11 @@ async fn stream_delta_events(
                     // After replay completes, we transition to a new snapshot anchor.
                     // Live envelopes validate against state(replay_to_sequence), which is
                     // equivalent to snapshot(baseline_sequence) + all replay deltas.
-                    match serialize_envelope_to_payload(&envelope, Some(replay_to_sequence)) {
+                    match serialize_envelope_to_payload(
+                        &envelope,
+                        Some(replay_to_sequence),
+                        cache.chain_id(),
+                    ) {
                         Ok(payload) => Some(Ok::<sse::Event, Infallible>(
                             sse::Event::default().event("delta").data(payload),
                         )),
@@ -845,7 +876,11 @@ async fn stream_delta_events(
     // Shared watch channel used to detect when the response-side stream is
     // dropped by the client. The producer task will observe the channel's
     // state (which is persisted) to exit promptly and avoid leaking
-    // subscriptions in test/oneshot environments.
+    // subscriptions in test/oneshot environments. Multiple senders can set
+    // the same boolean without coordination because watch keeps only the
+    // latest value. Consequently, send errors from concurrent writers are
+    // benign and intentionally ignored (we only care that the value becomes
+    // true eventually).
     let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
 
     let (stream_sender, stream_receiver) =
@@ -858,6 +893,7 @@ async fn stream_delta_events(
     let control_sender_clone = control_sender.clone();
     let cache = Arc::clone(&state.solvable_orders_cache);
     let closed_rx_for_spawn = closed_rx.clone();
+    let closed_tx_for_spawn = closed_tx.clone();
     tokio::spawn(async move {
         let _active_stream = active_stream;
         let mut stream = Box::pin(stream);
@@ -880,12 +916,18 @@ async fn stream_delta_events(
                             "skipped": 0
                         })
                         .to_string();
+
+                        tracing::warn!("delta stream lost leader authority");
+
                         if let Err(_) = control_sender_clone.send(Ok(sse::Event::default()
                             .event("resync_required")
                             .data(resync_payload))) {
                             tracing::debug!("resync control event dropped: channel closed");
+                            let _ = closed_tx_for_spawn.send(true);
+                            tracing::warn!("aborting delta forward: resync signal could not be delivered");
+                            break;
                         }
-                        tracing::warn!("delta stream lost leader authority");
+
                         break;
                     }
                 }
@@ -914,17 +956,23 @@ async fn stream_delta_events(
                             })
                             .to_string();
 
-                            // Send critical resync event over the unbounded control channel so
-                            // it won't be dropped due to the bounded consumer buffer.
-                            // control_sender_clone is injected into the spawn closure.
-                            if let Err(_) = control_sender_clone.send(Ok(sse::Event::default()
-                                .event("resync_required")
-                                .data(resync_payload))) {
-                                tracing::debug!("resync control event dropped: channel closed");
-                            }
+                                // Send critical resync event over the unbounded control channel so
+                                // it won't be dropped due to the bounded consumer buffer.
+                                // control_sender_clone is injected into the spawn closure.
+                                // Log the slow-consumer condition even if the control
+                                // send subsequently fails (client disconnected).
+                                tracing::warn!("delta stream dropped slow consumer");
 
-                            tracing::warn!("delta stream dropped slow consumer");
-                            break;
+                                if let Err(_) = control_sender_clone.send(Ok(sse::Event::default()
+                                    .event("resync_required")
+                                    .data(resync_payload))) {
+                                    tracing::debug!("resync control event dropped: channel closed");
+                                    let _ = closed_tx_for_spawn.send(true);
+                                    tracing::warn!("aborting delta forward: resync signal could not be delivered");
+                                    break;
+                                }
+
+                                break;
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                             break;
@@ -951,7 +999,17 @@ async fn stream_delta_events(
             .event("resync_required")
             .data(resync_payload)))
         {
+            // Control receiver closed (client disconnected or race). Abort the
+            // forwarding task immediately to avoid continuing to stream deltas
+            // without delivering the critical resync event.
             tracing::debug!("resync control event dropped: channel closed");
+            let _ = closed_tx.send(true);
+            tracing::warn!("aborting delta forward: resync signal could not be delivered");
+            return delta_stream_gone_response(
+                "delta stream closed during replay drain",
+                latest_sequence,
+                None,
+            );
         }
     }
 
@@ -991,10 +1049,12 @@ async fn get_delta_checksum(headers: HeaderMap, AxumState(state): AxumState<Stat
 fn to_api_envelope(
     envelope: crate::solvable_orders::DeltaEnvelope,
     snapshot_sequence: Option<u64>,
+    chain_id: u64,
 ) -> DeltaEventEnvelope {
     DeltaEventEnvelope {
         version: 1,
-        boot_id: crate::solvable_orders::boot_id().to_owned(),
+        boot_id: crate::solvable_orders::boot_id_for_chain(Some(chain_id)).to_owned(),
+        chain_id,
         auction_id: envelope.auction_id,
         auction_sequence: envelope.auction_sequence,
         from_sequence: envelope.from_sequence,
@@ -1012,9 +1072,10 @@ fn to_api_envelope(
 fn serialize_envelope_to_payload(
     envelope: &crate::solvable_orders::DeltaEnvelope,
     snapshot_sequence: Option<u64>,
+    chain_id: u64,
 ) -> Result<String, serde_json::Error> {
     let mut buf = Vec::with_capacity(512 + envelope.events.len() * 256);
-    let api_envelope = to_api_envelope(envelope.clone(), snapshot_sequence);
+    let api_envelope = to_api_envelope(envelope.clone(), snapshot_sequence, chain_id);
     serde_json::to_writer(&mut buf, &api_envelope)?;
     // serde_json writes valid UTF-8, but convert using checked API for safety
     Ok(String::from_utf8(buf).expect("serde_json always writes valid UTF-8"))
@@ -1024,6 +1085,7 @@ fn serialize_envelope_to_payload(
 fn build_replay_payloads(
     envelopes: &[crate::solvable_orders::DeltaEnvelope],
     baseline_sequence: u64,
+    chain_id: u64,
 ) -> Result<Vec<String>, serde_json::Error> {
     let mut payloads = Vec::with_capacity(envelopes.len());
     let mut buf = Vec::with_capacity(1024);
@@ -1032,7 +1094,7 @@ fn build_replay_payloads(
         buf.clear();
         serde_json::to_writer(
             &mut buf,
-            &to_api_envelope(envelope.clone(), Some(baseline_sequence)),
+            &to_api_envelope(envelope.clone(), Some(baseline_sequence), chain_id),
         )?;
 
         let old = std::mem::replace(&mut buf, Vec::with_capacity(1024));
@@ -1066,6 +1128,7 @@ fn drain_live_envelopes(
     already_replayed_up_to: u64,
     baseline_sequence: u64,
     highest_sequence_seen: &mut u64,
+    chain_id: u64,
 ) -> Result<DrainOutcome, DrainError> {
     let mut payloads: Vec<String> = Vec::new();
     let mut closed = false;
@@ -1089,8 +1152,9 @@ fn drain_live_envelopes(
                 // Drain phase: snapshotSequence = baseline_sequence
                 // These envelopes are "catch-up" deltas from the snapshot baseline.
                 // They validate against snapshot(baseline_sequence).
-                let payload = serialize_envelope_to_payload(&envelope, Some(baseline_sequence))
-                    .map_err(DrainError::Serialize)?;
+                let payload =
+                    serialize_envelope_to_payload(&envelope, Some(baseline_sequence), chain_id)
+                        .map_err(DrainError::Serialize)?;
                 payloads.push(payload);
             }
             Err(TryRecvError::Empty) => break,
@@ -1142,8 +1206,9 @@ async fn subscribe_and_build_replay(
     }
 
     if !replay.envelopes.is_empty() {
-        let mut replay_payloads = build_replay_payloads(&replay.envelopes, baseline_sequence)
-            .map_err(SubscribeReplayError::Serialize)?;
+        let mut replay_payloads =
+            build_replay_payloads(&replay.envelopes, baseline_sequence, cache.chain_id())
+                .map_err(SubscribeReplayError::Serialize)?;
         payloads.append(&mut replay_payloads);
     }
 
@@ -1152,6 +1217,7 @@ async fn subscribe_and_build_replay(
         replay_to_sequence,
         baseline_sequence,
         &mut replay_to_sequence,
+        cache.chain_id(),
     )
     .map_err(SubscribeReplayError::Drain)?;
 
@@ -1282,7 +1348,7 @@ fn delta_stream_max_lag() -> u64 {
 fn delta_stream_buffer_size() -> usize {
     // The test override is checked first so tests can vary buffer sizes
     // without fighting the OnceLock that caches the first production read.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     {
         if let Some(value) = *DELTA_SYNC_STREAM_BUFFER_OVERRIDE
             .lock()
@@ -1663,6 +1729,11 @@ mod tests {
                 .expect("delta sync stream buffer override lock poisoned");
             let previous = *lock;
             *lock = Some(value);
+            // Ensure any previously cached computed buffer size is cleared so the
+            // override takes effect immediately for subsequent calls.
+            *DELTA_STREAM_BUFFER_SIZE
+                .lock()
+                .expect("delta stream buffer size mutex poisoned") = None;
             Self { previous }
         }
     }
@@ -1694,6 +1765,11 @@ mod tests {
             *DELTA_SYNC_STREAM_BUFFER_OVERRIDE
                 .lock()
                 .expect("delta sync stream buffer override lock poisoned") = self.previous;
+            // Restore cache to unclobbered state so later tests or production code
+            // can recompute from the environment if needed.
+            *DELTA_STREAM_BUFFER_SIZE
+                .lock()
+                .expect("delta stream buffer size mutex poisoned") = None;
         }
     }
 
@@ -1782,6 +1858,7 @@ mod tests {
             Address::repeat_byte(0xFF),
             false,
             None,
+            1,
         )
     }
 
@@ -1836,6 +1913,7 @@ mod tests {
             Address::repeat_byte(0xFF),
             true,
             None,
+            1,
         );
 
         (cache, postgres)
@@ -1874,7 +1952,7 @@ mod tests {
             ],
         };
 
-        let dto = to_api_envelope(envelope, Some(42));
+        let dto = to_api_envelope(envelope, Some(42), 1);
         assert_eq!(dto.version, 1);
         assert_eq!(dto.auction_id, 7);
         assert_eq!(dto.auction_sequence, 3);
@@ -1889,7 +1967,8 @@ mod tests {
     fn api_envelope_serializes_with_expected_wire_shape() {
         let envelope = DeltaEventEnvelope {
             version: 1,
-            boot_id: crate::solvable_orders::boot_id().to_owned(),
+            boot_id: crate::solvable_orders::boot_id_for_chain(Some(1)),
+            chain_id: 1,
             auction_id: 9,
             auction_sequence: 4,
             from_sequence: 10,
@@ -1923,7 +2002,8 @@ mod tests {
     fn api_envelope_serializes_block_and_jit_owner_events() {
         let envelope = DeltaEventEnvelope {
             version: 1,
-            boot_id: crate::solvable_orders::boot_id().to_owned(),
+            boot_id: crate::solvable_orders::boot_id_for_chain(Some(1)),
+            chain_id: 1,
             auction_id: 9,
             auction_sequence: 4,
             from_sequence: 10,
@@ -2477,6 +2557,7 @@ mod tests {
             checkpoint_sequence,
             checkpoint_sequence,
             &mut replay_to_sequence,
+            1,
         )
         .unwrap();
 
@@ -2518,7 +2599,8 @@ mod tests {
             })
             .unwrap();
 
-        let drained = drain_live_envelopes(&mut receiver, 5, 5, &mut replay_to_sequence).unwrap();
+        let drained =
+            drain_live_envelopes(&mut receiver, 5, 5, &mut replay_to_sequence, 1).unwrap();
 
         assert_eq!(drained.payloads.len(), 1);
         assert!(!drained.closed);
@@ -2549,7 +2631,7 @@ mod tests {
         }
 
         let outcome =
-            drain_live_envelopes(&mut receiver, checkpoint, checkpoint, &mut replay_to).unwrap();
+            drain_live_envelopes(&mut receiver, checkpoint, checkpoint, &mut replay_to, 1).unwrap();
 
         assert_eq!(
             outcome.payloads.len(),
@@ -2598,7 +2680,8 @@ mod tests {
             })
             .unwrap();
 
-        let err = drain_live_envelopes(&mut receiver, 0, 0, &mut replay_to_sequence).unwrap_err();
+        let err =
+            drain_live_envelopes(&mut receiver, 0, 0, &mut replay_to_sequence, 1).unwrap_err();
         assert!(matches!(err, DrainError::Lagged(_)));
     }
 
@@ -2868,6 +2951,21 @@ mod tests {
         assert_eq!(delta_stream_buffer_size(), 256);
     }
 
+    #[test]
+    fn set_delta_stream_buffer_override_clears_cached_value() {
+        let _test_state = ApiTestStateGuard::new();
+
+        // Force the computed value to be cached first.
+        let _computed_before = delta_stream_buffer_size();
+
+        // Now set override via the public setter (it should clear the cache).
+        set_delta_stream_buffer_override(Some(3));
+        assert_eq!(delta_stream_buffer_size(), 3);
+
+        // Cleanup: remove override so other tests remain isolated.
+        set_delta_stream_buffer_override(None);
+    }
+
     #[tokio::test]
     async fn drain_live_envelopes_with_closed_true_triggers_resync_control_event() {
         let (sender, mut receiver) = tokio::sync::broadcast::channel(8);
@@ -2875,7 +2973,8 @@ mod tests {
 
         drop(sender);
 
-        let drained = drain_live_envelopes(&mut receiver, 0, 0, &mut replay_to_sequence).unwrap();
+        let drained =
+            drain_live_envelopes(&mut receiver, 0, 0, &mut replay_to_sequence, 1).unwrap();
 
         assert!(drained.closed);
         assert_eq!(drained.payloads.len(), 0);
@@ -2957,7 +3056,8 @@ mod tests {
     fn boot_id_field_appears_in_envelope_responses() {
         let envelope = DeltaEventEnvelope {
             version: 1,
-            boot_id: crate::solvable_orders::boot_id().to_owned(),
+            boot_id: crate::solvable_orders::boot_id_for_chain(Some(1)),
+            chain_id: 1,
             auction_id: 1,
             auction_sequence: 1,
             from_sequence: 0,
@@ -2969,7 +3069,7 @@ mod tests {
 
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(json.contains("bootId"));
-        assert!(json.contains(&crate::solvable_orders::boot_id()));
+        assert!(json.contains(&crate::solvable_orders::boot_id_for_chain(Some(1))));
     }
 
     #[test]

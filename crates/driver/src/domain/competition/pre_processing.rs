@@ -1208,6 +1208,7 @@ mod replica_binding_tests {
         let snapshot = DeltaSnapshot {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: Some(1),
             sequence: 7,
             auction: RawAuctionData {
@@ -1273,6 +1274,7 @@ mod replica_binding_tests {
         let snapshot = DeltaSnapshot {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: Some(2),
             sequence: 11,
             auction: RawAuctionData {
@@ -1333,6 +1335,7 @@ mod replica_binding_tests {
         let snapshot = DeltaSnapshot {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: Some(3),
             sequence: 13,
             auction: RawAuctionData {
@@ -1522,7 +1525,13 @@ async fn build_solve_request_from_replica_resilient(
     // If the binding failure circuit is open, attempt a bootstrap resnapshot
     // instead of immediately refusing the request. This avoids persistent
     // cooldown windows preventing self-healing for transient mismatches.
-    if delta_sync::replica_binding_circuit_open() {
+    let current_auction_id = u64::try_from(metadata.id).ok();
+    // Ensure any stale opened-circuit state for a previous auction is
+    // cleared before probing. Historically this check implicitly reset
+    // the circuit on mismatch; keep the explicit reset here so production
+    // callers that rely on that behaviour continue to function.
+    delta_sync::replica_binding_circuit_reset_if_mismatch_or_cooldown(current_auction_id);
+    if delta_sync::replica_binding_circuit_open_for_auction(current_auction_id) {
         tracing::warn!("replica binding circuit open; attempting bootstrap for thin request");
         return ensure_replica_then_build(
             metadata,
@@ -1557,8 +1566,9 @@ async fn build_solve_request_from_replica_resilient(
             Ok(request) => Ok(request),
             Err(err) => {
                 // Bootstrap failed: record a binding failure now that recovery
-                // was attempted.
-                delta_sync::record_binding_failure();
+                // was attempted. Attach auction id for per-auction circuit
+                // semantics so the circuit only blocks this auction.
+                delta_sync::record_binding_failure_for_auction(u64::try_from(metadata.id).ok());
                 metrics::get().thin_solve_replica_fallbacks.inc();
                 Err(err)
             }
@@ -1584,7 +1594,7 @@ async fn build_solve_request_from_replica_resilient(
             {
                 Ok(request) => Ok(request),
                 Err(err) => {
-                    delta_sync::record_binding_failure();
+                    delta_sync::record_binding_failure_for_auction(u64::try_from(metadata.id).ok());
                     metrics::get().thin_solve_replica_fallbacks.inc();
                     Err(err)
                 }
@@ -1843,33 +1853,53 @@ mod tests {
         set_replica_snapshot_for_tests(Snapshot {
             version: 1,
             boot_id: None,
-            auction_id: Some(5),
-            sequence: 1,
+            chain_id: None,
+            auction_id: Some(7),
+            sequence: 3,
             auction: RawAuctionData {
-                orders: vec![],
+                orders: vec![serde_json::json!({
+                    "uid": format!("0x{}", "11".repeat(56)),
+                    "sellToken": "0x0000000000000000000000000000000000000001",
+                    "buyToken": "0x0000000000000000000000000000000000000002",
+                    "sellAmount": "1",
+                    "buyAmount": "1",
+                    "protocolFees": [],
+                    "created": 1,
+                    "validTo": 100,
+                    "kind": "sell",
+                    "receiver": null,
+                    "owner": "0x0000000000000000000000000000000000000003",
+                    "partiallyFillable": false,
+                    "executed": "0",
+                    "preInteractions": [],
+                    "postInteractions": [],
+                    "class": "market",
+                    "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "signingScheme": "eip712",
+                    "signature": format!("0x{}", hex::encode([0u8; 65])),
+                    "quote": null
+                })],
                 prices: HashMap::new(),
             },
         })
         .await;
 
-        let metadata = SolveRequestMetadata {
-            id: 6,
-            tokens: vec![SolveRequestTokenMetadata {
-                address: eth::Address::repeat_byte(1),
-                trusted: true,
-            }],
-            deadline: chrono::Utc::now(),
-            surplus_capturing_jit_order_owners: Vec::new(),
-        };
-        let replica_snapshot = delta_sync::snapshot().await.expect("replica snapshot");
-        let replica_binding = SolveRequestReplicaBinding {
-            sequence: replica_snapshot.sequence,
-            order_uid_hash: replica_snapshot.order_uid_hash,
-            price_hash: replica_snapshot.price_hash,
-            order_content_hash: replica_snapshot.order_content_hash,
+        let rep = delta_sync::snapshot().await.expect("replica snapshot");
+        let binding = SolveRequestReplicaBinding {
+            sequence: rep.sequence,
+            order_uid_hash: rep.order_uid_hash.clone(),
+            price_hash: rep.price_hash.clone(),
+            order_content_hash: rep.order_content_hash.clone(),
         };
 
-        let err = build_solve_request_from_replica(&metadata, &replica_binding)
+        let metadata = SolveRequestMetadata {
+            id: 42,
+            tokens: Vec::new(),
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+            surplus_capturing_jit_order_owners: Vec::new(),
+        };
+
+        let err = build_solve_request_from_replica(&metadata, &binding)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("auction id mismatch"));
@@ -1907,6 +1937,7 @@ mod tests {
         set_replica_snapshot_for_tests(Snapshot {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: Some(42),
             sequence: 10,
             auction: RawAuctionData {
@@ -2027,6 +2058,7 @@ mod tests {
         set_replica_snapshot_for_tests(Snapshot {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: Some(7),
             sequence: 3,
             auction: RawAuctionData {
@@ -2049,7 +2081,7 @@ mod tests {
                     "class": "market",
                     "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
                     "signingScheme": "eip712",
-                    "signature": "0x00",
+                    "signature": format!("0x{}", hex::encode([0u8; 65])),
                     "quote": null
                 })],
                 prices: HashMap::new(),
@@ -2090,6 +2122,7 @@ mod tests {
         set_replica_snapshot_for_tests(Snapshot {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: Some(77),
             sequence: 5,
             auction: RawAuctionData {
@@ -2112,7 +2145,7 @@ mod tests {
                     "class": "market",
                     "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
                     "signingScheme": "eip712",
-                    "signature": "0x00",
+                    "signature": format!("0x{}", hex::encode([0u8; 65])),
                     "quote": null
                 })],
                 prices: HashMap::new(),
@@ -2178,6 +2211,7 @@ mod tests {
         set_replica_snapshot_for_tests(Snapshot {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: Some(8),
             sequence: 4,
             auction: RawAuctionData {
@@ -2200,7 +2234,7 @@ mod tests {
                     "class": "market",
                     "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
                     "signingScheme": "eip712",
-                    "signature": "0x00",
+                    "signature": format!("0x{}", hex::encode([0u8; 65])),
                     "quote": null
                 })],
                 prices: HashMap::new(),
@@ -2313,6 +2347,7 @@ mod tests {
         set_replica_snapshot_for_tests(Snapshot {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: Some(100),
             sequence: 5,
             auction: RawAuctionData {
@@ -2336,6 +2371,7 @@ mod tests {
         set_replica_snapshot_for_tests(Snapshot {
             version: 1,
             boot_id: None,
+            chain_id: None,
             auction_id: Some(1),
             sequence: 1,
             auction: RawAuctionData {
