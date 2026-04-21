@@ -193,6 +193,8 @@ pub struct Metrics {
 
     /// Incremental projection mismatches against the canonical rebuild surface.
     delta_incremental_projection_mismatch_total: IntCounter,
+    /// Incremental matches where only non-delta fields (block/JIT owners) differed.
+    delta_incremental_non_delta_mismatch_total: IntCounter,
 }
 
 impl Metrics {
@@ -295,6 +297,12 @@ pub struct DeltaSyncConfig {
     pub pending_events_min_retained: usize,
     pub history_max_age: Duration,
     pub broadcast_capacity: usize,
+    // Maximum age for pending events before leader must flush them.
+    pub pending_flush_max_age: Duration,
+    // Maximum number of pending batches before leader must flush them.
+    pub pending_flush_max_count: usize,
+    // Extra grace window before non-leader forces resync.
+    pub pending_resync_grace: Duration,
 }
 
 impl Default for DeltaSyncConfig {
@@ -304,6 +312,9 @@ impl Default for DeltaSyncConfig {
             pending_events_min_retained: MIN_DELTA_HISTORY_RETAINED,
             history_max_age: DEFAULT_DELTA_HISTORY_MAX_AGE,
             broadcast_capacity: DELTA_BROADCAST_CAPACITY,
+            pending_flush_max_age: Duration::from_secs(2),
+            pending_flush_max_count: 1_000,
+            pending_resync_grace: Duration::from_millis(500),
         }
     }
 }
@@ -1050,7 +1061,12 @@ impl SolvableOrdersCache {
                     self.flush_pending_event(inner, pending);
                 }
 
-                inner.committed_auction = inner.auction.clone();
+                    // After flushing pending events for the transition, reset
+                    // the per-auction sequence so that the first event for the
+                    // new auction will be emitted with `auction_sequence = 1`.
+                    inner.auction_sequence = 0;
+
+                    inner.committed_auction = inner.auction.clone();
             }
         }
 
@@ -1094,6 +1110,28 @@ impl SolvableOrdersCache {
         let lock = self.cache.lock().await;
 
         let mut receiver = self.delta_sender.subscribe();
+
+        // If pending events have exceeded thresholds on a non-leader, force a
+        // resync so clients are not left waiting indefinitely for a leader
+        // to flush. This must be checked under the cache lock to avoid TOCTOU
+        // races with concurrent updates.
+        if let Some(inner) = lock.as_ref() {
+            if pending_exceeded(inner, &self.delta_config) {
+                // Update metrics for forced resyncs.
+                crate::infra::api::delta_pending_resync_forced_total_inc();
+
+                let latest = inner.delta_sequence;
+                let oldest_available = inner
+                    .delta_history
+                    .front()
+                    .map(|envelope| envelope.from_sequence)
+                    .unwrap_or(latest);
+                return Err(DeltaSubscribeError::DeltaAfter(DeltaAfterError::ResyncRequired {
+                    oldest_available,
+                    latest,
+                }));
+            }
+        }
 
         let latest = lock.as_ref().map(|inner| inner.delta_sequence).unwrap_or(0);
         if after_sequence.is_none() && latest > 0 {
@@ -1327,10 +1365,20 @@ impl SolvableOrdersCache {
                                  back"
                             );
                         }
+                        // Ensure non-delta fields (block, JIT owners) also match
+                        // so incremental vs full rebuild mismatches are detected
+                        // when those fields diverge (they are intentionally
+                        // ignored by `normalized_delta_surface`).
+                        let non_delta_fields_match = incremental_auction.block == full_auction.block
+                            && incremental_auction
+                                .surplus_capturing_jit_order_owners
+                                == full_auction.surplus_capturing_jit_order_owners;
+
                         let surfaces_match = normalized_delta_surface(incremental_auction)
                             == normalized_delta_surface(full_auction)
                             && incremental_events == full_events
-                            && indexed_state_matches;
+                            && indexed_state_matches
+                            && non_delta_fields_match;
 
                         if surfaces_match {
                             Metrics::get()
@@ -1577,6 +1625,15 @@ impl SolvableOrdersCache {
 
             pending.push_back(new_pending);
 
+            // Update pending-event metrics.
+            let pending_len = pending.len();
+            crate::infra::api::delta_pending_events_count_set(pending_len as i64);
+            let oldest_age_secs = pending
+                .front()
+                .map(|e| e.created_at_instant.elapsed().as_secs())
+                .unwrap_or(0);
+            crate::infra::api::delta_pending_events_oldest_age_seconds_set(oldest_age_secs as i64);
+
             let max_age = chrono::Duration::from_std(self.delta_config.history_max_age)
                 .unwrap_or_else(|_| chrono::Duration::seconds(60));
             prune_pending_delta_events(&mut pending, max_age, &self.delta_config);
@@ -1602,12 +1659,19 @@ impl SolvableOrdersCache {
             // pending events only exist in-memory between `update()` and
             // `set_auction_id()`.
             if store_events {
-                // Operate on the inner state while holding the cache lock.
+                // We need to potentially call `get_next_auction_id()` which is
+                // a blocking DB call. Avoid holding the cache mutex while
+                // awaiting it: compute the size/capacity checks under the
+                // lock, drop the lock, call persistence, then re-acquire the
+                // lock to apply the result.
+
+                let mut need_db_id = false;
+                let mut flush_requested = false;
+
+                // Compute safety/required values while holding the cache lock.
                 if let Some(inner) = cache.as_mut() {
-                    // Pre-check that advancing the global delta sequence will
-                    // not overflow given how many envelopes we need to emit
-                    // (1 for AuctionChanged + N pending events). Use the
-                    // allocated sequence so reserved assignments are counted.
+                    flush_requested = should_flush_pending(inner, &self.delta_config);
+
                     let pending_count: u64 =
                         inner.pending_events.len().try_into().unwrap_or(u64::MAX);
                     let required = pending_count.saturating_add(1);
@@ -1617,43 +1681,62 @@ impl SolvableOrdersCache {
                         tracing::error!(
                             available,
                             required,
-                            "delta sequence would overflow while flushing pending events; \
-                             refusing to set auction id"
+                            "delta sequence would overflow while flushing pending events; refusing to set auction id"
                         );
-                    } else {
-                        match self.persistence.get_next_auction_id().await {
+                    } else if flush_requested {
+                        // We only collapse/flush when thresholds require it.
+                        need_db_id = true;
+                    }
+                }
+
+                // Call DB outside of the cache lock to avoid blocking the
+                // async executor while holding mutex guards.
+                let db_id_res = if need_db_id {
+                    Some(self.persistence.get_next_auction_id().await)
+                } else {
+                    None
+                };
+
+                // Re-acquire cache and, if we obtained an id, apply the
+                // auction id change and flush pending events while still
+                // holding the update lock (but not the DB call).
+                if let Some(db_id_res) = db_id_res {
+                    let mut lock = self.cache.lock().await;
+                    if let Some(inner) = lock.as_mut() {
+                        match db_id_res {
                             Ok(db_id) => {
                                 let auction_id_u64 = u64::try_from(db_id).unwrap_or_default();
                                 debug_assert_ne!(
                                     auction_id_u64, inner.auction_id,
-                                    "apply_auction_id_change called with unchanged id during \
-                                     update collapse"
+                                    "apply_auction_id_change called with unchanged id during update collapse"
                                 );
-                                if let Some(envelope) = apply_auction_id_change(
-                                    inner,
-                                    auction_id_u64,
-                                    &self.delta_config,
-                                ) {
-                                    // Send the AuctionChanged envelope while
-                                    // holding the cache lock so ordering stays
-                                    // consistent with replay.
+                                if let Some(envelope) =
+                                    apply_auction_id_change(inner, auction_id_u64, &self.delta_config)
+                                {
                                     if let Err(e) = self.try_send_envelope(envelope.clone()) {
                                         tracing::warn!(error = ?e, "delta broadcast failed");
                                     }
 
-                                    // Flush any pending per-auction events that were
-                                    // queued while waiting for the authoritative id.
                                     while let Some(pending) = inner.pending_events.pop_front() {
                                         self.flush_pending_event(inner, pending);
                                     }
+
+                                    // Metrics: record a flush-trigger occurrence and reset gauges.
+                                    crate::infra::api::delta_pending_flush_triggered_total_inc();
+                                    crate::infra::api::delta_pending_events_count_set(inner.pending_events.len() as i64);
+                                    crate::infra::api::delta_pending_events_oldest_age_seconds_set(0);
+
+                                    // Reset the per-auction sequence after flushing
+                                    // pending events so the new auction starts at
+                                    // `auction_sequence = 1` for its first event.
+                                    inner.auction_sequence = 0;
 
                                     inner.committed_auction = inner.auction.clone();
                                 }
                             }
                             Err(err) => tracing::error!(
                                 ?err,
-                                "failed to get next auction id while flushing pending events; \
-                                 pending events remain queued"
+                                "failed to get next auction id while flushing pending events; pending events remain queued"
                             ),
                         }
                     }
@@ -2411,6 +2494,18 @@ impl SolvableOrdersCache {
         let auction_surface = normalized_delta_surface(auction.clone());
 
         if reconstructed_surface == auction_surface {
+            // If only non-delta fields differ (such as block number or the set
+            // of surplus-capturing JIT owners), record a special metric so
+            // these cases are observable even though the reconstructed
+            // surface matches up to non-delta fields.
+            if reconstructed.block != auction.block
+                || reconstructed.surplus_capturing_jit_order_owners
+                    != auction.surplus_capturing_jit_order_owners
+            {
+                Metrics::get()
+                    .delta_incremental_non_delta_mismatch_total
+                    .inc();
+            }
             return ProjectionResult::Match(with_non_delta_fields(reconstructed, &auction));
         }
 
@@ -2817,12 +2912,17 @@ fn apply_auction_id_change(
         return None;
     }
 
+    // Preserve the pre-transition auction sequence value in the AuctionChanged
+    // envelope so the transition is easy to correlate with the previous
+    // auction's events. Do NOT reset the per-auction sequence here: callers
+    // must reset the per-auction counter after flushing any pending events
+    // to ensure ordering is consistent for replay consumers.
+    let prev_auction_sequence = inner.auction_sequence;
     inner.auction_id = auction_id;
-    inner.auction_sequence = 0;
     let next_sequence = inner.delta_sequence + 1;
     let envelope = DeltaEnvelope {
         auction_id,
-        auction_sequence: 0,
+        auction_sequence: prev_auction_sequence,
         from_sequence: inner.delta_sequence,
         to_sequence: next_sequence,
         published_at: chrono::Utc::now(),
@@ -2936,12 +3036,17 @@ fn checksum_prices(prices: &domain::auction::Prices) -> String {
 }
 
 fn checksum_order_contents(orders: &[domain::Order]) -> String {
-    // Serialize domain orders into persistence DTOs (stable field order)
-    // and hash the resulting JSON blobs deterministically.
+    // Serialize domain orders into persistence DTOs and compute a
+    // canonical JSON representation (sorted object keys) so that checksum
+    // computation is stable across processes even if serde_json's insertion
+    // ordering differs.
     let mut serialized: Vec<Vec<u8>> = orders
         .iter()
         .map(|o| crate::infra::persistence::dto::order::from_domain(o.clone()))
-        .map(|dto| serde_json::to_vec(&dto).expect("order DTO serializable"))
+        .map(|dto| {
+            let value = serde_json::to_value(&dto).expect("dto -> value");
+            canonical_json_bytes(&value)
+        })
         .collect();
 
     serialized.sort();
@@ -2951,6 +3056,44 @@ fn checksum_order_contents(orders: &[domain::Order]) -> String {
         hasher.update(&bytes);
     }
     format!("0x{}", const_hex::encode(hasher.finalize()))
+}
+
+fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+            let mut out = Vec::new();
+            out.push(b'{');
+            let mut first = true;
+            for (k, v) in entries {
+                if !first {
+                    out.push(b',');
+                }
+                first = false;
+                out.extend_from_slice(serde_json::to_string(k).unwrap().as_bytes());
+                out.push(b':');
+                out.extend_from_slice(&canonical_json_bytes(v));
+            }
+            out.push(b'}');
+            out
+        }
+        serde_json::Value::Array(arr) => {
+            let mut out = Vec::new();
+            out.push(b'[');
+            let mut first = true;
+            for v in arr {
+                if !first {
+                    out.push(b',');
+                }
+                first = false;
+                out.extend_from_slice(&canonical_json_bytes(v));
+            }
+            out.push(b']');
+            out
+        }
+        _ => serde_json::to_vec(value).expect("value serializable"),
+    }
 }
 
 fn compute_delta_events(
@@ -3158,6 +3301,39 @@ fn prune_pending_delta_events(
     if remove > 0 {
         pending_events.drain(..remove);
     }
+}
+
+fn should_flush_pending(inner: &Inner, cfg: &DeltaSyncConfig) -> bool {
+    let count = inner.pending_events.len();
+    if count == 0 {
+        return false;
+    }
+
+    let oldest_age = inner
+        .pending_events
+        .front()
+        .map(|e| e.created_at_instant.elapsed())
+        .unwrap_or_default();
+
+    oldest_age >= cfg.pending_flush_max_age || count >= cfg.pending_flush_max_count
+}
+
+fn pending_exceeded(inner: &Inner, cfg: &DeltaSyncConfig) -> bool {
+    if inner.pending_events.is_empty() {
+        return false;
+    }
+    let oldest_age = inner
+        .pending_events
+        .front()
+        .map(|e| e.created_at_instant.elapsed())
+        .unwrap_or_default();
+
+    let threshold = cfg
+        .pending_flush_max_age
+        .checked_add(cfg.pending_resync_grace)
+        .unwrap_or(cfg.pending_flush_max_age);
+
+    oldest_age >= threshold || inner.pending_events.len() >= cfg.pending_flush_max_count
 }
 
 fn solver_visible_order_eq(lhs: &domain::Order, rhs: &domain::Order) -> bool {

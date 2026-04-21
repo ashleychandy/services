@@ -1501,12 +1501,39 @@ struct DeltaMetrics {
     snapshot_bytes: IntGauge,
     /// Currently active stream handlers.
     active_streams: IntGauge,
+    /// Number of pending event batches currently queued.
+    pending_events_count: IntGauge,
+    /// Oldest pending event age in seconds.
+    pending_events_oldest_age_seconds: IntGauge,
+    /// Total times a pending-events flush was triggered by leader.
+    pending_flush_triggered_total: IntCounter,
+    /// Total times a forced resync was returned because pending exceeded thresholds.
+    pending_resync_forced_total: IntCounter,
 }
 
 impl DeltaMetrics {
     fn get() -> &'static Self {
         DeltaMetrics::instance(observe::metrics::get_storage_registry()).unwrap()
     }
+}
+
+// Public (crate) accessors for selected delta sync metrics. These helpers
+// avoid exposing the `DeltaMetrics` struct and its private fields across the
+// crate boundary while allowing other modules to update the metrics safely.
+pub(crate) fn delta_pending_resync_forced_total_inc() {
+    DeltaMetrics::get().pending_resync_forced_total.inc();
+}
+
+pub(crate) fn delta_pending_events_count_set(v: i64) {
+    DeltaMetrics::get().pending_events_count.set(v);
+}
+
+pub(crate) fn delta_pending_events_oldest_age_seconds_set(v: i64) {
+    DeltaMetrics::get().pending_events_oldest_age_seconds.set(v);
+}
+
+pub(crate) fn delta_pending_flush_triggered_total_inc() {
+    DeltaMetrics::get().pending_flush_triggered_total.inc();
 }
 
 struct ActiveStreamGuard {

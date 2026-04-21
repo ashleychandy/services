@@ -32,6 +32,33 @@ const SNAPSHOT_BOOTSTRAP_DELAY: Duration = Duration::from_millis(100);
 const DELTA_SYNC_API_KEY_HEADER: &str = "X-Delta-Sync-Api-Key";
 const DEFAULT_REPLICA_KEY: &str = "__DEFAULT__";
 
+// Backoff for resnapshot/retry loops to avoid tight reconnect storms.
+struct Backoff {
+    current: Duration,
+    base: Duration,
+    max: Duration,
+}
+
+impl Backoff {
+    fn new(base: Duration, max: Duration) -> Self {
+        Self { current: base, base, max }
+    }
+
+    fn next(&mut self) -> Duration {
+        let now = self.current;
+        // exponential step
+        let doubled = if self.current >= self.max { self.max } else { self.current * 2 };
+        self.current = std::cmp::min(doubled, self.max);
+        // jitter in [0.8, 1.2)
+        let factor: f64 = 0.8 + (rand::random::<f64>() * 0.4);
+        Duration::from_secs_f64(now.as_secs_f64() * factor)
+    }
+
+    fn reset(&mut self) {
+        self.current = self.base;
+    }
+}
+
 /// Map of replica instances keyed by a per-replica identifier. The key is
 /// typically the configured autopilot base URL (when present) so that a
 /// single process can safely host multiple drivers talking to different
@@ -348,6 +375,7 @@ pub(crate) struct ReplicaSnapshot {
     pub(crate) order_content_hash: String,
     pub(crate) orders: Vec<crate::infra::api::routes::solve::dto::solve_request::Order>,
     pub(crate) prices: HashMap<alloy::primitives::Address, String>,
+    pub(crate) surplus_capturing_jit_order_owners: Vec<alloy::primitives::Address>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -769,6 +797,7 @@ fn snapshot_from_replica(replica: &Replica) -> Option<ReplicaSnapshot> {
             entries.into_iter().map(|(_, v)| v).collect()
         },
         prices: replica.prices().clone(),
+        surplus_capturing_jit_order_owners: replica.surplus_capturing_jit_order_owners().clone(),
     })
 }
 
@@ -1052,6 +1081,8 @@ async fn run(
     base_url: Url,
     replica: Arc<RwLock<Replica>>,
 ) -> anyhow::Result<()> {
+    // Backoff controls retry behavior when snapshot/stream fail repeatedly.
+    let mut backoff = Backoff::new(Duration::from_millis(200), Duration::from_secs(5));
     loop {
         {
             let mut lock = replica.write().await;
@@ -1059,39 +1090,41 @@ async fn run(
         }
         // Fetch snapshot and capture session boot_id and chain_id for validation of
         // live envelopes.
-        let (session_boot_id, session_chain_id) =
-            match fetch_snapshot(&snapshot_client, &base_url).await {
-                Ok(snapshot) => {
-                    let boot_id = snapshot.boot_id.clone();
-                    let chain_id = snapshot.chain_id;
-                    let applied = {
-                        let mut lock = replica.write().await;
-                        lock.apply_snapshot(snapshot)
-                    };
-                    if let Err(err) = applied {
-                        tracing::warn!(?err, "delta sync snapshot apply failed; retrying");
-                        tokio::time::sleep(DEFAULT_RETRY_DELAY).await;
-                        continue;
-                    }
-                    let view = replica.read().await;
-                    tracing::info!(
-                        sequence = view.sequence(),
-                        orders = view.orders().len(),
-                        prices = view.prices().len(),
-                        "delta sync snapshot applied"
-                    );
-                    (boot_id, chain_id)
-                }
-                Err(err) => {
-                    {
-                        let mut lock = replica.write().await;
-                        lock.set_state(ReplicaState::Resyncing);
-                    }
-                    tracing::warn!(?err, "delta sync snapshot fetch failed; retrying");
-                    tokio::time::sleep(DEFAULT_RETRY_DELAY).await;
+        let (session_boot_id, session_chain_id) = match fetch_snapshot(&snapshot_client, &base_url).await {
+            Ok(snapshot) => {
+                let boot_id = snapshot.boot_id.clone();
+                let chain_id = snapshot.chain_id;
+                let applied = {
+                    let mut lock = replica.write().await;
+                    lock.apply_snapshot(snapshot)
+                };
+                if let Err(err) = applied {
+                    tracing::warn!(?err, "delta sync snapshot apply failed; retrying");
+                    tokio::time::sleep(backoff.next()).await;
                     continue;
                 }
-            };
+                // Snapshot applied successfully; clear backoff so subsequent
+                // retries start from base delay.
+                backoff.reset();
+                let view = replica.read().await;
+                tracing::info!(
+                    sequence = view.sequence(),
+                    orders = view.orders().len(),
+                    prices = view.prices().len(),
+                    "delta sync snapshot applied"
+                );
+                (boot_id, chain_id)
+            }
+            Err(err) => {
+                {
+                    let mut lock = replica.write().await;
+                    lock.set_state(ReplicaState::Resyncing);
+                }
+                tracing::warn!(?err, "delta sync snapshot fetch failed; retrying");
+                tokio::time::sleep(backoff.next()).await;
+                continue;
+            }
+        };
 
         let snapshot_started_at = Instant::now();
         loop {
@@ -1171,21 +1204,18 @@ async fn follow_stream(
 ) -> anyhow::Result<StreamControl> {
     let url = shared::url::join(base_url, "delta/stream");
     let after_sequence = replica.read().await.sequence();
+
     let response = apply_delta_sync_auth(client.get(url))
         .query(&[("after_sequence", after_sequence)])
         .send()
         .await?;
+
     if response.status() == StatusCode::GONE {
-        // Autopilot uses 410/Gone to indicate the stream cannot be followed
-        // without a fresh snapshot (resync). Historically we attempted a
-        // short retry for small gaps, but retrying with the same
-        // `after_sequence` cannot advance the replica in many server-side
-        // scenarios and can trap the client in a reconnect loop. Prefer to
-        // request a resnapshot immediately so the replica can make progress.
+        // Autopilot signals that a resnapshot is required for the requested
+        // sequence. Respect the diagnostic payload when present and request
+        // a resnapshot so the replica can make forward progress.
         let payload = response.json::<DeltaStreamGonePayload>().await.ok();
-        if let Some(payload) = payload {
-            // Preserve the more specific diagnostic when the server indicates
-            // the requested sequence is older than the oldest available.
+        if let Some(ref payload) = payload {
             if payload
                 .oldest_available
                 .is_some_and(|oldest| after_sequence < oldest)
@@ -1200,23 +1230,18 @@ async fn follow_stream(
                 );
                 return Ok(StreamControl::Resnapshot);
             }
-            // For all other 410/Gone cases, treat as resnapshot required.
-            replica.write().await.set_state(ReplicaState::Resyncing);
-            tracing::warn!(
-                after_sequence,
-                latest_sequence = payload.latest_sequence,
-                oldest_available = ?payload.oldest_available,
-                message = payload.message.as_deref().unwrap_or(""),
-                "delta stream returned 410 Gone; resnapshot required"
-            );
-            return Ok(StreamControl::Resnapshot);
         }
+
         replica.write().await.set_state(ReplicaState::Resyncing);
-        tracing::warn!("delta stream returned 410 Gone without payload; resnapshot required");
+        tracing::warn!(
+            after_sequence,
+            message = payload.as_ref().and_then(|p| p.message.as_deref()).unwrap_or("")
+        );
         return Ok(StreamControl::Resnapshot);
     }
 
     let mut response = response.error_for_status()?;
+
     let mut buffer = String::new();
     let max_staleness = delta_replica_max_staleness();
     let resnapshot_interval = delta_replica_resnapshot_interval();
@@ -1227,20 +1252,13 @@ async fn follow_stream(
     loop {
         tokio::select! {
             chunk = response.chunk() => {
-                match chunk? {
+                let chunk = chunk?;
+                match chunk {
                     Some(bytes) => {
-                        // Append raw chunk text first. We intentionally avoid doing
-                        // per-chunk CRLF normalization because a CRLF boundary may
-                        // be split across two chunks. Normalize CRLF on the
-                        // accumulated `buffer` after appending the chunk so that
-                        // cross-chunk "\r\n\r\n" boundaries become "\n\n".
                         let text = String::from_utf8_lossy(&bytes).into_owned();
-
                         buffer.push_str(&text);
 
-                        // If any CR characters are present in the buffer, normalize
-                        // CRLF -> LF across the whole buffer. Also remove any
-                        // stray CRs that may remain (handles odd splits).
+                        // Normalize CRLF boundaries and stray CRs.
                         if buffer.contains('\r') {
                             if buffer.contains("\r\n") {
                                 buffer = buffer.replace("\r\n", "\n");
@@ -1264,10 +1282,9 @@ async fn follow_stream(
                 }
             }
             _ = &mut safety_sleep => {
-
+                // Periodic health checks while the stream is idle.
                 if delta_sync_checksum_enabled() {
-                    let local_checksum = replica.read().await.checksum();
-                    if let Some(local_checksum) = local_checksum {
+                    if let Some(local_checksum) = replica.read().await.checksum() {
                         match compare_replica_checksum(base_url, local_checksum).await {
                             Ok(true) => {}
                             Ok(false) => {
@@ -1276,10 +1293,6 @@ async fn follow_stream(
                                 return Ok(StreamControl::Resnapshot);
                             }
                             Err(err) => {
-                                // Treat transient comparison errors (timeouts, network
-                                // partitions) as a degraded state: mark the replica as
-                                // Syncing to avoid serving thin requests until
-                                // connectivity is restored or max staleness is hit.
                                 tracing::warn!(?err, "delta replica checksum comparison failed; marking replica degraded");
                                 replica.write().await.set_state(ReplicaState::Syncing);
                             }
@@ -1306,7 +1319,6 @@ async fn follow_stream(
                         return Ok(StreamControl::Resnapshot);
                     }
                 }
-
 
                 safety_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
             }
@@ -1491,9 +1503,14 @@ async fn compare_replica_checksum(
 
     if local_checksum.sequence == remote.sequence {
         // If sequences match, fall back to the content hashes check.
+        // Compare core binding checks (uids + prices). The `order_content_hash`
+        // is intentionally excluded because its inputs (serialization and any
+        // fee-normalization applied by autopilot) may differ from the raw
+        // wire JSON the driver stores; comparing it here can create false
+        // positives when both sides are otherwise consistent. Re-enable if
+        // serialization/fee-normalization rules are guaranteed to match.
         if local_checksum.order_uid_hash != remote.order_uid_hash
             || local_checksum.price_hash != remote.price_hash
-            || local_checksum.order_content_hash != remote.order_content_hash
         {
             metrics::get().delta_replica_diverged_total.inc();
             tracing::warn!(

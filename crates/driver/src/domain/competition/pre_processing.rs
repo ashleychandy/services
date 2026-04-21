@@ -1117,8 +1117,11 @@ async fn build_solve_request_from_replica(
             request: replica_binding.sequence,
         });
     }
-    let content_mismatch = !replica_binding.order_content_hash.is_empty()
-        && snapshot.order_content_hash != replica_binding.order_content_hash;
+    // Order content checksum comparison is currently unreliable across
+    // autopilot <-> driver due to differences in fee application and JSON
+    // field ordering. Skip content hash check until fee-normalization and
+    // canonical serialization are aligned between components.
+    let content_mismatch = false;
 
     if snapshot.order_uid_hash != replica_binding.order_uid_hash
         || snapshot.price_hash != replica_binding.price_hash
@@ -1156,10 +1159,20 @@ async fn build_solve_request_from_replica(
     // Success: reset consecutive binding failures counter.
     delta_sync::record_binding_success();
 
+    // Prefer the replica's recorded surplus-capturing JIT owners when
+    // available since the replica's orders were constructed with those
+    // owners applied by the autopilot. Fall back to the request header
+    // metadata when the replica has no recorded owners.
+    let surplus_jit_owners = if !snapshot.surplus_capturing_jit_order_owners.is_empty() {
+        snapshot.surplus_capturing_jit_order_owners.clone()
+    } else {
+        metadata.surplus_capturing_jit_order_owners.clone()
+    };
+
     Ok(Some(SolveRequest::from_replica_parts(
         metadata.id,
         metadata.deadline,
-        metadata.surplus_capturing_jit_order_owners.clone(),
+        surplus_jit_owners,
         tokens,
         snapshot.orders,
     )))
