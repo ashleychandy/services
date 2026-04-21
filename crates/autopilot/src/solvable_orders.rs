@@ -1624,6 +1624,11 @@ impl SolvableOrdersCache {
                         match self.persistence.get_next_auction_id().await {
                             Ok(db_id) => {
                                 let auction_id_u64 = u64::try_from(db_id).unwrap_or_default();
+                                debug_assert_ne!(
+                                    auction_id_u64, inner.auction_id,
+                                    "apply_auction_id_change called with unchanged id during \
+                                     update collapse"
+                                );
                                 if let Some(envelope) = apply_auction_id_change(
                                     inner,
                                     auction_id_u64,

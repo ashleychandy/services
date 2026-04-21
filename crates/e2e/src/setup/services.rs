@@ -185,14 +185,26 @@ impl<'a> Services<'a> {
             ..config
         };
 
-        #[cfg(any(test, feature = "test-util"))]
-        {
-            let guard = autopilot::infra::api::ApiTestStateGuard::new();
-            let _static_guard_ref: &'static autopilot::infra::api::ApiTestStateGuard =
-                Box::leak(Box::new(guard));
-        }
+        // In tests we create an `ApiTestStateGuard` to ensure test-only
+        // overrides are reset on drop. Do NOT leak the guard: move it into
+        // the spawned autopilot task so it is held for the lifetime of the
+        // background service and released when the task ends.
+        let join_handle = {
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                let guard = autopilot::infra::api::ApiTestStateGuard::new();
+                tokio::task::spawn(async move {
+                    // Hold the guard for the duration of the run future.
+                    let _guard = guard;
+                    autopilot::run(config, control).await
+                })
+            }
+            #[cfg(not(any(test, feature = "test-util")))]
+            {
+                tokio::task::spawn(autopilot::run(config, control))
+            }
+        };
 
-        let join_handle = tokio::task::spawn(autopilot::run(config, control));
         self.wait_until_autopilot_ready().await;
 
         join_handle

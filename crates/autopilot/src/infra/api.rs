@@ -871,6 +871,17 @@ async fn stream_delta_events(
             }
         }
     });
+    // If tests or other runtime overrides have disabled live producers,
+    // serve the replay payloads only and avoid spawning the background
+    // forwarding/producer task. This makes test-only route registration
+    // deterministic and avoids leaking background tasks.
+    if !delta_sync_live_stream_allowed() {
+        tracing::debug!("delta live stream producers disabled by override; serving replay-only");
+        return sse::Sse::new(replay_stream)
+            .keep_alive(sse::KeepAlive::new().interval(delta_stream_keepalive_interval()))
+            .into_response();
+    }
+
     let stream = replay_stream.chain(live_stream);
 
     // Shared watch channel used to detect when the response-side stream is
@@ -1390,17 +1401,36 @@ fn delta_stream_keepalive_interval() -> Duration {
     })
 }
 
+/// Returns whether live delta-stream producers are allowed to run.
+///
+/// Test builds can override this via `DELTA_SYNC_LIVE_STREAM_OVERRIDE` to
+/// prevent background producers from executing when tests only want to
+/// register routes. In non-test builds this always returns `true`.
+fn delta_sync_live_stream_allowed() -> bool {
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        match *DELTA_SYNC_LIVE_STREAM_OVERRIDE
+            .lock()
+            .expect("delta sync live stream override lock poisoned")
+        {
+            Some(v) => v,
+            None => true,
+        }
+    }
+    #[cfg(not(any(test, feature = "test-util")))]
+    {
+        true
+    }
+}
+
 fn authorize_delta_sync(headers: &HeaderMap) -> Result<(), Response> {
     let Some(expected) = delta_sync_api_key() else {
         return Ok(());
     };
 
-    // Perform a constant-time comparison that does not leak whether the
-    // header was present. To avoid a timing difference between a missing
-    // header and a present-but-wrong header, build a padded/truncated
-    // view of the provided header with the same length as the expected
-    // key and compare using `ct_eq`. Also verify lengths via a
-    // constant-time comparison of the length encoded as bytes.
+    // Perform a constant-time comparison of the header value against the
+    // expected key. Comparing digests with `ct_eq` is sufficient; a
+    // separate length comparison is redundant and can be confusing.
     let expected_bytes = expected.as_bytes();
     let provided_str = headers
         .get("X-Delta-Sync-Api-Key")
@@ -1413,14 +1443,7 @@ fn authorize_delta_sync(headers: &HeaderMap) -> Result<(), Response> {
 
     let content_eq = expected_digest.ct_eq(&provided_digest);
 
-    // Constant-time length equality via byte-wise comparison of u64 LE
-    // encodings. This avoids leaking length differences via a quick
-    // integer comparison.
-    let provided_len_bytes = (provided_bytes.len() as u64).to_le_bytes();
-    let expected_len_bytes = (expected_bytes.len() as u64).to_le_bytes();
-    let length_eq = provided_len_bytes.ct_eq(&expected_len_bytes);
-
-    if bool::from(content_eq) & bool::from(length_eq) {
+    if bool::from(content_eq) {
         Ok(())
     } else {
         Err((StatusCode::UNAUTHORIZED, "Unauthorized").into_response())

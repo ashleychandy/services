@@ -174,8 +174,6 @@ impl RunLoop {
                 leader_lock_tracker.try_acquire().await;
             }
 
-            let _stepped_up_this_iteration = is_follower && leader_lock_tracker.is_leader();
-
             // Always verify/refresh immediately so a just-stepped-up leader
             // consumes the `JustSteppedUp` transition in the same iteration
             // (ensuring logs/metrics fire without waiting one loop).
@@ -239,9 +237,9 @@ impl RunLoop {
             }
 
             // No-op: verification already performed at the top of the loop to
-            // ensure leadership transitions are handled immediately.
+            // ensure leadership transitions are handled immediately. Re-check
+            // current leadership below and skip if we lost it while waiting.
             let is_leader_now = leader_lock_tracker.is_leader();
-            sync_serving_flag(&mut last_serving_flag, is_leader_now);
             if !is_leader_now {
                 // Lost leadership after waiting, skip this cycle
                 continue;
