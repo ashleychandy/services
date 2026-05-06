@@ -164,30 +164,68 @@ impl Settlement {
         let mut fee_breakdown = HashMap::with_capacity(self.trades.len());
 
         for trade in &self.trades {
-            let (trade_surplus, trade_fee, breakdown) = trade
-                .calculate_all_metrics(&self.auction)
-                .unwrap_or_else(|err| {
-                    tracing::warn!(
+            // Try the optimized path first
+            match trade.calculate_all_metrics(&self.auction) {
+                Ok((trade_surplus, trade_fee, breakdown)) => {
+                    surplus = surplus + trade_surplus;
+                    fee = fee + trade_fee;
+                    fee_breakdown.insert(*trade.uid(), breakdown);
+                }
+                Err(err) => {
+                    // Fall back to independent calculation to preserve old behavior
+                    // where each metric can fail independently
+                    tracing::debug!(
                         ?err,
                         trade = %trade.uid(),
-                        "possible incomplete metrics calculation",
+                        "combined metrics calculation failed, falling back to independent calculation",
                     );
-                    (
-                        eth::Ether::zero(),
-                        eth::Ether::zero(),
+
+                    // Calculate surplus independently (may succeed even if combined failed)
+                    let trade_surplus = trade
+                        .surplus_in_ether(&self.auction.prices)
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                ?err,
+                                trade = %trade.uid(),
+                                "possible incomplete surplus calculation",
+                            );
+                            num::zero()
+                        });
+
+                    // Calculate fee independently
+                    let trade_fee =
+                        trade
+                            .fee_in_ether(&self.auction.prices)
+                            .unwrap_or_else(|err| {
+                                tracing::warn!(
+                                    ?err,
+                                    trade = %trade.uid(),
+                                    "possible incomplete fee calculation",
+                                );
+                                num::zero()
+                            });
+
+                    // Calculate breakdown independently
+                    let breakdown = trade.fee_breakdown(&self.auction).unwrap_or_else(|err| {
+                        tracing::warn!(
+                            ?err,
+                            trade = %trade.uid(),
+                            "possible incomplete fee breakdown calculation",
+                        );
                         trade::FeeBreakdown {
                             total: eth::Asset {
                                 token: trade.sell_token(),
                                 amount: num::zero(),
                             },
                             protocol: vec![],
-                        },
-                    )
-                });
+                        }
+                    });
 
-            surplus = surplus + trade_surplus;
-            fee = fee + trade_fee;
-            fee_breakdown.insert(*trade.uid(), breakdown);
+                    surplus = surplus + trade_surplus;
+                    fee = fee + trade_fee;
+                    fee_breakdown.insert(*trade.uid(), breakdown);
+                }
+            }
         }
 
         SettlementMetrics {

@@ -90,6 +90,7 @@ impl Trade {
         auction: &super::Auction,
     ) -> Result<(eth::Ether, eth::Ether, FeeBreakdown), math::Error> {
         let math_trade = math::Trade::from(self);
+        let is_non_surplus_jit = matches!(self, Self::Jit(trade) if !trade.surplus_capturing);
 
         // Compute these expensive operations only once
         let surplus_after = math_trade.surplus_over_limit_price()?;
@@ -101,12 +102,10 @@ impl Trade {
             .get(&surplus_token)
             .ok_or(math::Error::MissingPrice(surplus_token))?;
 
-        let surplus_ether = match self {
-            Self::Jit(trade) if !trade.surplus_capturing => {
-                // Non-surplus-capturing JIT orders have zero surplus
-                eth::Ether::zero()
-            }
-            _ => price.in_eth(eth::TokenAmount(surplus_after.0)),
+        let surplus_ether = if is_non_surplus_jit {
+            eth::Ether::zero()
+        } else {
+            price.in_eth(eth::TokenAmount(surplus_after.0))
         };
 
         let fee_in_surplus_token = surplus_before
