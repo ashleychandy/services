@@ -171,15 +171,8 @@ impl Settlement {
                     fee = fee + trade_fee;
                     fee_breakdown.insert(*trade.uid(), breakdown);
                 }
-                Err(err) => {
+                Err(_err) => {
                     // Fall back to independent calculation to preserve old behavior
-                    // where each metric can fail independently
-                    tracing::debug!(
-                        ?err,
-                        trade = %trade.uid(),
-                        "combined metrics calculation failed, falling back to independent calculation",
-                    );
-
                     // Calculate surplus independently (may succeed even if combined failed)
                     let trade_surplus = trade
                         .surplus_in_ether(&self.auction.prices)
