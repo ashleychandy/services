@@ -97,46 +97,30 @@ impl Settlement {
         let mut jit_orders = Vec::new();
 
         for trade in &self.trades {
-            let trade_surplus =
-                trade
-                    .surplus_in_ether(&self.auction.prices)
-                    .unwrap_or_else(|err| {
-                        tracing::warn!(
-                            ?err,
-                            trade = %trade.uid(),
-                            "possible incomplete surplus calculation",
-                        );
-                        num::zero()
-                    });
-            surplus = surplus + trade_surplus;
-
-            let trade_fee = trade
-                .fee_in_ether(&self.auction.prices)
+            let metrics = trade
+                .calculate_all_metrics(&self.auction)
                 .unwrap_or_else(|err| {
                     tracing::warn!(
                         ?err,
                         trade = %trade.uid(),
-                        "possible incomplete fee calculation",
+                        "possible incomplete metrics calculation",
                     );
-                    num::zero()
+                    trade::TradeMetrics {
+                        surplus: num::zero(),
+                        fee: num::zero(),
+                        breakdown: trade::FeeBreakdown {
+                            total: eth::Asset {
+                                token: trade.sell_token(),
+                                amount: num::zero(),
+                            },
+                            protocol: vec![],
+                        },
+                    }
                 });
-            fee = fee + trade_fee;
 
-            let breakdown = trade.fee_breakdown(&self.auction).unwrap_or_else(|err| {
-                tracing::warn!(
-                    ?err,
-                    trade = %trade.uid(),
-                    "possible incomplete fee breakdown calculation",
-                );
-                trade::FeeBreakdown {
-                    total: eth::Asset {
-                        token: trade.sell_token(),
-                        amount: num::zero(),
-                    },
-                    protocol: vec![],
-                }
-            });
-            fee_breakdown.insert(*trade.uid(), breakdown);
+            surplus = surplus + metrics.surplus;
+            fee = fee + metrics.fee;
+            fee_breakdown.insert(*trade.uid(), metrics.breakdown);
 
             if let Some(jit) = trade.as_jit() {
                 jit_orders.push(jit);
