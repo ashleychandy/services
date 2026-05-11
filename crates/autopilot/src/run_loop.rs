@@ -447,6 +447,8 @@ impl RunLoop {
         ranking: &Ranking,
         block_deadline: u64,
     ) -> Result<()> {
+        use crate::infra::persistence::dto::fee_policy;
+
         let start = Instant::now();
         let reference_scores = ranking.reference_scores().clone();
 
@@ -460,18 +462,21 @@ impl RunLoop {
             .map(|order| (&order.uid, order))
             .collect();
 
-        let fee_policies: Vec<_> = ranking
+        // Convert to owned DTOs synchronously
+        let fee_policy_rows: Vec<_> = ranking
             .ranked()
             .flat_map(|bid| bid.solution().order_ids())
             .unique()
-            .filter_map(|order_id| match order_lookup.get(order_id) {
-                Some(auction_order) => {
-                    Some((auction_order.uid, auction_order.protocol_fees.clone()))
-                }
-                None => {
+            .filter_map(|order_id| {
+                order_lookup.get(order_id).or_else(|| {
                     tracing::debug!(?order_id, "order not found in auction");
                     None
-                }
+                })
+            })
+            .flat_map(|o| {
+                o.protocol_fees
+                    .iter()
+                    .map(move |policy| fee_policy::from_domain(auction.id, o.uid, policy))
             })
             .collect();
 
@@ -554,7 +559,7 @@ impl RunLoop {
                 )
                 .map_err(|e| e.0.context("failed to save jit order owners")),
             self.persistence
-                .store_fee_policies(auction.id, fee_policies)
+                .store_fee_policies(fee_policy_rows)
                 .map_err(|e| e.context("failed to fee_policies")),
         )
         .inspect_err(|err| tracing::warn!(?err, "failed to write post processed data to DB"))?;

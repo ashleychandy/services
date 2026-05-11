@@ -340,8 +340,7 @@ impl Persistence {
     /// Saves the given fee policies to the DB as a single batch.
     pub async fn store_fee_policies(
         &self,
-        auction_id: domain::auction::Id,
-        fee_policies: Vec<(domain::OrderUid, Vec<domain::fee::Policy>)>,
+        fee_policies: Vec<database::fee_policies::FeePolicy>,
     ) -> anyhow::Result<()> {
         let _timer = Metrics::get()
             .database_queries
@@ -350,7 +349,7 @@ impl Persistence {
 
         let mut ex = self.postgres.pool.begin().await.context("begin")?;
         for chunk in fee_policies.chunks(self.postgres.config.insert_batch_size.get()) {
-            crate::database::fee_policies::insert_batch(&mut ex, auction_id, chunk.iter().cloned())
+            database::fee_policies::insert_batch(&mut ex, chunk.iter().cloned())
                 .await
                 .context("fee_policies::insert_batch")?;
         }

@@ -7,7 +7,7 @@ use {
 pub fn from_domain(
     auction_id: domain::auction::Id,
     order_uid: domain::OrderUid,
-    policy: domain::fee::Policy,
+    policy: &domain::fee::Policy,
 ) -> FeePolicy {
     match policy {
         domain::fee::Policy::Surplus {

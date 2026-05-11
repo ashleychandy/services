@@ -14,7 +14,6 @@ pub mod auction_prices;
 pub mod competition;
 pub mod ethflow_events;
 pub mod events;
-pub mod fee_policies;
 pub mod onchain_order_events;
 pub mod order_events;
 mod quotes;
