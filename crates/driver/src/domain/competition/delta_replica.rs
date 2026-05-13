@@ -50,10 +50,6 @@ pub struct Snapshot {
 pub struct RawAuctionData {
     pub orders: Vec<Value>,
     pub prices: HashMap<Address, String>,
-    #[serde(default)]
-    pub block: Option<u64>,
-    #[serde(default)]
-    pub surplus_capturing_jit_order_owners: Vec<Address>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,8 +114,6 @@ pub struct Replica {
     orders_raw: HashMap<String, Value>,
     order_uid_bytes: HashMap<String, [u8; 56]>,
     prices: HashMap<Address, String>,
-    block: u64,
-    surplus_capturing_jit_order_owners: Vec<Address>,
     state: ReplicaState,
     last_update: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -150,8 +144,6 @@ impl Default for Replica {
             orders_raw: HashMap::new(),
             order_uid_bytes: HashMap::new(),
             prices: HashMap::new(),
-            block: 0,
-            surplus_capturing_jit_order_owners: Vec::new(),
             state: ReplicaState::Uninitialized,
             last_update: None,
         }
@@ -173,14 +165,6 @@ impl Replica {
 
     pub fn prices(&self) -> &HashMap<Address, String> {
         &self.prices
-    }
-
-    pub fn block(&self) -> u64 {
-        self.block
-    }
-
-    pub fn surplus_capturing_jit_order_owners(&self) -> &Vec<Address> {
-        &self.surplus_capturing_jit_order_owners
     }
 
     pub fn state(&self) -> ReplicaState {
@@ -235,10 +219,6 @@ impl Replica {
         self.orders_raw = new_orders_raw;
         self.order_uid_bytes = new_order_uid_bytes;
         self.prices = new_prices;
-        // Capture non-order fields from the snapshot when available.
-        self.block = snapshot.auction.block.unwrap_or(0);
-        self.surplus_capturing_jit_order_owners =
-            snapshot.auction.surplus_capturing_jit_order_owners.clone();
         self.state = ReplicaState::Ready;
         self.last_update = Some(chrono::Utc::now());
         metrics::get()
@@ -301,32 +281,9 @@ impl Replica {
         let mut mutations = Vec::with_capacity(envelope.events.len());
         for event in envelope.events {
             match event {
-                Event::AuctionChanged { .. } => {
-                    // Treat AuctionChanged as an explicit auction boundary.
-                    // Clear per-auction projection state so that the replica's
-                    // view matches the autopilot projection after a transition.
-                    // This avoids semantic divergence when the same event
-                    // stream is consumed by both autopilot and driver paths.
-                    self.orders.clear();
-                    self.orders_raw.clear();
-                    self.order_uid_bytes.clear();
-                    self.prices.clear();
-                    self.block = 0;
-                    self.surplus_capturing_jit_order_owners.clear();
-                    metrics::get().delta_replica_order_count.set(self.orders.len() as i64);
-                }
-                Event::BlockChanged { block } => {
-                    // Track block changes so consumers can detect missing
-                    // BlockChanged events even though orders/prices are the
-                    // primary projection surface.
-                    self.block = block;
-                }
-                Event::JitOwnersChanged { surplus_capturing_jit_order_owners } => {
-                    // Track surplus-capturing JIT owners so replica-based
-                    // solve requests can use the same owner set as the
-                    // autopilot that applied protocol fees.
-                    self.surplus_capturing_jit_order_owners = surplus_capturing_jit_order_owners;
-                }
+                Event::AuctionChanged { .. } => {}
+                Event::BlockChanged { .. } => {}
+                Event::JitOwnersChanged { .. } => {}
                 Event::OrderAdded { order } | Event::OrderUpdated { order } => {
                     let uid = order_uid(&order)?;
                     let uid_bytes = decode_order_uid_bytes(&uid)?;
@@ -456,55 +413,16 @@ impl Replica {
         let mut hasher = Sha256::new();
         for (_, order_val) in entries {
             // Prefer serializing the order as the DTO used for solve requests
-            // to ensure a stable deterministic shape. Canonicalize the JSON
-            // representation (sorted object keys) before hashing so different
-            // serde insertion orders do not affect the checksum.
-            let value_to_hash = match serde_json::from_value::<ReplicaOrder>(order_val.clone()) {
-                Ok(order_dto) => serde_json::to_value(&order_dto).expect("order DTO -> value"),
-                Err(_) => order_val.clone(),
+            // to ensure a stable, deterministic field ordering. If the raw
+            // value doesn't deserialize into the DTO, fall back to
+            // serializing the `Value` directly.
+            let bytes = match serde_json::from_value::<ReplicaOrder>(order_val.clone()) {
+                Ok(order_dto) => serde_json::to_vec(&order_dto).expect("order DTO serializable"),
+                Err(_) => serde_json::to_vec(order_val).expect("order JSON serializable"),
             };
-            let bytes = Self::canonical_json_bytes(&value_to_hash);
             hasher.update(&bytes);
         }
         format!("0x{}", const_hex::encode(hasher.finalize()))
-    }
-
-    fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
-        match value {
-            serde_json::Value::Object(map) => {
-                let mut entries: Vec<_> = map.iter().collect();
-                entries.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
-                let mut out = Vec::new();
-                out.push(b'{');
-                let mut first = true;
-                for (k, v) in entries {
-                    if !first {
-                        out.push(b',');
-                    }
-                    first = false;
-                    out.extend_from_slice(serde_json::to_string(k).unwrap().as_bytes());
-                    out.push(b':');
-                    out.extend_from_slice(&Self::canonical_json_bytes(v));
-                }
-                out.push(b'}');
-                out
-            }
-            serde_json::Value::Array(arr) => {
-                let mut out = Vec::new();
-                out.push(b'[');
-                let mut first = true;
-                for v in arr {
-                    if !first {
-                        out.push(b',');
-                    }
-                    first = false;
-                    out.extend_from_slice(&Self::canonical_json_bytes(v));
-                }
-                out.push(b']');
-                out
-            }
-            _ => serde_json::to_vec(value).expect("value serializable"),
-        }
     }
 
     fn parse_order(order: &Value) -> Result<ReplicaOrder, Error> {
@@ -1112,16 +1030,15 @@ mod tests {
     #[test]
     // Verifies autopilot <-> driver checksum equivalence for a single order.
     fn checksum_equivalence_autopilot_driver_single_order() {
-        use {
-            alloy::primitives::{Address, B256},
-            autopilot::{domain as ap_domain, infra::persistence::dto::order as ap_order},
-            eth_domain_types as eth,
-            sha2::{Digest, Sha256},
-            std::collections::HashMap,
-        };
+        use sha2::{Digest, Sha256};
+        use std::collections::HashMap;
 
-        // Build a canonical domain order (similar to
-        // autopilot::test_helpers::test_order)
+        use autopilot::infra::persistence::dto::order as ap_order;
+        use autopilot::domain as ap_domain;
+        use alloy::primitives::{Address, B256};
+        use eth_domain_types as eth;
+
+        // Build a canonical domain order (similar to autopilot::test_helpers::test_order)
         let uid_byte: u8 = 1;
         let amount: u8 = 1;
         let domain_order = ap_domain::Order {
@@ -1132,9 +1049,7 @@ mod tests {
             },
             buy: eth::Asset {
                 token: Address::repeat_byte(uid_byte.saturating_add(1)).into(),
-                amount: eth::TokenAmount::from(eth::U256::from(u128::from(
-                    amount.saturating_add(1),
-                ))),
+                amount: eth::TokenAmount::from(eth::U256::from(u128::from(amount.saturating_add(1)))),
             },
             protocol_fees: Vec::new(),
             side: ap_domain::auction::order::Side::Sell,
@@ -1234,14 +1149,14 @@ mod tests {
     // Verifies autopilot <-> driver checksum equivalence for a multi-order
     // auction including UID, prices and full snapshot checksum.
     fn checksum_equivalence_autopilot_driver_full_auction() {
-        use {
-            alloy::primitives::Address,
-            autopilot::{domain as ap_domain, infra::persistence::dto::order as ap_order},
-            eth_domain_types as eth,
-            serde_json::Value,
-            sha2::{Digest, Sha256},
-            std::collections::HashMap,
-        };
+        use sha2::{Digest, Sha256};
+        use std::collections::HashMap;
+
+        use autopilot::infra::persistence::dto::order as ap_order;
+        use autopilot::domain as ap_domain;
+        use alloy::primitives::Address;
+        use eth_domain_types as eth;
+        use serde_json::Value;
 
         // Build several canonical domain orders.
         let mut domain_orders = Vec::new();
@@ -1258,9 +1173,7 @@ mod tests {
                 },
                 buy: eth::Asset {
                     token: Address::repeat_byte(buy_token_byte).into(),
-                    amount: eth::TokenAmount::from(eth::U256::from(u128::from(
-                        amount.saturating_add(1),
-                    ))),
+                    amount: eth::TokenAmount::from(eth::U256::from(u128::from(amount.saturating_add(1)))),
                 },
                 protocol_fees: Vec::new(),
                 side: ap_domain::auction::order::Side::Sell,
@@ -1352,10 +1265,7 @@ mod tests {
 
         let mut orders_map: HashMap<String, Value> = HashMap::new();
         for domain_order in domain_orders.iter() {
-            orders_map.insert(
-                domain_order.uid.to_string(),
-                manual_value_from_domain(domain_order),
-            );
+            orders_map.insert(domain_order.uid.to_string(), manual_value_from_domain(domain_order));
         }
         let driver_order_content_hash = Replica::checksum_order_contents_raw(&orders_map);
         // If checksums differ, print canonical serialized forms for debugging
@@ -1370,6 +1280,7 @@ mod tests {
                 driver_serialized_vec.push(serde_json::to_vec(&parsed).expect("driver serialize"));
             }
             driver_serialized_vec.sort();
+
         }
         assert_eq!(ap_order_content_hash, driver_order_content_hash);
 
@@ -1403,9 +1314,7 @@ mod tests {
         let mut hasher = Sha256::new();
         for (token, price_str) in entries {
             hasher.update(token.as_slice());
-            let canonical = eth::U256::from_str(price_str)
-                .expect("parse price")
-                .to_string();
+            let canonical = eth::U256::from_str(price_str).expect("parse price").to_string();
             hasher.update(canonical.as_bytes());
         }
         let ap_price_hash = format!("0x{}", const_hex::encode(hasher.finalize()));

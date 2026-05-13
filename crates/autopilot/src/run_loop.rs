@@ -174,6 +174,8 @@ impl RunLoop {
                 leader_lock_tracker.try_acquire().await;
             }
 
+            let _stepped_up_this_iteration = is_follower && leader_lock_tracker.is_leader();
+
             // Always verify/refresh immediately so a just-stepped-up leader
             // consumes the `JustSteppedUp` transition in the same iteration
             // (ensuring logs/metrics fire without waiting one loop).
@@ -237,9 +239,9 @@ impl RunLoop {
             }
 
             // No-op: verification already performed at the top of the loop to
-            // ensure leadership transitions are handled immediately. Re-check
-            // current leadership below and skip if we lost it while waiting.
+            // ensure leadership transitions are handled immediately.
             let is_leader_now = leader_lock_tracker.is_leader();
+            sync_serving_flag(&mut last_serving_flag, is_leader_now);
             if !is_leader_now {
                 // Lost leadership after waiting, skip this cycle
                 continue;
@@ -394,11 +396,10 @@ impl RunLoop {
         // See `solvable_orders::current_auction` and
         // `solvable_orders::current_candidate_auction` for the canonical
         // behavior and tests that verify the separation.
-        let Some(candidate) = self.solvable_orders_cache.current_candidate_auction().await else {
+        let Some(auction) = self.solvable_orders_cache.current_candidate_auction().await else {
             tracing::debug!("no current auction");
             return None;
         };
-        let auction = candidate.into_inner();
         // If the cache already assigned an auction id (e.g. leader collapsed
         // the commit into `update()`), reuse that id. Otherwise, claim the
         // next id from persistence and set it here.

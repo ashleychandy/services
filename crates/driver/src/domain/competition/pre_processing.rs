@@ -1117,11 +1117,8 @@ async fn build_solve_request_from_replica(
             request: replica_binding.sequence,
         });
     }
-    // Order content checksum comparison is currently unreliable across
-    // autopilot <-> driver due to differences in fee application and JSON
-    // field ordering. Skip content hash check until fee-normalization and
-    // canonical serialization are aligned between components.
-    let content_mismatch = false;
+    let content_mismatch = !replica_binding.order_content_hash.is_empty()
+        && snapshot.order_content_hash != replica_binding.order_content_hash;
 
     if snapshot.order_uid_hash != replica_binding.order_uid_hash
         || snapshot.price_hash != replica_binding.price_hash
@@ -1159,20 +1156,10 @@ async fn build_solve_request_from_replica(
     // Success: reset consecutive binding failures counter.
     delta_sync::record_binding_success();
 
-    // Prefer the replica's recorded surplus-capturing JIT owners when
-    // available since the replica's orders were constructed with those
-    // owners applied by the autopilot. Fall back to the request header
-    // metadata when the replica has no recorded owners.
-    let surplus_jit_owners = if !snapshot.surplus_capturing_jit_order_owners.is_empty() {
-        snapshot.surplus_capturing_jit_order_owners.clone()
-    } else {
-        metadata.surplus_capturing_jit_order_owners.clone()
-    };
-
     Ok(Some(SolveRequest::from_replica_parts(
         metadata.id,
         metadata.deadline,
-        surplus_jit_owners,
+        metadata.surplus_capturing_jit_order_owners.clone(),
         tokens,
         snapshot.orders,
     )))
@@ -1539,11 +1526,6 @@ async fn build_solve_request_from_replica_resilient(
     // instead of immediately refusing the request. This avoids persistent
     // cooldown windows preventing self-healing for transient mismatches.
     let current_auction_id = u64::try_from(metadata.id).ok();
-    // Ensure any stale opened-circuit state for a previous auction is
-    // cleared before probing. Historically this check implicitly reset
-    // the circuit on mismatch; keep the explicit reset here so production
-    // callers that rely on that behaviour continue to function.
-    delta_sync::replica_binding_circuit_reset_if_mismatch_or_cooldown(current_auction_id);
     if delta_sync::replica_binding_circuit_open_for_auction(current_auction_id) {
         tracing::warn!("replica binding circuit open; attempting bootstrap for thin request");
         return ensure_replica_then_build(
@@ -1889,7 +1871,7 @@ mod tests {
                     "class": "market",
                     "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
                     "signingScheme": "eip712",
-                    "signature": format!("0x{}", hex::encode([0u8; 65])),
+                    "signature": "0x00",
                     "quote": null
                 })],
                 prices: HashMap::new(),
@@ -2094,7 +2076,7 @@ mod tests {
                     "class": "market",
                     "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
                     "signingScheme": "eip712",
-                    "signature": format!("0x{}", hex::encode([0u8; 65])),
+                    "signature": "0x00",
                     "quote": null
                 })],
                 prices: HashMap::new(),
@@ -2158,7 +2140,7 @@ mod tests {
                     "class": "market",
                     "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
                     "signingScheme": "eip712",
-                    "signature": format!("0x{}", hex::encode([0u8; 65])),
+                    "signature": "0x00",
                     "quote": null
                 })],
                 prices: HashMap::new(),
@@ -2247,7 +2229,7 @@ mod tests {
                     "class": "market",
                     "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
                     "signingScheme": "eip712",
-                    "signature": format!("0x{}", hex::encode([0u8; 65])),
+                    "signature": "0x00",
                     "quote": null
                 })],
                 prices: HashMap::new(),

@@ -121,13 +121,11 @@ mod tests {
     fn required_from_env_var() {
         let var = "TEST_DESER_REQ_FROM_ENV";
         // Test-only: use a unique env var name to avoid conflicts
-        // SAFETY: no other threads access this env var.
-        unsafe { std::env::set_var(var, "http://example.com") };
+        std::env::set_var(var, "http://example.com");
         let json = format!(r#"{{"url": "%{var}"}}"#);
         let parsed: Required = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.url.as_str(), "http://example.com/");
-        // SAFETY: no other threads access this env var.
-        unsafe { std::env::remove_var(var) };
+        std::env::remove_var(var);
     }
 
     #[test]
@@ -166,13 +164,11 @@ mod tests {
     #[test]
     fn optional_from_env_var() {
         let var = "TEST_DESER_OPT_FROM_ENV";
-        // SAFETY: no other threads access this env var.
-        unsafe { std::env::set_var(var, "http://opt.example.com") };
+        std::env::set_var(var, "http://opt.example.com");
         let json = format!(r#"{{"url": "%{var}"}}"#);
         let parsed: Optional = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.url.unwrap().as_str(), "http://opt.example.com/");
-        // SAFETY: no other threads access this env var.
-        unsafe { std::env::remove_var(var) };
+        std::env::remove_var(var);
     }
 
     #[test]

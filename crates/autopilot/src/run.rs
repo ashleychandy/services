@@ -471,6 +471,7 @@ pub async fn run(config: Configuration, shutdown_controller: ShutdownController)
         config.price_estimation.quote_verification,
         config.price_estimation.quote_timeout,
     ));
+
     let solvable_orders_cache = SolvableOrdersCache::new(
         config.min_order_validity_period,
         persistence.clone(),

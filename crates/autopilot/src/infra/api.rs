@@ -35,7 +35,7 @@ use {
         time::{Duration, Instant},
     },
     subtle::ConstantTimeEq,
-    tokio::sync::{broadcast::error::TryRecvError, oneshot, watch},
+    tokio::sync::{Notify, broadcast::error::TryRecvError, oneshot, watch},
     tokio_stream::wrappers::{
         BroadcastStream,
         ReceiverStream,
@@ -307,6 +307,14 @@ pub fn set_delta_sync_live_stream_override(value: Option<bool>) {
 pub fn set_delta_stream_buffer_override(value: Option<usize>) {
     #[cfg(any(test, feature = "test-util"))]
     {
+        // Debug-only assertion: ensure the caller holds `API_TEST_STATE_MUTEX`
+        // (i.e. `ApiTestStateGuard`). We intentionally use `try_lock()` to
+        // detect the absence of the guard and panic when the mutex is not
+        // already held. This is a TOCTOU-style check (another thread could
+        // theoretically acquire the mutex immediately after this check), but
+        // it is acceptable here because this branch is only compiled for
+        // tests/test utilities and serves as a developer-facing assertion to
+        // catch incorrect test setup.
         if API_TEST_STATE_MUTEX.try_lock().is_ok() {
             panic!(
                 "set_delta_stream_buffer_override must be called while holding ApiTestStateGuard"
@@ -871,27 +879,12 @@ async fn stream_delta_events(
             }
         }
     });
-    // If tests or other runtime overrides have disabled live producers,
-    // serve the replay payloads only and avoid spawning the background
-    // forwarding/producer task. This makes test-only route registration
-    // deterministic and avoids leaking background tasks.
-    if !delta_sync_live_stream_allowed() {
-        tracing::debug!("delta live stream producers disabled by override; serving replay-only");
-        return sse::Sse::new(replay_stream)
-            .keep_alive(sse::KeepAlive::new().interval(delta_stream_keepalive_interval()))
-            .into_response();
-    }
-
     let stream = replay_stream.chain(live_stream);
 
     // Shared watch channel used to detect when the response-side stream is
     // dropped by the client. The producer task will observe the channel's
     // state (which is persisted) to exit promptly and avoid leaking
-    // subscriptions in test/oneshot environments. Multiple senders can set
-    // the same boolean without coordination because watch keeps only the
-    // latest value. Consequently, send errors from concurrent writers are
-    // benign and intentionally ignored (we only care that the value becomes
-    // true eventually).
+    // subscriptions in test/oneshot environments.
     let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
 
     let (stream_sender, stream_receiver) =
@@ -927,6 +920,7 @@ async fn stream_delta_events(
                             "skipped": 0
                         })
                         .to_string();
+
 
                         tracing::warn!("delta stream lost leader authority");
 
@@ -1401,36 +1395,17 @@ fn delta_stream_keepalive_interval() -> Duration {
     })
 }
 
-/// Returns whether live delta-stream producers are allowed to run.
-///
-/// Test builds can override this via `DELTA_SYNC_LIVE_STREAM_OVERRIDE` to
-/// prevent background producers from executing when tests only want to
-/// register routes. In non-test builds this always returns `true`.
-fn delta_sync_live_stream_allowed() -> bool {
-    #[cfg(any(test, feature = "test-util"))]
-    {
-        match *DELTA_SYNC_LIVE_STREAM_OVERRIDE
-            .lock()
-            .expect("delta sync live stream override lock poisoned")
-        {
-            Some(v) => v,
-            None => true,
-        }
-    }
-    #[cfg(not(any(test, feature = "test-util")))]
-    {
-        true
-    }
-}
-
 fn authorize_delta_sync(headers: &HeaderMap) -> Result<(), Response> {
     let Some(expected) = delta_sync_api_key() else {
         return Ok(());
     };
 
-    // Perform a constant-time comparison of the header value against the
-    // expected key. Comparing digests with `ct_eq` is sufficient; a
-    // separate length comparison is redundant and can be confusing.
+    // Perform a constant-time comparison that does not leak whether the
+    // header was present. To avoid a timing difference between a missing
+    // header and a present-but-wrong header, build a padded/truncated
+    // view of the provided header with the same length as the expected
+    // key and compare using `ct_eq`. Also verify lengths via a
+    // constant-time comparison of the length encoded as bytes.
     let expected_bytes = expected.as_bytes();
     let provided_str = headers
         .get("X-Delta-Sync-Api-Key")
@@ -1443,7 +1418,14 @@ fn authorize_delta_sync(headers: &HeaderMap) -> Result<(), Response> {
 
     let content_eq = expected_digest.ct_eq(&provided_digest);
 
-    if bool::from(content_eq) {
+    // Constant-time length equality via byte-wise comparison of u64 LE
+    // encodings. This avoids leaking length differences via a quick
+    // integer comparison.
+    let provided_len_bytes = (provided_bytes.len() as u64).to_le_bytes();
+    let expected_len_bytes = (expected_bytes.len() as u64).to_le_bytes();
+    let length_eq = provided_len_bytes.ct_eq(&expected_len_bytes);
+
+    if bool::from(content_eq) & bool::from(length_eq) {
         Ok(())
     } else {
         Err((StatusCode::UNAUTHORIZED, "Unauthorized").into_response())
@@ -1501,39 +1483,12 @@ struct DeltaMetrics {
     snapshot_bytes: IntGauge,
     /// Currently active stream handlers.
     active_streams: IntGauge,
-    /// Number of pending event batches currently queued.
-    pending_events_count: IntGauge,
-    /// Oldest pending event age in seconds.
-    pending_events_oldest_age_seconds: IntGauge,
-    /// Total times a pending-events flush was triggered by leader.
-    pending_flush_triggered_total: IntCounter,
-    /// Total times a forced resync was returned because pending exceeded thresholds.
-    pending_resync_forced_total: IntCounter,
 }
 
 impl DeltaMetrics {
     fn get() -> &'static Self {
         DeltaMetrics::instance(observe::metrics::get_storage_registry()).unwrap()
     }
-}
-
-// Public (crate) accessors for selected delta sync metrics. These helpers
-// avoid exposing the `DeltaMetrics` struct and its private fields across the
-// crate boundary while allowing other modules to update the metrics safely.
-pub(crate) fn delta_pending_resync_forced_total_inc() {
-    DeltaMetrics::get().pending_resync_forced_total.inc();
-}
-
-pub(crate) fn delta_pending_events_count_set(v: i64) {
-    DeltaMetrics::get().pending_events_count.set(v);
-}
-
-pub(crate) fn delta_pending_events_oldest_age_seconds_set(v: i64) {
-    DeltaMetrics::get().pending_events_oldest_age_seconds.set(v);
-}
-
-pub(crate) fn delta_pending_flush_triggered_total_inc() {
-    DeltaMetrics::get().pending_flush_triggered_total.inc();
 }
 
 struct ActiveStreamGuard {
