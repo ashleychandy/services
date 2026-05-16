@@ -16,7 +16,10 @@ use {
     alloy_transport::TransportErrorKind,
     contracts::ERC20,
     ethrpc::Web3,
-    std::{iter, time::Duration},
+    std::{
+        iter,
+        time::{Duration, Instant},
+    },
 };
 
 /// These are the solady magic bytes for user allowances
@@ -211,7 +214,10 @@ impl Detector {
             web3,
             probing_depth,
             verification_timeout,
-            cache: Cache::new(u64::try_from(cache_size).expect("cache_size must be non-negative")),
+            cache: Cache::new(
+                u64::try_from(cache_size).expect("cache_size must be non-negative"),
+                "approval",
+            ),
         }
     }
 
@@ -230,12 +236,31 @@ impl Detector {
     ) -> Option<ApprovalStrategy> {
         tracing::trace!(?token, "attempting to auto-detect approval slot");
 
+        let start = Instant::now();
+        let detector_label = "approval";
+
         {
             if let Some(strategy_opt) = self.cache.get(&(token, None)) {
+                crate::metrics::Metrics::get()
+                    .cache_hits
+                    .with_label_values(&[detector_label])
+                    .inc();
+                crate::metrics::Metrics::get()
+                    .detection_duration_cache_hit_seconds
+                    .with_label_values(&[detector_label, "cache_hit"])
+                    .observe(start.elapsed().as_secs_f64());
                 tracing::trace!(?token, "cache hit (strategy valid for all pairs)");
                 return strategy_opt;
             }
             if let Some(strategy_opt) = self.cache.get(&(token, Some((owner, spender)))) {
+                crate::metrics::Metrics::get()
+                    .cache_hits
+                    .with_label_values(&[detector_label])
+                    .inc();
+                crate::metrics::Metrics::get()
+                    .detection_duration_cache_hit_seconds
+                    .with_label_values(&[detector_label, "cache_hit_specific"])
+                    .observe(start.elapsed().as_secs_f64());
                 tracing::trace!(
                     ?token,
                     ?owner,
@@ -246,7 +271,22 @@ impl Detector {
             }
         }
 
+        crate::metrics::Metrics::get()
+            .cache_misses
+            .with_label_values(&[detector_label])
+            .inc();
+
         let result = self.uncached_detect(token, owner, spender).await;
+
+        let result_label = match &result {
+            Ok(_) => "uncached_found",
+            Err(DetectionError::NotFound) => "uncached_not_found",
+            Err(_) => "uncached_error",
+        };
+        crate::metrics::Metrics::get()
+            .detection_duration_uncached_seconds
+            .with_label_values(&[detector_label, result_label])
+            .observe(start.elapsed().as_secs_f64());
 
         if matches!(&result, Ok(_) | Err(DetectionError::NotFound)) {
             tracing::debug!(?token, ?result, "caching auto-detected approval strategy");

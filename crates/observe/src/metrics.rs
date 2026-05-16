@@ -40,6 +40,8 @@ static REGISTRY: OnceLock<prometheus_metric_storage::StorageRegistry> = OnceLock
 /// any call to [`get_registry`]. This function also panics if registry
 /// configuration is invalid.
 pub fn setup_registry(prefix: Option<String>, labels: Option<HashMap<String, String>>) {
+    let labels = inject_release_label(labels);
+
     let registry = prometheus::Registry::new_custom(prefix, labels).unwrap();
     let storage_registry = prometheus_metric_storage::StorageRegistry::new(registry);
     REGISTRY.set(storage_registry).unwrap();
@@ -50,9 +52,21 @@ pub fn setup_registry(prefix: Option<String>, labels: Option<HashMap<String, Str
 ///
 /// Useful for tests.
 pub fn setup_registry_reentrant(prefix: Option<String>, labels: Option<HashMap<String, String>>) {
+    let labels = inject_release_label(labels);
     let registry = prometheus::Registry::new_custom(prefix, labels).unwrap();
     let storage_registry = prometheus_metric_storage::StorageRegistry::new(registry);
     REGISTRY.set(storage_registry).ok();
+}
+
+fn inject_release_label(
+    mut labels: Option<HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    if let Ok(rel) = std::env::var("RELEASE") {
+        let mut map = labels.unwrap_or_default();
+        map.entry("release".to_string()).or_insert(rel);
+        labels = Some(map);
+    }
+    labels
 }
 
 /// Get the global instance of the metrics registry.

@@ -2,6 +2,7 @@ pub mod approval;
 pub mod balance;
 mod cache;
 pub mod detector;
+mod metrics;
 
 use {alloy_primitives::Address, alloy_rpc_types::state::AccountOverride};
 pub use {
@@ -383,5 +384,139 @@ mod tests {
                 .await,
             Some(strategy_p2)
         );
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn stress_cache_moka() {
+        use std::{sync::Arc, time::Instant};
+
+        let mock_web3 = mock::web3();
+        let state_overrides = StateOverrides::new(mock_web3);
+        let state_overrides = Arc::new(state_overrides);
+
+        let token_count = 200usize;
+        let mut tokens = Vec::with_capacity(token_count);
+        for i in 0..token_count {
+            tokens.push(Address::with_last_byte((i % 255) as u8));
+        }
+
+        for i in 0..(token_count / 2) {
+            let token = tokens[i];
+            let strategy = Strategy::SolidityMapping {
+                target_contract: token,
+                map_slot: U256::ONE,
+            };
+            state_overrides
+                .balance_detector
+                .cache
+                .insert((token, None), Some(strategy));
+        }
+
+        let concurrency = 64usize;
+        let iterations_per_worker = 2000usize;
+        let start = Instant::now();
+
+        let mut handles = Vec::with_capacity(concurrency);
+        for worker in 0..concurrency {
+            let so = Arc::clone(&state_overrides);
+            let toks = tokens.clone();
+            let handle = tokio::spawn(async move {
+                for j in 0..iterations_per_worker {
+                    let idx = (worker + j) % toks.len();
+                    let token = toks[idx];
+                    let holder = Address::with_last_byte(((idx + 7) % 255) as u8);
+                    let _ = so.balance_detector.detect(token, holder).await;
+                }
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
+
+        let elapsed = start.elapsed();
+        println!("stress run completed: {:?}", elapsed);
+
+        // Print the collected metrics to help local inspection.
+        println!(
+            "METRICS:\n{}",
+            observe::metrics::encode(observe::metrics::get_registry())
+        );
+    }
+
+    #[ignore]
+    #[test]
+    fn compare_moka_vs_mutex_cache() {
+        use {
+            cached::Cached,
+            std::{
+                sync::{Arc, Mutex},
+                thread,
+                time::Instant,
+            },
+        };
+
+        let key_count = 1000usize;
+        let workers = 64usize;
+        let iters = 2000usize;
+
+        // Moka cache benchmark
+        let moka_cache = Arc::new(moka::sync::Cache::builder().max_capacity(10_000).build());
+        for i in 0..(key_count / 2) {
+            moka_cache.insert(i as u64, i as u64);
+        }
+
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for worker in 0..workers {
+            let cache = Arc::clone(&moka_cache);
+            let handle = thread::spawn(move || {
+                for j in 0..iters {
+                    let idx = ((worker + j) % key_count) as u64;
+                    let _ = cache.get(&idx);
+                }
+            });
+            handles.push(handle);
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        let duration_moka = start.elapsed();
+
+        // cached::SizedCache behind a Mutex benchmark (closer to the previous
+        // implementation)
+        let cached_map = Arc::new(Mutex::new(cached::SizedCache::<u64, u64>::with_size(
+            10_000,
+        )));
+        {
+            let mut guard = cached_map.lock().unwrap();
+            for i in 0..(key_count / 2) {
+                guard.cache_set(i as u64, i as u64);
+            }
+        }
+
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for worker in 0..workers {
+            let map = Arc::clone(&cached_map);
+            let handle = thread::spawn(move || {
+                for j in 0..iters {
+                    let idx = ((worker + j) % key_count) as u64;
+                    let mut guard = map.lock().unwrap();
+                    let _ = guard.cache_get(&idx).cloned();
+                    drop(guard);
+                }
+            });
+            handles.push(handle);
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        let duration_cached = start.elapsed();
+
+        println!("Moka duration: {:?}", duration_moka);
+        println!("cached::SizedCache (Mutex) duration: {:?}", duration_cached);
     }
 }
