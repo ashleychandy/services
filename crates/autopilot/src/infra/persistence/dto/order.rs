@@ -362,6 +362,16 @@ impl Quote {
         }
     }
 
+    /// Old implementation for benchmarking - takes ownership
+    pub fn from_domain_old(quote: domain::Quote) -> Self {
+        Quote {
+            sell_amount: quote.sell_amount.0,
+            buy_amount: quote.buy_amount.0,
+            fee: quote.fee.0,
+            solver: quote.solver,
+        }
+    }
+
     pub fn to_domain(&self, order_uid: OrderUid) -> domain::Quote {
         domain::Quote {
             order_uid,
@@ -370,6 +380,41 @@ impl Quote {
             fee: self.fee.into(),
             solver: self.solver,
         }
+    }
+}
+
+/// Old implementation for benchmarking - takes ownership and clones everything
+pub fn from_domain_old(order: domain::Order) -> Order {
+    Order {
+        uid: order.uid.into(),
+        sell_token: order.sell.token.into(),
+        buy_token: order.buy.token.into(),
+        sell_amount: order.sell.amount.into(),
+        buy_amount: order.buy.amount.into(),
+        protocol_fees: order
+            .protocol_fees
+            .into_iter()
+            .map(FeePolicy::from_domain)
+            .collect(),
+        created: order.created,
+        valid_to: order.valid_to,
+        kind: order.side.into(),
+        receiver: order.receiver,
+        owner: order.owner,
+        partially_fillable: order.partially_fillable,
+        executed: order.executed.into(),
+        pre_interactions: order.pre_interactions.into_iter().map(Into::into).collect(),
+        post_interactions: order
+            .post_interactions
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        sell_token_balance: order.sell_token_balance.into(),
+        buy_token_balance: order.buy_token_balance.into(),
+        class: boundary::OrderClass::Limit,
+        app_data: order.app_data.into(),
+        signature: order.signature.into(),
+        quote: order.quote.map(Quote::from_domain_old),
     }
 }
 

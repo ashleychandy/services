@@ -50,6 +50,7 @@ const_format = "0.2.32"
 const-hex = "1.17.0"
 contracts = { path = "contracts/generated/contracts-facade" }
 cow-amm = { path = "crates/cow-amm" }
+criterion = { version = "0.5", features = ["html_reports"] }
 dashmap = "6.1.0"
 database = { path = "crates/database" }
 derive_more = { version = "1.0.0", features = ["full"] }
